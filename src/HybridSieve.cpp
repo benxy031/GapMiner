@@ -185,7 +185,7 @@ void HybridSieve::run_sieve(PoW *pow,
   sieve_queue->clear();
   
   /* just to be sure */
-  pow->set_shift(32);
+  pow->set_shift(58);
 
   mpz_t mpz_offset;
   mpz_init_set_ui64(mpz_offset, 0);
@@ -505,8 +505,8 @@ void *HybridSieve::gpu_results_thread(void *args) {
     unsigned failed = 0;
 
     for (int i = 0; i < list->n_candidates(); i++) {
-      mpz_div_2exp(mpz, mpz, 32);
-      mpz_mul_2exp(mpz, mpz, 32);
+      mpz_div_2exp(mpz, mpz, 58);
+      mpz_mul_2exp(mpz, mpz, 58);
       mpz_add_ui(mpz, mpz, fermat->get_candidates_buffer()[i]);
 
       if (mpz_probab_prime_p(mpz, 25) != (int32_t) result[i]) {
@@ -1052,7 +1052,7 @@ bool HybridSieve::GPUWorkList::submit(uint32_t offset) {
   static unsigned valid = 0, invalid = 0;
   mpz_t mpz, next;
   mpz_init_set(mpz, mpz_hash);
-  mpz_mul_2exp(mpz, mpz, 32);
+  mpz_mul_2exp(mpz, mpz, 58);
   mpz_add_ui(mpz, mpz, offset);
   mpz_init_set(next, mpz);
   mpz_nextprime(next, mpz);
@@ -1069,7 +1069,7 @@ bool HybridSieve::GPUWorkList::submit(uint32_t offset) {
   mpz_clear(next);
 #endif
 
-  PoW pow(mpz_hash, 32, mpz_adder, target, nonce);
+  PoW pow(mpz_hash, 58, mpz_adder, target, nonce);
 
   if (pow.valid()) {
 #ifdef DEBUG_FAST
