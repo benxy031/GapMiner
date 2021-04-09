@@ -31,6 +31,9 @@
 #include <mpfr.h>
 #include <pthread.h>
 #include <iostream>
+bool reset_stats = false;
+
+
 
 #include "utils.h"
 #include "HybridSieve.h"
