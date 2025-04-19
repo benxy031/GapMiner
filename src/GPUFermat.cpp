@@ -1,5 +1,5 @@
 #ifndef CPU_ONLY
-#include <CL/cl.hpp>
+#include </usr/include/CL/cl2.hpp>
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -80,25 +80,24 @@ GPUFermat *GPUFermat::get_instance(unsigned device_id,
 }
 
 /* initialize this */
-GPUFermat::GPUFermat(unsigned device_id, 
-                     const char *platformId, 
-                     unsigned workItems) {
-
-  log_str("creating GPUFermat", LOG_D);
+// Optimized constructor for GPUFermat class
+GPUFermat::GPUFermat(unsigned device_id, const char *platformId, unsigned workItems) {
+  log_str("Creating GPUFermat", LOG_D);
   this->workItems = workItems;
-  init_cl(device_id, platformId);
+  init_cl(device_id, platformId); // Assuming init_cl is defined elsewhere for initializing OpenCL context and command queue
 
   elementsNum = GroupSize * workItems;
   numberLimbsNum = elementsNum * operandSize;
-
-  /* total number of worker groups */
   groupsNum = computeUnits * 4;
 
-  /* init Fermat buffers */
-  numbers.init(elementsNum, CL_MEM_READ_WRITE);
-  gpuResults.init(elementsNum, CL_MEM_READ_WRITE);
-  primeBase.init(operandSize, CL_MEM_READ_WRITE);
+  initializeBuffers(); // Function to handle buffer initialization
+}
 
+// Define the function to initialize buffers
+void GPUFermat::initializeBuffers() {
+  numbers.init(elementsNum, CL_MEM_READ_WRITE);
+  gpuResults.init(numberLimbsNum, CL_MEM_READ_WRITE);
+  primeBase.init(operandSize, CL_MEM_READ_WRITE);
 }
 
 uint32_t *GPUFermat::get_results_buffer() {
@@ -230,22 +229,24 @@ bool GPUFermat::init_cl(unsigned device_id, const char *platformId) {
     }
     
     cl_int error;
-    const char* sources[] = { sourcefile.c_str(), 0 };
-    gProgram = clCreateProgramWithSource(gContext, 1, sources, 0, &error);
-    OCLR(error, false);   
+const char* sources[] = { sourcefile.c_str(), 0 };
+gProgram = clCreateProgramWithSource(gContext, 1, sources, NULL, &error); // Corrected here
+OCLR(error, false);   
 
-    if (clBuildProgram(gProgram, 1, &gpu, NULL, 0, 0) != CL_SUCCESS) {    
-      size_t logSize;
-      clGetProgramBuildInfo(gProgram, devices[0], CL_PROGRAM_BUILD_LOG, 0, 0, &logSize);
-      
-      std::unique_ptr<char[]> log_str(new char[logSize]);
-      clGetProgramBuildInfo(gProgram, devices[0], CL_PROGRAM_BUILD_LOG, logSize, log.get(), 0);
-      pthread_mutex_lock(&io_mutex);                            
-      cout << get_time() <<  log.get() << endl;
-      pthread_mutex_unlock(&io_mutex);                       
-      
-      exit(1);
-    }    
+if (clBuildProgram(gProgram, 1, &gpu, NULL, 0, 0) != CL_SUCCESS) {    
+  size_t logSize;
+clGetProgramBuildInfo(gProgram, devices[0], CL_PROGRAM_BUILD_LOG, 0, nullptr, &logSize); // Corrected here
+
+//std::unique_ptr<char[]> log_str(new char,[logSize]); 
+
+clGetProgramBuildInfo(gProgram, devices[0], CL_PROGRAM_BUILD_LOG, logSize, nullptr, 0); // Corrected here
+    
+    pthread_mutex_lock(&io_mutex);                            
+    cout << get_time() <<  endl;
+    pthread_mutex_unlock(&io_mutex);                       
+    
+    exit(1);
+}    
     
     size_t binsizes[10];
     OCLR(clGetProgramInfo(gProgram, CL_PROGRAM_BINARY_SIZES, sizeof(binsizes), binsizes, 0), false);
@@ -463,7 +464,8 @@ void GPUFermat::run_fermat(cl_command_queue queue,
                            clBuffer &gpuResults,
                            unsigned elementsNum) {
 
-  log_str("running " + items(elementsNum) + " fermat tests on the gpu", LOG_D);
+                            
+  log_str("running " + std::to_string(elementsNum) + " fermat tests on the gpu", LOG_D);
   numbers.copyToDevice(queue);
   gpuResults.copyToDevice(queue);
   primeBase.copyToDevice(queue);
