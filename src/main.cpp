@@ -232,7 +232,7 @@ int main(int argc, char *argv[]) {
 #ifndef CPU_ONLY
   if (opts->has_benchmark()) {
     unsigned dev_id = (opts->has_gpu_dev() ? atoi(opts->get_gpu_dev().c_str()) : 0);
-    string platfrom  = (opts->has_platform() ? string(opts->get_platform()) : "amd");
+    string platfrom  = (opts->has_platform() ? string(opts->get_platform()) : "amd", "nvidia");
     unsigned workItems = (opts->has_work_items() ? atoi(opts->get_work_items().c_str()) : 2048);
 
     GPUFermat *fermat = GPUFermat::get_instance(dev_id, platfrom.c_str(), workItems);
@@ -309,10 +309,10 @@ int main(int argc, char *argv[]) {
   int timeout = (opts->has_timeout() ? atoi(opts->get_timeout().c_str()) : 25);
 
   /* default shift 25 */
-  uint16_t shift = (opts->has_shift() ?  atoi(opts->get_shift().c_str()) : 25);
+  uint16_t shift = (opts->has_shift() ?  atoi(opts->get_shift().c_str()) : 64);
 
   /* 10 seconds default */
-  unsigned int sec = (opts->has_stats() ? atoll(opts->get_stats().c_str()) : 10);
+  unsigned int sec = (opts->has_stats() ? atoll(opts->get_stats().c_str()) : 5);
 
   string host = opts->get_host();
   string port = opts->get_port();
@@ -350,7 +350,7 @@ int main(int argc, char *argv[]) {
     shift = 64;
 
     unsigned dev_id = (opts->has_gpu_dev() ? atoi(opts->get_gpu_dev().c_str()) : 0);
-    string platfrom  = (opts->has_platform() ? string(opts->get_platform()) : "amd");
+    string platfrom  = (opts->has_platform() ? string(opts->get_platform()) : "amd", "nvidia");
     unsigned workItems = (opts->has_work_items() ? atoi(opts->get_work_items().c_str()) : 2048);
 
     GPUFermat::get_instance(dev_id, platfrom.c_str(), workItems);

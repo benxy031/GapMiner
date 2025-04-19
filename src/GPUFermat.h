@@ -1,7 +1,7 @@
 #ifndef CPU_ONLY
 #ifndef __GPU_FERMAT_H__
 #define __GPU_FERMAT_H__
-#include <CL/cl.hpp>
+#include </usr/include/CL/cl2.hpp>
 #include <vector>
 #include <string>
 #include <gmp.h>
@@ -135,6 +135,8 @@ class GPUFermat {
                              cl_kernel kernel,
                              clBuffer &numbers,
                              unsigned elementsNum);
+
+                             void initializeBuffers(); // Function prototype                 
 
   public :
 

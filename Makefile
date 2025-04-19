@@ -5,10 +5,10 @@ CC        = g++
 DBFLAGS   = -g
 CXXFLAGS  = -Wall -Wextra -c -Winline -Wformat -Wformat-security \
             -pthread --param max-inline-insns-single=1000 -lm \
-						-I/opt/AMDAPP/include 
+						-I/usr/include 
 LDFLAGS   = -lm -lcrypto -lmpfr -lgmp -pthread -lcurl -ljansson \
-					  -L/opts/AMDAPP/lib -lOpenCL
-OTFLAGS   = -march=native -O3
+					  -L/usr/lib/x86_64-linux-gnu -lOpenCL
+OTFLAGS   = -march=native -O3 -ffast-math -fPIC -mtune=native -pipe
 
 .PHONY: clean test all install
 
@@ -40,8 +40,8 @@ CXXFLAGS  += $(OTFLAGS)
 LDFLAGS   += $(OTFLAGS)
 
 # disable GPU support
-CXXFLAGS += -DCPU_ONLY 
-LDFLAGS   = -lm -lcrypto -lmpfr -lgmp -pthread -lcurl -ljansson
+# CXXFLAGS += -DCPU_ONLY 
+# LDFLAGS   = -lm -lcrypto -lmpfr -lgmp -pthread -lcurl -ljansson
 
 EV_SRC  = $(shell find $(SRC)/Evolution -type f -name '*.c'|grep -v -e test -e evolution.c)
 EV_OBJ  = $(EV_SRC:%.c=%.o) $(SRC)/Evolution/src/evolution-O3.o

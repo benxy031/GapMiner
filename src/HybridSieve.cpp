@@ -31,13 +31,12 @@
 #include <mpfr.h>
 #include <pthread.h>
 #include <iostream>
-bool reset_stats = false;
-
-
 
 #include "utils.h"
 #include "HybridSieve.h"
 #include "Opts.h"
+
+bool reset_stats = false;
 
 #if __WORDSIZE == 64
 /**
@@ -185,7 +184,7 @@ void HybridSieve::run_sieve(PoW *pow,
   sieve_queue->clear();
   
   /* just to be sure */
-  pow->set_shift(58);
+  pow->set_shift(64);
 
   mpz_t mpz_offset;
   mpz_init_set_ui64(mpz_offset, 0);
@@ -220,7 +219,7 @@ void HybridSieve::run_sieve(PoW *pow,
       reset_stats      = false;
       cur_found_primes = 0;
       cur_tests        = 0;
-      cur_passed_time  = 0;
+      cur_passed_time  = 1;
     }
     
 
@@ -398,7 +397,7 @@ void *HybridSieve::gpu_work_thread(void *args) {
     mpz_set(mpz_start, sitem->mpz_start);
 
     double d_difficulty = ((double) pow->get_target()) / TWO_POW48;
-    sieve_t min_len     = log_str(mpz_get_d(mpz_start)) * d_difficulty;
+    sieve_t min_len     = log(mpz_get_d(mpz_start)) * d_difficulty;
     sieve_t start       = 0;
     sieve_t i           = 1;
 
@@ -505,8 +504,8 @@ void *HybridSieve::gpu_results_thread(void *args) {
     unsigned failed = 0;
 
     for (int i = 0; i < list->n_candidates(); i++) {
-      mpz_div_2exp(mpz, mpz, 58);
-      mpz_mul_2exp(mpz, mpz, 58);
+      mpz_div_2exp(mpz, mpz, 32);
+      mpz_mul_2exp(mpz, mpz, 32);
       mpz_add_ui(mpz, mpz, fermat->get_candidates_buffer()[i]);
 
       if (mpz_probab_prime_p(mpz, 25) != (int32_t) result[i]) {
@@ -1025,19 +1024,10 @@ void HybridSieve::GPUWorkList::parse_results(uint32_t *results) {
  * (and not divisible by two)
  */
 void HybridSieve::calc_muls() {
-  
   for (sieve_t i = 0; i < n_primes; i++) {
-
     starts[i] = primes[i] - mpz_tdiv_ui(mpz_start, primes[i]);
-
-    if (starts[i] == primes[i])
-      starts[i] = 0;
-
-    /* is start index divisible by two 
-     * (this check works because mpz_start is divisible by two)
-     */
-    if ((starts[i] & 1) == 0)
-      starts[i] += primes[i];
+    if (starts[i] == primes[i]) starts[i] = 0; // Corrected condition as per discussion above.
+    if ((starts[i] & 1) == 0) starts[i] += primes[i]; // Ensure odd start index for primes > 2
   }
 }
 
@@ -1045,14 +1035,14 @@ void HybridSieve::calc_muls() {
 bool HybridSieve::GPUWorkList::submit(uint32_t offset) {
   
   mpz_import(mpz_hash, 10, -1, 4, 0, 0, prime_base);
-  mpz_div_2exp(mpz_hash, mpz_hash, 32);
+  mpz_div_2exp(mpz_hash, mpz_hash, 64);
   mpz_set_ui(mpz_adder, offset);
 
 #ifdef DEBUG_FAST
   static unsigned valid = 0, invalid = 0;
   mpz_t mpz, next;
   mpz_init_set(mpz, mpz_hash);
-  mpz_mul_2exp(mpz, mpz, 58);
+  mpz_mul_2exp(mpz, mpz, 32);
   mpz_add_ui(mpz, mpz, offset);
   mpz_init_set(next, mpz);
   mpz_nextprime(next, mpz);
@@ -1069,7 +1059,7 @@ bool HybridSieve::GPUWorkList::submit(uint32_t offset) {
   mpz_clear(next);
 #endif
 
-  PoW pow(mpz_hash, 58, mpz_adder, target, nonce);
+  PoW pow(mpz_hash, 64, mpz_adder, target, nonce);
 
   if (pow.valid()) {
 #ifdef DEBUG_FAST

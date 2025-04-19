@@ -522,7 +522,7 @@ void Stratum::process_share(map<int, double> *shares, int id, bool accepted) {
       (accepted ? "accepted" : "stale!"), LOG_I);
 
   pthread_mutex_lock(&io_mutex);
-  cout.precision(4);
+  cout.precision(7);
   cout << get_time();
   cout << "Found Share: " << fixed << shares->at(id);
   cout << "  =>  " <<  (accepted ? "accepted" : "stale!");

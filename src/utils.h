@@ -51,7 +51,7 @@ string dtoa(double d, unsigned precision = 3);
 #define log_str(str, status)
 #else
 #define log_str(str, status) \
-  log_string(string("[") + __FILE__ + ":" + itoa(__LINE__) + "] " + str, status)
+ log_string(string("[") + __FILE__ + ":" + itoa(__LINE__) + "] " + str, status)
 
 /* logs the given string */
 void log_string(string str, int status);

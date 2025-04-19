@@ -34,6 +34,9 @@
 #include "utils.h"
 #include "Opts.h"
 #include "Stratum.h"
+//#include "UTILS.h"
+#include <iostream>
+#include <string>
 
 using namespace std;
 

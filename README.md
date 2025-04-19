@@ -38,8 +38,7 @@ Plus, currently it's only for Linux. Sorry.
 ```sh
   git clone https://github.com/gapcoin-project/GapMiner.git
   cd GapMiner
-  git submodule init
-  git submodule update
+  git submodule update --init --recursive
   make all
   make install
 ```
