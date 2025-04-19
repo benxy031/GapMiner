@@ -31,7 +31,7 @@ void vectorAdd(__global uint4 *output,
 #define WIDTH 20
 #define PCOUNT 40960
 #define TARGET 10
-
+#define __NVIDIA
 __constant uint pow2[9] = {1, 2, 4, 8, 16, 32, 64, 128, 256};
 
 __constant uint32_t binvert_limb_table[128] = {
@@ -72,7 +72,7 @@ typedef struct {
 	uint WIDTH_;
 	uint PCOUNT_;
 	uint TARGET_;
-	
+	uint WINDOWSIZE_;
 } config_t;
 
 
@@ -87,6 +87,57 @@ __kernel void getconfig(__global config_t* conf)
 	c.PCOUNT_ = PCOUNT;
 	c.TARGET_ = TARGET;
 	*conf = c;
+}
+
+void shl32(uint32_t *data, unsigned size)
+{
+  #pragma unroll
+  for (int j = size-1; j > 0; j--)
+    data[j] = data[j-1];
+  data[0] = 0;
+}
+
+void shr32(uint32_t *data, unsigned size)
+{
+  #pragma unroll
+  for (int j = 1; j < size; j++)
+    data[j-1] = data[j];
+  data[size-1] = 0;
+}
+
+void shl(uint32_t *data, unsigned size, unsigned bits)
+{
+  #pragma unroll
+  for(int i = size-1; i > 0; i--)
+    data[i] = (data[i] << bits) | (data[i-1] >> (32-bits));
+  
+  data[0] = data[0] << bits;
+}
+
+void shr(uint32_t *data, unsigned size, unsigned bits)
+{
+  #pragma unroll
+  for(uint i = 0; i < size-1; i++)
+    data[i] = (data[i] >> bits) | (data[i+1] << (32-bits));
+  data[size-1] = data[size-1] >> bits;
+}
+
+void shlreg(uint32_t *data, unsigned size, unsigned bits)
+{
+  for (unsigned i = 0, ie = bits/32; i < ie; i++)
+    shl32(data, size);
+  
+  if (bits%32)
+    shl(data, size, bits%32);
+}
+
+
+void shrreg(uint32_t *data, unsigned size, unsigned bits)
+{
+  for (unsigned i = 0, ie = bits/32; i < ie; i++)
+    shr32(data, size);
+  if (bits%32)
+    shr(data, size, bits%32);
 }
 
 uint32_t add128(uint4 *A, uint4 B)
@@ -888,16 +939,16 @@ void redcify352(unsigned shiftCount,
   result[0]++;
 }
 
-
+#if defined(__NVIDIA) || defined(__AMDLEGACY)
 void FermatTest352(uint4 *restrict limbs,
-                      uint4 *redcl)
+                   uint4 *redcl)
 {
   uint2 bitSize;
-//   uint4 redcl0, redcl1, redcl2;
+  //   uint4 redcl0, redcl1, redcl2;
   uint32_t inverted = invert_limb(limbs[0].x);  
   
-//   uint4 q0 = 0, q1 = 0;  
-  uint4 q[2] = {{0,0,0,0},{0,0,0,0}};
+  //   uint4 q0 = 0, q1 = 0;  
+  uint4 q[2] = {0, 0, 0, 0};
   {
     uint4 dl4 = {0, 0, 0, 0};    
     uint4 dl3 = {0, 0, 0, 1};
@@ -926,11 +977,78 @@ void FermatTest352(uint4 *restrict limbs,
   uint32_t *data = (uint32_t*)limbs;
   int remaining = (bitSize.x-1)*32 + bitSize.y;
   
+  uint32_t e[11];
+  for (unsigned i = 0; i < 11; i++)
+    e[i] = data[i];
+  e[0]--;
+  shlreg(e, 11, 352-remaining);    
+  
+  while (remaining > 0) {
+    int size = min(remaining, windowSize);
+    int index = e[10] >> (32-size);
+    
+    uint4 m[3];
+    for (unsigned i = 0; i < size; i++)
+      monSqr352(redcl, limbs, inverted);
+    
+    redcify352(index, q, limbs, m, windowSize);    
+    monMul352(redcl, m, limbs, inverted);
+    shl(e, 11, size);
+    remaining -= windowSize;
+  }
+  
+  redcHalf352(redcl, limbs, inverted);
+}
+
+#else
+
+void FermatTest352(uint4 *restrict limbs,
+                      uint4 *redcl)
+{
+  uint2 bitSize;
+  uint32_t inverted = invert_limb(limbs[0].x);  
+  
+  uint4 q[2] = {0, 0, 0, 0};
+  q[0] = 0;
+  q[1] = 0;
+  
+  {
+    uint4 dl4 = {0, 0, 0, 0};    
+    uint4 dl3 = {0, 0, 0, 1};
+    uint4 dl2 = {0, 0, 0, 0};
+    uint4 dl1 = {0, 0, 0, 0};
+    uint4 dl0 = {0, 0, 0, 0};
+    divq640to384(dl0, dl1, dl2, dl3, dl4, limbs[0], limbs[1], limbs[2], &q[0], &q[1]);
+  }
+  
+  
+  // Retrieve of "2" in Montgomery representation
+  {
+    uint4 dl3 = {0, 0, 0, 0};
+    uint4 dl2 = {0, 0, 0, 2};
+    uint4 dl1 = {0, 0, 0, 0};
+    uint4 dl0 = {0, 0, 0, 0};    
+    bitSize = modulo512to384(dl0, dl1, dl2, dl3, limbs[0], limbs[1], limbs[2], &redcl[0], &redcl[1], &redcl[2]);
+    --bitSize.y;
+    if (bitSize.y == 0) {
+      --bitSize.x;
+      bitSize.y = 32;
+    }
+  }
+  
+  const int windowSize = 7;  
+  int remaining = (bitSize.x-1)*32 + bitSize.y;
+  
+  uint32_t data[12];
+  for (unsigned i = 0; i < 11; i++)
+    data[i] = ((uint32_t*)limbs)[i];  
+  data[0]--;  
+  
   while (remaining > 0) {
     int bitPos = max(remaining-windowSize, 0);
     int size = min(remaining, windowSize);
     
-    uint64_t v64 = *(uint64_t*)(data+bitPos/32) - (remaining <= windowSize ? 1 : 0);
+    uint64_t v64 = *(uint64_t*)(data+bitPos/32);
     v64 >>= bitPos % 32;
     uint32_t index = ((uint32_t)v64) & ((1 << size) - 1);
 
@@ -943,10 +1061,10 @@ void FermatTest352(uint4 *restrict limbs,
     remaining -= windowSize;
   }
 
-  barrier(CLK_LOCAL_MEM_FENCE);
   redcHalf352(redcl, limbs, inverted);
 }
 
+#endif
 
 void redcify320(unsigned shiftCount,
                 uint4 *quotient,
@@ -954,8 +1072,7 @@ void redcify320(unsigned shiftCount,
                 uint32_t *result,
                 uint32_t windowSize)
 {
-  uint4 mr0, mr1, mr2, mr3;
-  uint4 q[2];
+  uint4 q[2] = {0, 0, 0, 0};
   q[0] = quotient[0];
   q[1] = quotient[1];
   
@@ -977,14 +1094,16 @@ void redcify320(unsigned shiftCount,
   result[0]++;
 }
 
-
+#if defined(__NVIDIA) || defined(__AMDLEGACY)
 void FermatTest320(uint4 *restrict limbs, uint4 *redcl)
 {
   uint2 bitSize;
   uint32_t inverted = invert_limb(limbs[0].x);  
   
-//   uint4 q0 = 0, q1 = 0;  
-  uint4 q[2] = {{0,0,0,0},{0,0,0,0}};
+  //   uint4 q0 = 0, q1 = 0;  
+  uint4 q[2] = {0, 0, 0, 0};
+  q[0] = 0;
+  q[1] = 0;
   {
     uint4 dl4 = {0, 0, 0, 0};    
     uint4 dl3 = {0, 0, 0, 0};
@@ -1013,11 +1132,79 @@ void FermatTest320(uint4 *restrict limbs, uint4 *redcl)
   int remaining = (bitSize.x-1)*32 + bitSize.y;
   
   const int windowSize = 5;
+  uint32_t e[10];
+  for (unsigned i = 0; i < 10; i++)
+    e[i] = data[i];
+  e[0]--;
+  shlreg(e, 10, 320-remaining);  
+  
+  int counter = 0;
+  while (remaining > 0) {
+    int size = min(remaining, windowSize);
+    int index = e[9] >> (32-size);
+    
+    uint4 m[3];
+    for (unsigned i = 0; i < size; i++)
+      monSqr320(redcl, limbs, inverted);
+    
+    redcify320(index, q, limbs, m, windowSize);
+    monMul320(redcl, m, limbs, inverted);   
+    
+    shl(e, 10, size);    
+    remaining -= windowSize;
+  }
+  
+  redcHalf320(redcl, limbs, inverted);
+}
+
+#else
+
+void FermatTest320(uint4 *restrict limbs, uint4 *redcl)
+{
+  uint2 bitSize;
+  uint32_t inverted = invert_limb(limbs[0].x);  
+
+  uint4 q[2] = {0, 0, 0, 0};
+  q[0] = 0;
+  q[1] = 0;
+  
+  {
+    uint4 dl4 = {0, 0, 0, 0};    
+    uint4 dl3 = {0, 0, 0, 0};
+    uint4 dl2 = {0, 0, 0, 1};
+    uint4 dl1 = {0, 0, 0, 0};
+    uint4 dl0 = {0, 0, 0, 0};
+    divq640to384(dl0, dl1, dl2, dl3, dl4, limbs[0], limbs[1], limbs[2], &q[0], &q[1]);
+  }
+  
+  
+  // Retrieve of "2" in Montgomery representation
+  {
+    uint4 dl3 = {0, 0, 0, 0};
+    uint4 dl2 = {0, 0, 2, 0};
+    uint4 dl1 = {0, 0, 0, 0};
+    uint4 dl0 = {0, 0, 0, 0};    
+    bitSize = modulo512to384(dl0, dl1, dl2, dl3, limbs[0], limbs[1], limbs[2], &redcl[0], &redcl[1], &redcl[2]);
+    --bitSize.y;
+    if (bitSize.y == 0) {
+      --bitSize.x;
+      bitSize.y = 32;
+    }
+  }
+
+  int remaining = (bitSize.x-1)*32 + bitSize.y;
+  const int windowSize = 5;
+  
+  uint32_t data[11];
+  for (unsigned i = 0; i < 10; i++)
+    data[i] = ((uint32_t*)limbs)[i];  
+  data[0]--;  
+  
   while (remaining > 0) {
     int bitPos = max(remaining-windowSize, 0);
     int size = min(remaining, windowSize);
     
-    uint64_t v64 = *(uint64_t*)(data+bitPos/32) - (remaining <= windowSize ? 1 : 0);
+    uint64_t v64 = *(uint64_t*)(data+bitPos/32);
     v64 >>= bitPos % 32;
     uint32_t index = ((uint32_t)v64) & ((1 << size) - 1);
 
@@ -1029,11 +1216,12 @@ void FermatTest320(uint4 *restrict limbs, uint4 *redcl)
     remaining -= windowSize;
   }
   
-  barrier(CLK_LOCAL_MEM_FENCE);  
   redcHalf320(redcl, limbs, inverted);
 }
 
-bool fermat352(const uint* p) {
+#endif
+
+bool fermat352(const uint4* p) {
   uint4 modpowl[3];
   FermatTest352((const uint4*)p, modpowl);
   
@@ -1043,7 +1231,6 @@ bool fermat352(const uint* p) {
   modpowl[0].x |= modpowl[0].y;
   modpowl[0].x |= modpowl[2].x;
   modpowl[0].x |= modpowl[2].y;  
-  modpowl[0].x |= modpowl[2].z;  
   return modpowl[0].x == 0;
 }
 
@@ -1061,17 +1248,14 @@ bool fermat320(const uint* p) {
 }
 
 
-uint int_invert(uint a, uint nPrime)
-{
-    // Extended Euclidean algorithm to calculate the inverse of a in finite field defined by nPrime
+uint int_invert(uint a, uint nPrime) {
+    // Using the Extended Euclidean Algorithm to calculate the inverse of a in finite field defined by nPrime
     int rem0 = nPrime, rem1 = a % nPrime, rem2;
     int aux0 = 0, aux1 = 1, aux2;
     int quotient, inverse;
     
-    while (1)
-    {
-        if (rem1 <= 1)
-        {
+    while (1) {
+        if (rem1 <= 1) {
             inverse = aux1;
             break;
         }
@@ -1080,8 +1264,7 @@ uint int_invert(uint a, uint nPrime)
         quotient = rem0 / rem1;
         aux2 = -quotient * aux1 + aux0;
         
-        if (rem2 <= 1)
-        {
+        if (rem2 <= 1) {
             inverse = aux2;
             break;
         }
@@ -1090,8 +1273,7 @@ uint int_invert(uint a, uint nPrime)
         quotient = rem1 / rem2;
         aux0 = -quotient * aux2 + aux1;
         
-        if (rem0 <= 1)
-        {
+        if (rem0 <= 1) {
             inverse = aux0;
             break;
         }
@@ -1103,57 +1285,6 @@ uint int_invert(uint a, uint nPrime)
     
     return (inverse + nPrime) % nPrime;
 }
-
-uint32_t mod32(uint32_t *data, unsigned size, uint32_t *modulos, uint32_t divisor)
-{
-  uint64_t acc = data[0];
-  for (unsigned i = 1; i < size; i++)
-    acc += (uint64_t)modulos[i-1] * (uint64_t)data[i];
-  return acc % divisor;
-}
-
-__kernel void setup_sieve(	__global uint* offset1,
-							__global uint* offset2,
-							__global const uint* vPrimes,
-							__global uint* hash,
-							uint hashid,
-              __global uint *modulos)
-{
-	
-	const uint id = get_global_id(0);
-	const uint nPrime = vPrimes[id];
-	
-	uint tmp[N];
-#pragma unroll
-	for(int i = 0; i < N; ++i)
-		tmp[i] = hash[hashid*N + i];
-
-  uint localModulos[N-2];
-#pragma unroll
-  for (unsigned i = 0; i < N-2; i++)
-    localModulos[i] = modulos[PCOUNT*i + id];
-  const uint nFixedFactorMod = mod32(tmp, N-1, localModulos, nPrime);
-  
-	if(nFixedFactorMod == 0){
-		for(uint line = 0; line < WIDTH; ++line){
-			offset1[PCOUNT*line + id] = 1u << 31;
-			offset2[PCOUNT*line + id] = 1u << 31;
-		}
-		return;
-		
-	}
-	
-	uint nFixedInverse = int_invert(nFixedFactorMod, nPrime);
-  for(uint layer = 0; layer < WIDTH; ++layer) {
-    offset1[PCOUNT*layer + id] = nFixedInverse;
-    offset2[PCOUNT*layer + id] = nPrime - nFixedInverse;
-    nFixedInverse = (nFixedInverse & 0x1) ?
-      (nFixedInverse + nPrime) / 2 : nFixedInverse / 2;
-  }    
-}
-
-
-
 void mul384_1(uint4 l0, uint4 l1, uint4 l2, uint32_t m,
               uint4 *r0, uint4 *r1, uint4 *r2)
 {
@@ -1216,32 +1347,30 @@ __kernel void setup_fermat( __global uint* fprimes,
 
 
 
-__attribute__((reqd_work_group_size(64, 1, 1)))
-__kernel void fermat_kernel(__global uchar* result,
-							__global const uint4* fprimes )
-{
-	
-	const uint id = get_global_id(0);
+// Function prototypes
+bool fermat352(const uint4* p);
+uint int_invert(uint a, uint nPrime);
 
-  uint4 p[3];
-  p[0] = fprimes[id*3+0];
-  p[1] = fprimes[id*3+1];
-  p[2] = fprimes[id*3+2];
-	result[id] = fermat352(p);
+__attribute__((reqd_work_group_size(256, 1, 1)))
+__kernel void fermat_kernel(__global uchar* result, __global const uint4* fprimes) {
+    uint id = get_global_id(0);
+    uint4 p[3];
+    p[0] = fprimes[id * 3 + 0];
+    p[1] = fprimes[id * 3 + 1];
+    p[2] = fprimes[id * 3 + 2];
+    
+    result[id] = fermat352(p) ? 1 : 0;
 }
 
-__attribute__((reqd_work_group_size(64, 1, 1)))
-__kernel void fermat_kernel320(__global uchar* result,
-              __global const uint4* fprimes )
-{
-  
-  const uint id = get_global_id(0);
-
-  uint4 p[3];
-  p[0] = fprimes[id*3+0];
-  p[1] = fprimes[id*3+1];
-  p[2] = fprimes[id*3+2];
-  result[id] = fermat320(p);
+__attribute__((reqd_work_group_size(256, 1, 1)))
+__kernel void fermat_kernel320(__global uchar* result, __global const uint4* fprimes) {
+    uint id = get_global_id(0);
+    uint4 p[3];
+    p[0] = fprimes[id * 3 + 0];
+    p[1] = fprimes[id * 3 + 1];
+    p[2] = fprimes[id * 3 + 2];
+    
+    result[id] = fermat320(p) ? 1 : 0;
 }
 
 
@@ -1277,3 +1406,53 @@ __kernel void check_fermat(	__global fermat_t* info_out,
 	}
 	
 }
+
+
+uint32_t mod32(uint32_t *data, unsigned size, uint32_t *modulos, uint32_t divisor)
+{
+  uint64_t acc = data[0];
+  for (unsigned i = 1; i < size; i++)
+    acc += (uint64_t)modulos[i-1] * (uint64_t)data[i];
+  return acc % divisor;
+}
+
+__kernel void setup_sieve(  __global uint* offset1,
+                            __global uint* offset2,
+                            __global const uint* vPrimes,
+                            __global uint* hash,
+                            uint hashid,
+                            __global uint *modulos)
+{
+  
+  const uint id = get_global_id(0);
+  const uint nPrime = vPrimes[id];
+  
+  uint tmp[N];
+#pragma unroll
+  for(int i = 0; i < N; ++i)
+    tmp[i] = hash[hashid*N + i];
+  
+  uint localModulos[N-2];
+#pragma unroll
+  for (unsigned i = 0; i < N-2; i++)
+    localModulos[i] = modulos[PCOUNT*i + id];
+  const uint nFixedFactorMod = mod32(tmp, N-1, localModulos, nPrime);
+  
+  if(nFixedFactorMod == 0){
+    for(uint line = 0; line < WIDTH; ++line){
+      offset1[PCOUNT*line + id] = 0; //1u << 31;
+      offset2[PCOUNT*line + id] = 0; //1u << 31;
+    }
+    return;
+    
+  }
+  
+  uint nFixedInverse = int_invert(nFixedFactorMod, nPrime);
+  for(uint layer = 0; layer < WIDTH; ++layer) {
+    offset1[PCOUNT*layer + id] = nFixedInverse;
+    offset2[PCOUNT*layer + id] = nPrime - nFixedInverse;
+    nFixedInverse = (nFixedInverse & 0x1) ?
+    (nFixedInverse + nPrime) / 2 : nFixedInverse / 2;
+  }    
+}
+
