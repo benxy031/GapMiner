@@ -3,12 +3,14 @@ SRC       = ./src
 BIN       = ./bin
 CC        = g++
 DBFLAGS   = -g
-CXXFLAGS  = -Wall -Wextra -c -Winline -Wformat -Wformat-security \
+CXXFLAGS  = -Wall -Wextra -c -Winline -Wformat -Wformat-security -Werror=calloc-transposed-args \
             -pthread --param max-inline-insns-single=1000 -lm \
 						-I/usr/include 
 LDFLAGS   = -lm -lcrypto -lmpfr -lgmp -pthread -lcurl -ljansson \
 					  -L/usr/lib/x86_64-linux-gnu -lOpenCL
-OTFLAGS   = -march=native -O3 -ffast-math -fPIC -mtune=native -pipe
+OTFLAGS   =  -O3 -msse4.1 -march=corei7-avx -mavx -ffast-math -fPIC -pipe
+
+
 
 .PHONY: clean test all install
 

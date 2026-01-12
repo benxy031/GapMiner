@@ -145,7 +145,7 @@ void *getwork_thread(void *arg) {
 
 #ifndef CPU_ONLY
   if (opts->has_use_gpu())
-    shift = 64;
+    shift = 45;
 #endif    
   
 
@@ -309,7 +309,7 @@ int main(int argc, char *argv[]) {
   int timeout = (opts->has_timeout() ? atoi(opts->get_timeout().c_str()) : 25);
 
   /* default shift 25 */
-  uint16_t shift = (opts->has_shift() ?  atoi(opts->get_shift().c_str()) : 64);
+  uint16_t shift = (opts->has_shift() ?  atoi(opts->get_shift().c_str()) : 45);
 
   /* 10 seconds default */
   unsigned int sec = (opts->has_stats() ? atoll(opts->get_stats().c_str()) : 5);
@@ -347,7 +347,7 @@ int main(int argc, char *argv[]) {
                  atoll(opts->get_primes().c_str()) :
                  3000000);
 
-    shift = 64;
+    shift = 45;
 
     unsigned dev_id = (opts->has_gpu_dev() ? atoi(opts->get_gpu_dev().c_str()) : 0);
     string platfrom  = (opts->has_platform() ? string(opts->get_platform()) : "amd", "nvidia");

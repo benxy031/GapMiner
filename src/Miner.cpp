@@ -63,7 +63,7 @@ Miner::Miner(uint64_t sieve_size,
 
 #ifndef CPU_ONLY  
   if (use_gpu)
-    this->n_threads = 1;
+    this->n_threads = n_threads;
 #endif    
 }              
 

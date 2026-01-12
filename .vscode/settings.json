@@ -1,5 +1,14 @@
 {
     "files.associations": {
-        "chrono": "cpp"
+        "chrono": "cpp",
+        "memory": "cpp",
+        "iomanip": "cpp",
+        "iostream": "cpp",
+        "string": "cpp",
+        "fstream": "cpp",
+        "vector": "cpp",
+        "sstream": "cpp",
+        "cstring": "cpp",
+        "cerrno": "cpp"
     }
 }

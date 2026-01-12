@@ -31,6 +31,10 @@
 #include <mpfr.h>
 #include <pthread.h>
 #include <iostream>
+#include <algorithm>
+#include <limits>
+#include <memory>
+#include <vector>
 
 #include "utils.h"
 #include "HybridSieve.h"
@@ -102,6 +106,23 @@ bool reset_stats = false;
 #define gpu_op_size 10
 
 using namespace std;
+
+class MutexGuard {
+public:
+    explicit MutexGuard(pthread_mutex_t& mtx) : mutex_(mtx) {
+        pthread_mutex_lock(&mutex_);
+    }
+    ~MutexGuard() {
+        pthread_mutex_unlock(&mutex_);
+    }
+    MutexGuard(const MutexGuard&) = delete;
+    MutexGuard& operator=(const MutexGuard&) = delete;
+
+private:
+    pthread_mutex_t& mutex_;
+};
+
+
 
 /**
  * create a new HybridSieve
@@ -184,7 +205,7 @@ void HybridSieve::run_sieve(PoW *pow,
   sieve_queue->clear();
   
   /* just to be sure */
-  pow->set_shift(64);
+  pow->set_shift(45);
 
   mpz_t mpz_offset;
   mpz_init_set_ui64(mpz_offset, 0);
@@ -359,7 +380,6 @@ bool HybridSieve::SieveQueue::full() {
 
 /* the gpu thread */
 void *HybridSieve::gpu_work_thread(void *args) {
-
   log_str("starting gpu_work_thread", LOG_D);
   if (Opts::get_instance()->has_extra_vb()) {
     pthread_mutex_lock(&io_mutex);
@@ -368,7 +388,6 @@ void *HybridSieve::gpu_work_thread(void *args) {
   }
 
 #ifndef WINDOWS
-  /* use idle CPU cycles for mining */
   struct sched_param param;
   param.sched_priority = sched_get_priority_min(SCHED_IDLE);
   sched_setscheduler(0, SCHED_IDLE, &param);
@@ -377,7 +396,8 @@ void *HybridSieve::gpu_work_thread(void *args) {
   SieveQueue *queue                  = (SieveQueue *) args;
   HybridSieve *hsieve                = queue->hsieve;
   HybridSieve::GPUWorkList *gpu_list = queue->gpu_list;
-  uint32_t offset_template[1024];
+  vector<uint32_t> offset_buffer;
+  offset_buffer.reserve(1024);
 
   mpz_t mpz_p, mpz_e, mpz_r, mpz_two, mpz_start;
   mpz_init_set_ui64(mpz_p, 0);
@@ -386,78 +406,90 @@ void *HybridSieve::gpu_work_thread(void *args) {
   mpz_init_set_ui64(mpz_two, 2);
   mpz_init_set_ui64(mpz_start, 0);
 
-
   while (queue->running) {
+    unique_ptr<SieveItem> sitem(queue->pull());
+    if (!sitem)
+      continue;
 
-    SieveItem *sitem    = queue->pull();
     PoW *pow            = sitem->pow;
     sieve_t *sieve      = sitem->sieve;
     sieve_t sievesize   = sitem->sievesize;
     sieve_t sieve_round = sitem->sieve_round;
     mpz_set(mpz_start, sitem->mpz_start);
 
-    double d_difficulty = ((double) pow->get_target()) / TWO_POW48;
-    sieve_t min_len     = log(mpz_get_d(mpz_start)) * d_difficulty;
-    sieve_t start       = 0;
-    sieve_t i           = 1;
+    double  d_difficulty = ((double) pow->get_target()) / TWO_POW48;
+    sieve_t min_len      = log(mpz_get_d(mpz_start)) * d_difficulty;
+    sieve_t start        = 0;
+    sieve_t i            = 1;
 
-    /* make sure min_len is divisible by two */
     min_len &= ~((sieve_t) 1);
+    if (min_len < 2)
+      min_len = 2;
+    if (min_len >= sievesize)
+      min_len = (sievesize > 2) ? ((sievesize & ~((sieve_t) 1)) - 2) : 2;
 
-    if (sieve_round == 0) {
+    bool stop_requested = hsieve->should_stop(sitem->hash);
 
-      /* init candidates_template */
+    if (sieve_round == 0 && !stop_requested) {
       size_t exported_size;
-      uint32_t prime_base[10] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
-
+      uint32_t prime_base[10] = {0};
       mpz_export(prime_base, &exported_size, -1, 4, 0, 0, mpz_start);
       gpu_list->reinit(prime_base, pow->get_target(), pow->get_nonce());
-    } 
+    }
 
-    /* Locate the first prime */
-    for ( ; i < sievesize; i += 2) {
-      if (is_prime(sieve, i)) {
-  
-        /* run fermat test */
+    if (!stop_requested) {
+      for (; i < sievesize; i += 2) {
+        if (!is_prime(sieve, i))
+          continue;
+
         mpz_add_ui(mpz_p, mpz_start, i + sievesize * sieve_round);
         mpz_sub_ui(mpz_e, mpz_p, 1);
         mpz_powm(mpz_r, mpz_two, mpz_e, mpz_p);
-   
+
         if (mpz_cmp_ui(mpz_r, 1) == 0) {
           i += 2;
+          start = i + sievesize * sieve_round;
           break;
         }
       }
     }
-    start = i + sievesize * sieve_round;
-  
 
-    /* run the sieve in size of min_len */
-    for (; i < sievesize - min_len && !hsieve->should_stop(sitem->hash); i += min_len) {
+    while (!stop_requested && i < sievesize - min_len) {
+      const size_t needed_capacity = static_cast<size_t>(min_len / 2) + 1;
+      if (offset_buffer.capacity() < needed_capacity)
+        offset_buffer.reserve(needed_capacity);
+      offset_buffer.clear();
 
-      sieve_t p = 0;
       for (sieve_t n = 0; n < min_len; n += 2) {
+        if (is_prime(sieve, i + n))
+          offset_buffer.push_back(i + n + sievesize * sieve_round);
+      }
 
-        if (is_prime(sieve, (i + n))) {
-          offset_template[p] = i + n + sievesize * sieve_round;
-          p++;
+      if (!offset_buffer.empty()) {
+        size_t emitted = 0;
+        while (emitted < offset_buffer.size()) {
+          size_t chunk = min(offset_buffer.size() - emitted,
+                             static_cast<size_t>(numeric_limits<uint16_t>::max()));
+          uint32_t chunk_start = (emitted == 0) ? start : 0;
+          gpu_list->add(new GPUWorkItem(offset_buffer.data() + emitted,
+                                        static_cast<uint16_t>(chunk),
+                                        min_len,
+                                        chunk_start));
+          start = 0;
+          emitted += chunk;
         }
       }
 
-      gpu_list->add(new GPUWorkItem(offset_template, p, min_len, start));
-      start = 0;
+      i += min_len;
+      stop_requested = hsieve->should_stop(sitem->hash);
     }
 
-    // approx. Primes in that range. Just for pps shown.
     *queue->cur_found_primes += i / 198;
-    *queue->found_primes += i / 198;
+    *queue->found_primes     += i / 198;
 
-    if (hsieve->should_stop(sitem->hash)) {
-      queue->clear();
+    if (stop_requested) {
       queue->clear();
     }
-
-    delete sitem;
   }
 
   mpz_clear(mpz_p);
@@ -489,39 +521,34 @@ void *HybridSieve::gpu_results_thread(void *args) {
   GPUWorkList *list = (GPUWorkList *) args;
   GPUFermat *fermat = GPUFermat::get_instance();
   uint32_t *result  = fermat->get_results_buffer();
+  const bool extra_verbose = Opts::get_instance()->has_extra_vb();
 
   while (list->running) {
-    
+    const uint64_t cycle_start = PoWUtils::gettime_usec();
+
     list->create_candidates();
+    if (!list->running)
+      break;
+
     fermat->fermat_gpu();
-#ifdef DEBUG_SLOW
-#ifdef CHECK_GPU_RESULTS
-    mpz_t mpz;
-    mpz_init(mpz);
+    if (!list->running)
+      break;
 
-    uint32_t *prime_base = list->get_prime_base();
-    mpz_import(mpz, 10, -1, 4, 0, 0, prime_base);
-    unsigned failed = 0;
-
-    for (int i = 0; i < list->n_candidates(); i++) {
-      mpz_div_2exp(mpz, mpz, 32);
-      mpz_mul_2exp(mpz, mpz, 32);
-      mpz_add_ui(mpz, mpz, fermat->get_candidates_buffer()[i]);
-
-      if (mpz_probab_prime_p(mpz, 25) != (int32_t) result[i]) {
-        failed++;
-      }
-    }
-    mpz_clear(mpz);
-
-    if (failed)
-      cout << "[DD] " << failed << " of " << 512*256/8 << " Prime tests failed" << endl;
-#endif
-#endif
     list->parse_results(result);
+    if (!list->running)
+      break;
 
-    *list->tests     += list->n_candidates();
-    *list->cur_tests += list->n_candidates();
+    const uint32_t processed = list->n_candidates();
+    *list->tests     += processed;
+    *list->cur_tests += processed;
+
+    if (extra_verbose) {
+      const uint64_t cycle_end = PoWUtils::gettime_usec();
+      pthread_mutex_lock(&io_mutex);
+      cout << get_time() << "GPU cycle processed " << processed
+           << " candidates in " << (cycle_end - cycle_start) / 1000.0 << " ms\n";
+      pthread_mutex_unlock(&io_mutex);
+    }
   }
 
   return NULL;
@@ -706,24 +733,22 @@ void HybridSieve::GPUWorkItem::set_start(uint32_t start) {
 
 /* returns whether this gap can be skipped */
 bool HybridSieve::GPUWorkItem::skip() {
-  return (start != 0 && end != 0 && next != NULL && (end - start < min_len || start > end));
+  return (start != 0 && end != 0 && next != NULL && 
+          (end <= start || end - start < min_len));
 }
 
 /* returns whether this is a valid gap */
 bool HybridSieve::GPUWorkItem::valid() {
+  if (start == 0 || index >= 0)
+    return false;
   
-  if (start != 0 && index < 0) {
-    if (end == 0) {
-      if (next != NULL)
-        next->mark_skipable();
-      
-      return true;
-    }
-    if (end > start && end - start >= min_len)
-      return true;
+  if (end == 0) {
+    if (next != NULL)
+      next->mark_skipable();
+    return true;
   }
-
-  return false;
+  
+  return end > start && end - start >= min_len;
 }
 
 /* returns the start offset */
@@ -740,110 +765,112 @@ uint16_t HybridSieve::GPUWorkItem::get_cur_len() {
 
 /* create a new gpu work list */
 HybridSieve::GPUWorkList::GPUWorkList(uint32_t len, 
-                                      uint32_t n_tests,
-                                      PoWProcessor *pprocessor,
-                                      HybridSieve *sieve,
-                                      uint32_t *prime_base,
-                                      uint32_t *candidates,
-                                      uint64_t *tests,
-                                      uint64_t *cur_tests) {
+                    uint32_t n_tests,
+                    PoWProcessor *pprocessor,
+                    HybridSieve *sieve,
+                    uint32_t *prime_base,
+                    uint32_t *candidates,
+                    uint64_t *tests,
+                    uint64_t *cur_tests) {
   
   log_str("creating new GPUWorkList", LOG_D);
+  
   pthread_mutex_init(&access_mutex, NULL);
   pthread_cond_init(&notfull_cond, NULL);
   pthread_cond_init(&full_cond, NULL);
 
-  this->len        = len;
-  this->cur_len    = 0;
-  this->n_tests    = n_tests;
-  this->pprocessor = pprocessor;
-  this->sieve      = sieve;
-  this->prime_base = prime_base;
-  this->start      = NULL;
-  this->end        = NULL;
-  this->running    = true;
-  this->tests      = tests;
-  this->cur_tests  = cur_tests;
-  this->candidates = candidates;
+  this->len           = len;
+  this->cur_len       = 0;
+  this->n_tests       = n_tests;
+  this->pprocessor    = pprocessor;
+  this->sieve         = sieve;
+  this->prime_base    = prime_base;
+  this->candidates    = candidates;
+  this->tests         = tests;
+  this->cur_tests     = cur_tests;
+  this->start         = NULL;
+  this->end           = NULL;
+  this->running       = true;
   this->extra_verbose = Opts::get_instance()->has_extra_vb();
 
   memset(prime_base, 0, sizeof(uint32_t) * 10);
+  
   mpz_init_set_ui(mpz_hash, 0);
   mpz_init_set_ui(mpz_adder, 0);
 }
 
 HybridSieve::GPUWorkList::~GPUWorkList() {
   log_str("deleting GPUWorkList", LOG_D);
+  
   pthread_mutex_destroy(&access_mutex);
   pthread_cond_destroy(&notfull_cond);
   pthread_cond_destroy(&full_cond);
+  
   mpz_clear(mpz_hash);
   mpz_clear(mpz_adder);
 }
 
 /* returns the size of this */
 size_t HybridSieve::GPUWorkList::size() {
-  size_t size = sizeof(GPUWorkList) + sizeof(uint32_t) * 10 * len * n_tests;
-
-  pthread_mutex_lock(&access_mutex);
+  MutexGuard guard(access_mutex);
 
   while (cur_len < len)
     pthread_cond_wait(&full_cond, &access_mutex);
 
+  size_t size = sizeof(GPUWorkList) + sizeof(uint32_t) * 10 * len * n_tests;
+
   for (GPUWorkItem *cur = start; cur != NULL; cur = cur->next) 
     size += sizeof(GPUWorkItem) + sizeof(uint32_t) * cur->get_len();
-  pthread_mutex_unlock(&access_mutex);
 
   return size;
 }
 
 /* returns the average length*/
 uint16_t HybridSieve::GPUWorkList::avg_len() {
-  uint64_t len = 0;
-  uint64_t i = 0;
-
-  pthread_mutex_lock(&access_mutex);
+  MutexGuard guard(access_mutex);
 
   while (cur_len < len)
     pthread_cond_wait(&full_cond, &access_mutex);
 
-  for (GPUWorkItem *cur = start; cur != NULL; cur = cur->next, i++) 
-    len += cur->get_len();
-  pthread_mutex_unlock(&access_mutex);
+  uint64_t total_len = 0;
+  uint64_t count = 0;
 
-  return len / i;
+  for (GPUWorkItem *cur = start; cur != NULL; cur = cur->next, count++) 
+    total_len += cur->get_len();
+
+  return (count > 0) ? total_len / count : 0;
 }
 
 /* returns the average length*/
 uint16_t HybridSieve::GPUWorkList::avg_cur_len() {
-  uint64_t len = 0;
-  uint64_t i = 0;
-
-  pthread_mutex_lock(&access_mutex);
+  MutexGuard guard(access_mutex);
 
   while (cur_len < len)
     pthread_cond_wait(&full_cond, &access_mutex);
 
-  for (GPUWorkItem *cur = start; cur != NULL; cur = cur->next, i++) 
-    len += cur->get_cur_len();
-  pthread_mutex_unlock(&access_mutex);
+  uint64_t total_len = 0;
+  uint64_t count = 0;
 
-  return len / i;
+  for (GPUWorkItem *cur = start; cur != NULL; cur = cur->next, count++) 
+    total_len += cur->get_cur_len();
+
+  return (count > 0) ? total_len / count : 0;
 }
 
 /* returns the min length*/
 uint16_t HybridSieve::GPUWorkList::min_cur_len() {
-  uint16_t min = UINT16_MAX;
-
-  pthread_mutex_lock(&access_mutex);
+  MutexGuard guard(access_mutex);
 
   while (cur_len < len)
     pthread_cond_wait(&full_cond, &access_mutex);
 
-  for (GPUWorkItem *cur = start; cur != NULL; cur = cur->next) 
-    if (min > cur->get_cur_len())
-      min = cur->get_cur_len();
-  pthread_mutex_unlock(&access_mutex);
+  uint16_t min = UINT16_MAX;
+  for (GPUWorkItem *cur = start; cur != NULL; cur = cur->next) {
+    uint16_t cur_len_val = cur->get_cur_len();
+    if (cur_len_val < min)
+      min = cur_len_val;
+    if (min == 0) break;  // Early exit optimization
+  }
 
   return min;
 }
@@ -851,54 +878,52 @@ uint16_t HybridSieve::GPUWorkList::min_cur_len() {
 /* reinits this */
 void HybridSieve::GPUWorkList::reinit(uint32_t prime_base[10], uint64_t target, uint32_t nonce) {
 
-  pthread_mutex_lock(&access_mutex);
+  MutexGuard guard(access_mutex);
 
   clear();
-  this->target     = target;
-  this->nonce      = nonce;
+  this->target = target;
+  this->nonce = nonce;
   memcpy(this->prime_base, prime_base, sizeof(uint32_t) * 10);
 
   pthread_cond_signal(&notfull_cond);
-  pthread_mutex_unlock(&access_mutex);
 }
 
 /* returns the number of candidates */
-uint32_t HybridSieve::GPUWorkList::n_candidates() { return len * n_tests; }
+uint32_t HybridSieve::GPUWorkList::n_candidates() { 
+  return len * n_tests; 
+}
 
 /* add a item to the list */
 void HybridSieve::GPUWorkList::add(GPUWorkItem *item) {
   
-  pthread_mutex_lock(&access_mutex);
+  MutexGuard guard(access_mutex);
 
   while (cur_len >= len)
-    pthread_cond_wait(&notfull_cond, &access_mutex);
+  pthread_cond_wait(&notfull_cond, &access_mutex);
 
-  if (start == NULL && end == NULL) {
-    start = item;
-    end   = item;
+  if (start == NULL) {
+  start = end = item;
   } else {
-    
-    if (end->get_end() != 0 && item->get_start() == 0)
-      item->set_start(end->get_end());
-    if (end->get_end() == 0 && item->get_start() != 0)
-      end->set_end();
+  // Link gap boundaries between consecutive items
+  if (end->get_end() != 0 && item->get_start() == 0)
+    item->set_start(end->get_end());
+  else if (end->get_end() == 0 && item->get_start() != 0)
+    end->set_end();
 
-    end->next = item;
-    end       = item;
+  end->next = item;
+  end = item;
   }
 
   cur_len++;
   
   if (cur_len >= len)
-    pthread_cond_signal(&full_cond);
-
-  pthread_mutex_unlock(&access_mutex);
+  pthread_cond_signal(&full_cond);
 }
 
 /* creates the candidate array to process */
 void HybridSieve::GPUWorkList::create_candidates() {
 
-  pthread_mutex_lock(&access_mutex);
+  MutexGuard guard(access_mutex);
 
   while (cur_len < len)
     pthread_cond_wait(&full_cond, &access_mutex);
@@ -912,7 +937,7 @@ void HybridSieve::GPUWorkList::create_candidates() {
     for (uint32_t n = 0; n < n_tests; n++)
       candidates[i + n] = cur->pop();
 
-     i += n_tests;
+    i += n_tests;
   }
 }
 
@@ -1024,18 +1049,22 @@ void HybridSieve::GPUWorkList::parse_results(uint32_t *results) {
  * (and not divisible by two)
  */
 void HybridSieve::calc_muls() {
-  for (sieve_t i = 0; i < n_primes; i++) {
-    starts[i] = primes[i] - mpz_tdiv_ui(mpz_start, primes[i]);
-    if (starts[i] == primes[i]) starts[i] = 0; // Corrected condition as per discussion above.
-    if ((starts[i] & 1) == 0) starts[i] += primes[i]; // Ensure odd start index for primes > 2
-  }
+    for (sieve_t i = 0; i < n_primes; ++i) {
+        mpz_class prime = primes[i];
+        mpz_class remainder;
+        mpz_mod(remainder.get_mpz_t(), mpz_start, prime.get_mpz_t());
+        mpz_class diff = prime - remainder;
+        starts[i] = (remainder == 0) ? 0 : (sieve_t)diff.get_ui();
+        if (prime != 2 && starts[i] % 2 == 0)
+            starts[i] += prime.get_ui();
+    }
 }
 
 /* submits a given offset */
 bool HybridSieve::GPUWorkList::submit(uint32_t offset) {
   
   mpz_import(mpz_hash, 10, -1, 4, 0, 0, prime_base);
-  mpz_div_2exp(mpz_hash, mpz_hash, 64);
+  mpz_div_2exp(mpz_hash, mpz_hash, 45);
   mpz_set_ui(mpz_adder, offset);
 
 #ifdef DEBUG_FAST
@@ -1059,7 +1088,7 @@ bool HybridSieve::GPUWorkList::submit(uint32_t offset) {
   mpz_clear(next);
 #endif
 
-  PoW pow(mpz_hash, 64, mpz_adder, target, nonce);
+  PoW pow(mpz_hash, 45, mpz_adder, target, nonce);
 
   if (pow.valid()) {
 #ifdef DEBUG_FAST
