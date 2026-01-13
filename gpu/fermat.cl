@@ -5,6 +5,29 @@
  *      Author: mad
  */
 
+#ifndef GAPMINER_OPENCL_STDINT
+#define GAPMINER_OPENCL_STDINT
+typedef uchar uint8_t;
+typedef uint  uint32_t;
+typedef ulong uint64_t;
+#endif
+
+// External Montgomery helpers live in procs.cl; declare them here to
+// appease OpenCL's no-implicit-declaration rule.
+void monSqr320(uint32_t *op, uint32_t *mod, uint32_t invm);
+void monMul320(uint32_t *op1, uint32_t *op2, uint32_t *mod, uint32_t invm);
+void redcHalf320(uint32_t *op, uint32_t *mod, uint32_t invm);
+void mulProductScan320to96(uint32_t *out, uint32_t *op1, uint32_t *op2);
+void mulProductScan320to128(uint32_t *out, uint32_t *op1, uint32_t *op2);
+void mulProductScan320to192(uint32_t *out, uint32_t *op1, uint32_t *op2);
+
+void monSqr352(uint32_t *op, uint32_t *mod, uint32_t invm);
+void monMul352(uint32_t *op1, uint32_t *op2, uint32_t *mod, uint32_t invm);
+void redcHalf352(uint32_t *op, uint32_t *mod, uint32_t invm);
+void mulProductScan352to96(uint32_t *out, uint32_t *op1, uint32_t *op2);
+void mulProductScan352to128(uint32_t *out, uint32_t *op1, uint32_t *op2);
+void mulProductScan352to192(uint32_t *out, uint32_t *op1, uint32_t *op2);
+
 __kernel 
 void vectorAdd(__global uint4 *output,
                 __global float4 *inputA)
@@ -926,12 +949,14 @@ void redcify352(unsigned shiftCount,
     rshiftByLimb2(&q[0], &q[1]);
   rshift2(&q[0], &q[1], (pow2ws-shiftCount) % 32);
 
+  uint32_t *limbWords = (uint32_t*)limbs;
+  uint32_t *quotientWords = (uint32_t*)q;
   if (windowSize == 5)
-    mulProductScan352to96(result, limbs, q);
+    mulProductScan352to96(result, limbWords, quotientWords);
   else if (windowSize == 6)
-    mulProductScan352to128(result, limbs, q);
+    mulProductScan352to128(result, limbWords, quotientWords);
   else if (windowSize == 7)
-    mulProductScan352to192(result, limbs, q);
+    mulProductScan352to192(result, limbWords, quotientWords);
   
   // substract 2^(384+shiftCount) - q*R
   for (unsigned i = 0; i < 11; i++)
@@ -948,7 +973,7 @@ void FermatTest352(uint4 *restrict limbs,
   uint32_t inverted = invert_limb(limbs[0].x);  
   
   //   uint4 q0 = 0, q1 = 0;  
-  uint4 q[2] = {0, 0, 0, 0};
+  uint4 q[2] = {(uint4)(0u), (uint4)(0u)};
   {
     uint4 dl4 = {0, 0, 0, 0};    
     uint4 dl3 = {0, 0, 0, 1};
@@ -1008,7 +1033,7 @@ void FermatTest352(uint4 *restrict limbs,
   uint2 bitSize;
   uint32_t inverted = invert_limb(limbs[0].x);  
   
-  uint4 q[2] = {0, 0, 0, 0};
+  uint4 q[2] = {(uint4)(0u), (uint4)(0u)};
   q[0] = 0;
   q[1] = 0;
   
@@ -1072,7 +1097,7 @@ void redcify320(unsigned shiftCount,
                 uint32_t *result,
                 uint32_t windowSize)
 {
-  uint4 q[2] = {0, 0, 0, 0};
+  uint4 q[2] = {(uint4)(0u), (uint4)(0u)};
   q[0] = quotient[0];
   q[1] = quotient[1];
   
@@ -1081,12 +1106,14 @@ void redcify320(unsigned shiftCount,
     rshiftByLimb2(&q[0], &q[1]);
   rshift2(&q[0], &q[1], (pow2ws-shiftCount) % 32);
 
+  uint32_t *limbWords = (uint32_t*)limbs;
+  uint32_t *quotientWords = (uint32_t*)q;
   if (windowSize == 5)
-    mulProductScan320to96(result, limbs, q);  
+    mulProductScan320to96(result, limbWords, quotientWords);
   else if (windowSize == 6)
-    mulProductScan320to128(result, limbs, q);
+    mulProductScan320to128(result, limbWords, quotientWords);
   else if (windowSize == 7)
-    mulProductScan320to192(result, limbs, q);
+    mulProductScan320to192(result, limbWords, quotientWords);
   
   // substract 2^(384+shiftCount) - q*R
   for (unsigned i = 0; i < 10; i++)
@@ -1101,7 +1128,7 @@ void FermatTest320(uint4 *restrict limbs, uint4 *redcl)
   uint32_t inverted = invert_limb(limbs[0].x);  
   
   //   uint4 q0 = 0, q1 = 0;  
-  uint4 q[2] = {0, 0, 0, 0};
+  uint4 q[2] = {(uint4)(0u), (uint4)(0u)};
   q[0] = 0;
   q[1] = 0;
   {
@@ -1164,7 +1191,7 @@ void FermatTest320(uint4 *restrict limbs, uint4 *redcl)
   uint2 bitSize;
   uint32_t inverted = invert_limb(limbs[0].x);  
 
-  uint4 q[2] = {0, 0, 0, 0};
+  uint4 q[2] = {(uint4)(0u), (uint4)(0u)};
   q[0] = 0;
   q[1] = 0;
   
@@ -1221,9 +1248,9 @@ void FermatTest320(uint4 *restrict limbs, uint4 *redcl)
 
 #endif
 
-bool fermat352(const uint4* p) {
+bool fermat352(uint4* p) {
   uint4 modpowl[3];
-  FermatTest352((const uint4*)p, modpowl);
+  FermatTest352(p, modpowl);
   
   --modpowl[0].x;
   modpowl[0] |= modpowl[1];
@@ -1234,9 +1261,9 @@ bool fermat352(const uint4* p) {
   return modpowl[0].x == 0;
 }
 
-bool fermat320(const uint* p) {
+bool fermat320(uint4* p) {
   uint4 modpowl[3];
-  FermatTest320((const uint4*)p, modpowl);
+  FermatTest320(p, modpowl);
   
   --modpowl[0].x;
   modpowl[0] |= modpowl[1];
@@ -1348,7 +1375,8 @@ __kernel void setup_fermat( __global uint* fprimes,
 
 
 // Function prototypes
-bool fermat352(const uint4* p);
+bool fermat352(uint4* p);
+bool fermat320(uint4* p);
 uint int_invert(uint a, uint nPrime);
 
 __attribute__((reqd_work_group_size(256, 1, 1)))
@@ -1410,10 +1438,10 @@ __kernel void check_fermat(	__global fermat_t* info_out,
 
 uint32_t mod32(uint32_t *data, unsigned size, uint32_t *modulos, uint32_t divisor)
 {
-  uint64_t acc = data[0];
-  for (unsigned i = 1; i < size; i++)
-    acc += (uint64_t)modulos[i-1] * (uint64_t)data[i];
-  return acc % divisor;
+    ulong acc = (ulong)data[0];
+    for (unsigned i = 1; i < size; ++i)
+        acc += (ulong)modulos[i-1] * (ulong)data[i];
+    return (uint)(acc % divisor);
 }
 
 __kernel void setup_sieve(  __global uint* offset1,

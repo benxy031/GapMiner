@@ -1,6 +1,9 @@
+#ifndef GAPMINER_OPENCL_STDINT
+#define GAPMINER_OPENCL_STDINT
 typedef unsigned char uint8_t;
 typedef unsigned int uint32_t;
 typedef unsigned long uint64_t;
+#endif
  
 void sub(uint32_t *a, const uint32_t *b, int size)
 {
