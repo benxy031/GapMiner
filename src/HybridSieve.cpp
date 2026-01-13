@@ -1049,15 +1049,43 @@ void HybridSieve::GPUWorkList::parse_results(uint32_t *results) {
  * (and not divisible by two)
  */
 void HybridSieve::calc_muls() {
-    for (sieve_t i = 0; i < n_primes; ++i) {
-        mpz_class prime = primes[i];
-        mpz_class remainder;
-        mpz_mod(remainder.get_mpz_t(), mpz_start, prime.get_mpz_t());
-        mpz_class diff = prime - remainder;
-        starts[i] = (remainder == 0) ? 0 : (sieve_t)diff.get_ui();
-        if (prime != 2 && starts[i] % 2 == 0)
-            starts[i] += prime.get_ui();
+  mpz_t remainder, diff;
+  mpz_init(remainder);
+  mpz_init(diff);
+
+  for (sieve_t i = 0; i < n_primes; ++i) {
+    const mpz_class& prime = primes[i];
+
+    mpz_mod(remainder, mpz_start, prime.get_mpz_t());
+    if (mpz_sgn(remainder) == 0) {
+      starts[i] = 0;
+      continue;
     }
+
+    mpz_sub(diff, prime.get_mpz_t(), remainder);
+
+    // Ensure diff fits into sieve_t without overflow.
+    sieve_t start_value;
+    if (mpz_fits_ulong_p(diff)) {
+      unsigned long tmp = mpz_get_ui(diff);
+      const unsigned long max_sieve_t =
+          static_cast<unsigned long>(std::numeric_limits<sieve_t>::max());
+      if (tmp > max_sieve_t) {
+        tmp = max_sieve_t;
+      }
+      start_value = static_cast<sieve_t>(tmp);
+    } else {
+      // If diff does not fit in unsigned long, clamp to maximum sieve_t value.
+      start_value = std::numeric_limits<sieve_t>::max();
+    }
+
+    starts[i] = start_value;
+    if (prime != 2 && (starts[i] & 1u) == 0)
+      starts[i] += prime.get_ui();
+  }
+
+  mpz_clear(diff);
+  mpz_clear(remainder);
 }
 
 /* submits a given offset */

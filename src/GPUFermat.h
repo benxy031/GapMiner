@@ -105,11 +105,15 @@ class GPUFermat {
 
     /* this is a singleton */
     GPUFermat(unsigned device_id, const char *platformId, unsigned workItems);
+    ~GPUFermat();
 
 
     /* initialize opencl for the given device */
     bool init_cl(unsigned device_id = 0, 
                  const char *platformId = "amd");
+
+    bool loadKernelSources(std::string &sourcefile);
+    bool buildKernelBinary(const std::string &sourcefile);
 
 
     void benchmark2();
@@ -153,6 +157,9 @@ class GPUFermat {
     static GPUFermat *get_instance(unsigned device_id = (unsigned)(-1), 
                                    const char *platformId = NULL,
                                    unsigned workItems = 0);
+
+    /* destroy the singleton instance and release resources */
+    static void destroy_instance();
 
     /* public interface to the gpu Fermat test */
     void fermat_gpu();

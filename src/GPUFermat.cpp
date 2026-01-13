@@ -6,6 +6,9 @@
 #include <string>
 #include <memory>
 #include <chrono>
+#include <stdexcept>
+#include <array>
+#include <iterator>
 #include <gmp.h>
 #include <gmpxx.h>
 
@@ -13,6 +16,14 @@
 #include "utils.h"
 
 using namespace std;
+
+namespace {
+constexpr const char *kKernelBinaryPath = "kernel.bin";
+constexpr array<const char *, 3> kKernelSourceFiles = {"gpu/procs.cl",
+                                                       "gpu/fermat.cl",
+                                                       "gpu/benchmarks.cl"};
+constexpr const char *kBuildOptions = "-cl-mad-enable -cl-fast-relaxed-math";
+}
 
 #define OCL(error)                                            \
 	if(cl_int err = error) {                                    \
@@ -59,6 +70,29 @@ unsigned GPUFermat::GroupSize = 256;
 /* the array size of uint32_t for the numbers to test */
 unsigned GPUFermat::operandSize = 320/32;
 
+GPUFermat::~GPUFermat() {
+  if (mFermatBenchmarkKernel320) {
+    clReleaseKernel(mFermatBenchmarkKernel320);
+    mFermatBenchmarkKernel320 = nullptr;
+  }
+  if (mFermatKernel320) {
+    clReleaseKernel(mFermatKernel320);
+    mFermatKernel320 = nullptr;
+  }
+  if (queue) {
+    clReleaseCommandQueue(queue);
+    queue = nullptr;
+  }
+  if (gProgram) {
+    clReleaseProgram(gProgram);
+    gProgram = nullptr;
+  }
+  if (gContext) {
+    clReleaseContext(gContext);
+    gContext = nullptr;
+  }
+}
+
 /* return the only instance of this */
 GPUFermat *GPUFermat::get_instance(unsigned device_id, 
                                    const char *platformId,
@@ -79,12 +113,28 @@ GPUFermat *GPUFermat::get_instance(unsigned device_id,
   return only_instance;
 }
 
+void GPUFermat::destroy_instance() {
+  pthread_mutex_lock(&creation_mutex);
+  delete only_instance;
+  only_instance = NULL;
+  initialized = false;
+  pthread_mutex_unlock(&creation_mutex);
+}
+
 /* initialize this */
 // Optimized constructor for GPUFermat class
 GPUFermat::GPUFermat(unsigned device_id, const char *platformId, unsigned workItems) {
   log_str("Creating GPUFermat", LOG_D);
+  gProgram = nullptr;
+  mFermatBenchmarkKernel320 = nullptr;
+  mFermatKernel320 = nullptr;
+  gpu = nullptr;
+  computeUnits = 0;
+  queue = nullptr;
   this->workItems = workItems;
-  init_cl(device_id, platformId); // Assuming init_cl is defined elsewhere for initializing OpenCL context and command queue
+  if (!init_cl(device_id, platformId)) {
+    throw std::runtime_error("GPUFermat OpenCL initialization failed");
+  }
 
   elementsNum = GroupSize * workItems;
   numberLimbsNum = elementsNum * operandSize;
@@ -154,7 +204,7 @@ bool GPUFermat::init_cl(unsigned device_id, const char *platformId) {
   
   if(iplatform < 0){
     pthread_mutex_lock(&io_mutex);                            
-    cout << get_time() << "ERROR: " << platformName << " found" << endl;
+    cout << get_time() << "ERROR: " << platformName << " not found" << endl;
     pthread_mutex_unlock(&io_mutex);                       
     return false;
   }
@@ -177,7 +227,7 @@ bool GPUFermat::init_cl(unsigned device_id, const char *platformId) {
   }
 
 
-  if (mNumDevices < device_id) {
+  if (mNumDevices <= device_id) {
     pthread_mutex_lock(&io_mutex);                            
     cout << get_time() << "ERROR " << mNumDevices << " device(s) detected ";
     cout << device_id << " device requested for use" << endl;
@@ -193,88 +243,22 @@ bool GPUFermat::init_cl(unsigned device_id, const char *platformId) {
     OCLR(error, false);
   }
 
-  std::ifstream testfile("kernel.bin");
+  std::ifstream testfile(kKernelBinaryPath);
   if(!testfile){
-       
     pthread_mutex_lock(&io_mutex);                            
     cout << get_time() << "Compiling ..." << endl;
     pthread_mutex_unlock(&io_mutex);                       
 
     std::string sourcefile;
-    {
-      std::ifstream t("gpu/procs.cl");
-      std::string str((std::istreambuf_iterator<char>(t)), std::istreambuf_iterator<char>());
-      sourcefile = str;
-    }    
-    {
-      std::ifstream t("gpu/fermat.cl");
-      std::string str((std::istreambuf_iterator<char>(t)), std::istreambuf_iterator<char>());
-      sourcefile.append(str);
-    }
-    {
-      std::ifstream t("gpu/benchmarks.cl");
-      std::string str((std::istreambuf_iterator<char>(t)), std::istreambuf_iterator<char>());
-      sourcefile.append(str);
-    }
-    pthread_mutex_lock(&io_mutex);                            
-    cout << get_time() << "Source: " << (unsigned)sourcefile.size();
-    cout << " bytes" << endl;
-    pthread_mutex_unlock(&io_mutex);                       
-    
-    if(sourcefile.size() < 1){
-      pthread_mutex_lock(&io_mutex);                            
-      cout << get_time() << "Source files not found or empty" << endl;
-      pthread_mutex_unlock(&io_mutex);                       
+    if (!loadKernelSources(sourcefile)) {
       return false;
     }
-    
-    cl_int error;
-const char* sources[] = { sourcefile.c_str(), 0 };
-gProgram = clCreateProgramWithSource(gContext, 1, sources, NULL, &error); // Corrected here
-OCLR(error, false);   
-
-if (clBuildProgram(gProgram, 1, &gpu, NULL, 0, 0) != CL_SUCCESS) {    
-  size_t logSize;
-clGetProgramBuildInfo(gProgram, devices[0], CL_PROGRAM_BUILD_LOG, 0, nullptr, &logSize); // Corrected here
-
-//std::unique_ptr<char[]> log_str(new char,[logSize]); 
-
-clGetProgramBuildInfo(gProgram, devices[0], CL_PROGRAM_BUILD_LOG, logSize, nullptr, 0); // Corrected here
-    
-    pthread_mutex_lock(&io_mutex);                            
-    cout << get_time() <<  endl;
-    pthread_mutex_unlock(&io_mutex);                       
-    
-    exit(1);
-}    
-    
-    size_t binsizes[10];
-    OCLR(clGetProgramInfo(gProgram, CL_PROGRAM_BINARY_SIZES, sizeof(binsizes), binsizes, 0), false);
-    size_t binsize = binsizes[0];
-    if(!binsize){
-      pthread_mutex_lock(&io_mutex);                            
-      cout << get_time() << "No binary available!" << endl;
-      pthread_mutex_unlock(&io_mutex);                       
+    if (!buildKernelBinary(sourcefile)) {
       return false;
     }
-    
-    pthread_mutex_lock(&io_mutex);                            
-    cout << get_time() << "Compiled kernel binary size = " << binsize << " bytes" << endl;
-    pthread_mutex_unlock(&io_mutex);                       
-    char* binary = new char[binsize+1];
-    unsigned char* binaries[] = { (unsigned char*)binary, (unsigned char*)binary,(unsigned char*)binary,(unsigned char*)binary, (unsigned char*)binary};
-    OCLR(clGetProgramInfo(gProgram, CL_PROGRAM_BINARIES, sizeof(binaries), binaries, 0), false);
-    {
-      std::ofstream bin("kernel.bin", std::ofstream::binary | std::ofstream::trunc);
-      bin.write(binary, binsize);
-      bin.close();
-    }
-    OCLR(clReleaseProgram(gProgram), false);
-    delete [] binary;
-    
   }
 
-  std::ifstream bfile("kernel.bin", std::ifstream::binary);
+  std::ifstream bfile(kKernelBinaryPath, std::ifstream::binary);
   if(!bfile){
     pthread_mutex_lock(&io_mutex);                            
     cout << get_time() << "ERROR: kernel.bin not found" << endl;
@@ -283,7 +267,7 @@ clGetProgramBuildInfo(gProgram, devices[0], CL_PROGRAM_BUILD_LOG, logSize, nullp
   }
   
   bfile.seekg(0, bfile.end);
-  int binsize = bfile.tellg();
+  size_t binsize = static_cast<size_t>(bfile.tellg());
   bfile.seekg(0, bfile.beg);
   if(!binsize){
     pthread_mutex_lock(&io_mutex);                            
@@ -292,8 +276,8 @@ clGetProgramBuildInfo(gProgram, devices[0], CL_PROGRAM_BUILD_LOG, logSize, nullp
     return false;
   }
 
-  std::vector<char> binary(binsize+1);
-  bfile.read(&binary[0], binsize);
+  std::vector<unsigned char> binary(binsize);
+  bfile.read(reinterpret_cast<char*>(binary.data()), binsize);
   bfile.close();
   pthread_mutex_lock(&io_mutex);                            
   cout << get_time() << "Loaded kernel binary size = " << binsize << " bytes" << endl;
@@ -301,7 +285,7 @@ clGetProgramBuildInfo(gProgram, devices[0], CL_PROGRAM_BUILD_LOG, logSize, nullp
   
   std::vector<size_t> binsizes(1, binsize);
   std::vector<cl_int> binstatus(1);
-  std::vector<const unsigned char*> binaries(1, (const unsigned char*)&binary[0]);
+  std::vector<const unsigned char*> binaries(1, binary.data());
   cl_int error;
   gProgram = clCreateProgramWithBinary(gContext, 1, &gpu, &binsizes[0], &binaries[0], &binstatus[0], &error);
   OCLR(error, false);
@@ -354,6 +338,93 @@ clGetProgramBuildInfo(gProgram, devices[0], CL_PROGRAM_BUILD_LOG, logSize, nullp
     return false;
   }
 
+  return true;
+}
+
+bool GPUFermat::loadKernelSources(std::string &sourcefile) {
+  sourcefile.clear();
+  for (const auto &path : kKernelSourceFiles) {
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream) {
+      pthread_mutex_lock(&io_mutex);
+      cout << get_time() << "ERROR: " << path << " cannot be opened" << endl;
+      pthread_mutex_unlock(&io_mutex);
+      return false;
+    }
+    sourcefile.append(std::istreambuf_iterator<char>(stream),
+                      std::istreambuf_iterator<char>());
+  }
+
+  if (sourcefile.empty()) {
+    pthread_mutex_lock(&io_mutex);
+    cout << get_time() << "ERROR: kernel sources are empty" << endl;
+    pthread_mutex_unlock(&io_mutex);
+    return false;
+  }
+
+  pthread_mutex_lock(&io_mutex);
+  cout << get_time() << "Source: " << static_cast<unsigned>(sourcefile.size())
+       << " bytes" << endl;
+  pthread_mutex_unlock(&io_mutex);
+  return true;
+}
+
+bool GPUFermat::buildKernelBinary(const std::string &sourcefile) {
+  cl_int error;
+  const char *sources[] = { sourcefile.c_str(), nullptr };
+  gProgram = clCreateProgramWithSource(gContext, 1, sources, NULL, &error);
+  OCLR(error, false);
+
+  cl_int buildStatus = clBuildProgram(gProgram, 1, &gpu, kBuildOptions, 0, 0);
+  if (buildStatus != CL_SUCCESS) {
+    size_t logSize = 0;
+    clGetProgramBuildInfo(gProgram, gpu, CL_PROGRAM_BUILD_LOG, 0, nullptr, &logSize);
+    std::vector<char> buildLog(logSize + 1, 0);
+    if (logSize) {
+      clGetProgramBuildInfo(gProgram, gpu, CL_PROGRAM_BUILD_LOG, logSize, buildLog.data(), 0);
+    }
+    pthread_mutex_lock(&io_mutex);
+    cout << get_time() << "ERROR: OpenCL build failed\n" << buildLog.data() << endl;
+    pthread_mutex_unlock(&io_mutex);
+    clReleaseProgram(gProgram);
+    gProgram = nullptr;
+    return false;
+  }
+
+  size_t binsizes[1] = {0};
+  OCLR(clGetProgramInfo(gProgram, CL_PROGRAM_BINARY_SIZES, sizeof(binsizes), binsizes, 0), false);
+  size_t binsize = binsizes[0];
+  if (!binsize) {
+    pthread_mutex_lock(&io_mutex);
+    cout << get_time() << "No binary available!" << endl;
+    pthread_mutex_unlock(&io_mutex);
+    clReleaseProgram(gProgram);
+    gProgram = nullptr;
+    return false;
+  }
+
+  pthread_mutex_lock(&io_mutex);
+  cout << get_time() << "Compiled kernel binary size = " << binsize << " bytes" << endl;
+  pthread_mutex_unlock(&io_mutex);
+
+  std::vector<unsigned char> binary(binsize);
+  unsigned char *binaries[] = { binary.data() };
+  OCLR(clGetProgramInfo(gProgram, CL_PROGRAM_BINARIES, sizeof(binaries), binaries, 0), false);
+
+  std::ofstream bin(kKernelBinaryPath, std::ofstream::binary | std::ofstream::trunc);
+  if (!bin) {
+    pthread_mutex_lock(&io_mutex);
+    cout << get_time() << "ERROR: cannot write " << kKernelBinaryPath << endl;
+    pthread_mutex_unlock(&io_mutex);
+    clReleaseProgram(gProgram);
+    gProgram = nullptr;
+    return false;
+  }
+  bin.write(reinterpret_cast<const char*>(binary.data()), binsize);
+  bin.close();
+
+  OCLR(clReleaseProgram(gProgram), false);
+  gProgram = nullptr;
   return true;
 }
 
@@ -470,75 +541,87 @@ void GPUFermat::run_fermat(cl_command_queue queue,
   gpuResults.copyToDevice(queue);
   primeBase.copyToDevice(queue);
 
-  clSetKernelArg(kernel, 0, sizeof(cl_mem), &numbers.DeviceData);
-  clSetKernelArg(kernel, 1, sizeof(cl_mem), &gpuResults.DeviceData);
-  clSetKernelArg(kernel, 2, sizeof(cl_mem), &primeBase.DeviceData);
-  clSetKernelArg(kernel, 3, sizeof(elementsNum), &elementsNum);
+  OCL(clSetKernelArg(kernel, 0, sizeof(cl_mem), &numbers.DeviceData));
+  OCL(clSetKernelArg(kernel, 1, sizeof(cl_mem), &gpuResults.DeviceData));
+  OCL(clSetKernelArg(kernel, 2, sizeof(cl_mem), &primeBase.DeviceData));
+  OCL(clSetKernelArg(kernel, 3, sizeof(elementsNum), &elementsNum));
   
-  clFinish(queue);
-  {
-    size_t globalThreads[1] = { groupsNum*GroupSize };
-    size_t localThreads[1] = { GroupSize };
-    cl_event event;
-    cl_int result;
-    if ((result = clEnqueueNDRangeKernel(queue,
+  size_t globalThreads[1] = { groupsNum*GroupSize };
+  size_t localThreads[1] = { GroupSize };
+  cl_event event = nullptr;
+  cl_int result = clEnqueueNDRangeKernel(queue,
                                          kernel,
                                          1,
                                          0,
                                          globalThreads,
                                          localThreads,
-                                         0, 0, &event)) != CL_SUCCESS) {
-      pthread_mutex_lock(&io_mutex);                            
-      cout << get_time() << "clEnqueueNDRangeKernel error!" << endl;
-      pthread_mutex_unlock(&io_mutex);                       
-      return;
-    }
-      
-    cl_int error;
-    if ((error = clWaitForEvents(1, &event)) != CL_SUCCESS) {
-      pthread_mutex_lock(&io_mutex);                            
-      cout << get_time() << "clWaitForEvents error " << error << "!" << endl;
-      pthread_mutex_unlock(&io_mutex);                       
-      return;
-    }
-      
-    clReleaseEvent(event);
+                                         0, 0, &event);
+  if (result != CL_SUCCESS) {
+    pthread_mutex_lock(&io_mutex);                            
+    cout << get_time() << "clEnqueueNDRangeKernel error: " << result << endl;
+    pthread_mutex_unlock(&io_mutex);                       
+    return;
   }
+    
+  cl_int waitResult = clWaitForEvents(1, &event);
+  if (waitResult != CL_SUCCESS) {
+    pthread_mutex_lock(&io_mutex);                            
+    cout << get_time() << "clWaitForEvents error " << waitResult << "!" << endl;
+    pthread_mutex_unlock(&io_mutex);                       
+    clReleaseEvent(event);
+    return;
+  }
+  clReleaseEvent(event);
+  clFlush(queue);
 }
 
 /* test the gpu results */
 void GPUFermat::test_gpu() {
 
-    unsigned size = elementsNum;
+    if (!elementsNum) {
+      pthread_mutex_lock(&io_mutex);
+      cout << get_time() << "test_gpu skipped: no elements configured" << endl;
+      pthread_mutex_unlock(&io_mutex);
+      return;
+    }
+
+    if (!primeBase.HostData || !numbers.HostData || !gpuResults.HostData) {
+      pthread_mutex_lock(&io_mutex);
+      cout << get_time() << "test_gpu aborted: host buffers not initialized" << endl;
+      pthread_mutex_unlock(&io_mutex);
+      return;
+    }
+
+    const unsigned size = elementsNum;
     uint32_t *prime_base = primeBase.HostData;
     uint32_t *primes  = numbers.HostData;
     uint32_t *results = gpuResults.HostData;
 
-    mpz_t mpz;
-    mpz_init_set_ui(mpz, rand32());
+    mpz_class mpz(rand32());
 
     /* init with random number */
     for (int i = 0; i < 8; i++) {
-      mpz_mul_2exp(mpz, mpz, 32);
-      mpz_add_ui(mpz, mpz, rand32());
+      mpz <<= 32;
+      mpz += rand32();
     }
 
     /* make sure mpz is not a prime */
-    if (mpz_get_ui(mpz) & 0x1)
-      mpz_add_ui(mpz, mpz, 1);
+    if (mpz.get_ui() & 0x1)
+      mpz += 1;
 
-    size_t exported_size;
-    mpz_export(prime_base, &exported_size, -1, 4, 0, 0, mpz);
+    memset(prime_base, 0, operandSize * sizeof(uint32_t));
+    size_t exported_size = 0;
+    mpz_export(prime_base, &exported_size, -1, sizeof(uint32_t), 0, 0, mpz.get_mpz_t());
   
     /* create the test numbers, every second will be prime */
     for (unsigned i = 0; i < size; i++) {
 
-      primes[i] = mpz_get_ui(mpz) & 0xffffffff;
+      primes[i] = mpz.get_ui() & 0xffffffff;
 
       if (i % 2 == 0)
-        mpz_nextprime(mpz, mpz);
+        mpz_nextprime(mpz.get_mpz_t(), mpz.get_mpz_t());
       else
-        mpz_add_ui(mpz, mpz, 1);
+        mpz_add_ui(mpz.get_mpz_t(), mpz.get_mpz_t(), 1);
 
       if (i % 23 == 0)
         printf("\rcreating test data: %d  \r", size - i);
@@ -549,22 +632,24 @@ void GPUFermat::test_gpu() {
     fermat_gpu();
 
     /* check the results */
+    unsigned failures = 0;
     for (unsigned i = 0; i < size; i++) {
 
-      bool fail = false;
+      const uint32_t expected = (i % 2 == 0) ? 0u : 1u;
 
-      if (i % 2 == 0 && results[i] != 0)
-        fail = true;
-      else if (i % 2 == 1 && results[i] != 1)
-        fail = true;
-
-      if (fail) {
-        printf("Result %d is wrong: %d\n", i, results[i]);
-        return;
-      } 
+      if (results[i] != expected) {
+        if (failures == 0) {
+          printf("Result %u is wrong: expected %u but got %u\n", i, expected, results[i]);
+        }
+        failures++;
+      }
    }
 
-   printf("GPU Test worked              \n");
+   if (failures) {
+     printf("GPU Test failed: %u mismatched result(s)\n", failures);
+   } else {
+     printf("GPU Test worked\n");
+   }
 }
 
 /* run the Fermat test on the gpu */
