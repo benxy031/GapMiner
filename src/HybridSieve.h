@@ -131,6 +131,7 @@ class HybridSieve : public Sieve {
 
         /* get the next candidate offset */
         uint32_t pop();
+        void copy_candidates(uint32_t *dest, uint32_t count);
 
         /* set a number to be prime (i relative to index) 
          * returns true if this can be skipped */
@@ -202,6 +203,7 @@ class HybridSieve : public Sieve {
         uint32_t min_n_tests;
         uint32_t active_n_tests;
         uint32_t last_cycle_tests;
+        uint32_t last_cycle_items;
         uint32_t last_candidate_count;
  
         /* List start and end */
@@ -281,6 +283,9 @@ class HybridSieve : public Sieve {
 
         /* returns the nuber of candidates */
         uint32_t n_candidates();
+
+        /* stops processing and wakes any waiters */
+        void stop();
 
         /* add a item to the list */
         void add(GPUWorkItem *item);

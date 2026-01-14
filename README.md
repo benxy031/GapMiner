@@ -33,17 +33,43 @@ Plus, currently it's only for Linux. Sorry.
   - gmp 
   - mpfr
   - boost system library
+  - OpenCL runtime/headers (AMD APP SDK, NVIDIA OpenCL, or Mesa/POCL) for GPU mining
+  - *(optional)* CUDA toolkit 11.x+ if you plan to build the CUDA miner
 
 ### installation
 ```sh
-  git clone https://github.com/gapcoin-project/GapMiner.git
+  git clone https://github.com/gapcoin-project/GapMiner.git or
+  for CUDA
+  git clone https://github.com/benxy031/GapMiner.git
   cd GapMiner
   git submodule update --init --recursive
-  make all
-  make install
+  make            # builds the default CPU/OpenCL binary: bin/gapminer
+
+  # Optional: build the CUDA miner once the NVIDIA toolkit is installed.
+  # Adjust CUDA_HOME if your toolkit is in a non-default location.
+  make gapminer-cuda CUDA_HOME=/usr/local/cuda
+
+  sudo make install   # installs bin/gapminer only
 ```
+
+### build targets & options
+
+| Target | Command | Notes |
+| --- | --- | --- |
+| CPU/OpenCL miner (default) | `make` or `make gapminer` | Requires OpenCL headers/libraries (NVIDIA, AMD, Intel, Mesa/POCL, etc.). Builds `bin/gapminer`. |
+| CUDA miner | `make gapminer-cuda` *(or `make cuda`)* | Needs a CUDA-capable NVIDIA GPU and the CUDA toolkit. Set `CUDA_HOME` if it is not `/usr/local/cuda`, and optionally override `CUDA_ARCH` (default `sm_70`). Produces `bin/gapminer-cuda`. |
+| Clean | `make clean` | Removes both binaries and intermediate objects. |
+
+Additional tips:
+
+1. **CPU-only build** – define `CPU_ONLY=1` on the make command line or add `-DCPU_ONLY` to `CXXFLAGS` if you want to disable all GPU code paths.
+2. **Verbosity/diagnostics** – the Makefile inherits standard `make` variables, so you can run `make V=1` for verbose commands or `make -j$(nproc)` to parallelize compilation.
+3. **CUDA tuning** – adjust `CUDA_ARCH` (e.g., `sm_86`) to match your GPU for best performance. Ensure the CUDA toolkit `bin/` directory is on your `PATH` so `nvcc` is found.
+
 ## Usage
 ---
+
+Both miners expose the same CLI surface; simply run the binary you built (`bin/gapminer` for CPU/OpenCL or `bin/gapminer-cuda` for CUDA) with the options below.
 
   `gapminer [--options]`
 

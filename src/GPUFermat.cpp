@@ -1,4 +1,4 @@
-#ifndef CPU_ONLY
+#if !defined(CPU_ONLY) && !defined(USE_CUDA_BACKEND)
 #include </usr/include/CL/cl2.hpp>
 #include <iostream>
 #include <fstream>
@@ -69,6 +69,10 @@ unsigned GPUFermat::GroupSize = 256;
 
 /* the array size of uint32_t for the numbers to test */
 unsigned GPUFermat::operandSize = 320/32;
+
+unsigned GPUFermat::get_group_size() {
+  return GroupSize;
+}
 
 GPUFermat::~GPUFermat() {
   if (mFermatBenchmarkKernel320) {
@@ -768,4 +772,4 @@ void GPUFermat::fermatTestBenchmark(cl_command_queue queue,
   std::cout << "  CPU with 320 bits: " << cpuTime << "ms (" << opsNum << "fM ops/sec)" << std::endl;
   std::cout << "  GPU is " <<  ((double) cpuTime) / ((double) gpuTime) << "times faster" << std::endl;
 }
-#endif /* CPU_ONLY */
+#endif /* !CPU_ONLY && !USE_CUDA_BACKEND */

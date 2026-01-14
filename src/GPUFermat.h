@@ -1,6 +1,10 @@
 #ifndef CPU_ONLY
 #ifndef __GPU_FERMAT_H__
 #define __GPU_FERMAT_H__
+
+#ifdef USE_CUDA_BACKEND
+#include "CUDAFermat.h"
+#else
 #include </usr/include/CL/cl2.hpp>
 #include <vector>
 #include <string>
@@ -158,6 +162,9 @@ class GPUFermat {
                                    const char *platformId = NULL,
                                    unsigned workItems = 0);
 
+    /* expose the active GPU group size */
+    static unsigned get_group_size();
+
     /* destroy the singleton instance and release resources */
     static void destroy_instance();
 
@@ -171,5 +178,6 @@ class GPUFermat {
     void test_gpu();
 
 };
+#endif /* USE_CUDA_BACKEND */
 #endif /* __GPU_FERMAT_H__ */
 #endif /* CPU_ONLY */

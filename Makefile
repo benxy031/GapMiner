@@ -2,21 +2,33 @@ VERSION   = 0.0.1
 SRC       = ./src
 BIN       = ./bin
 CC        = g++
+NVCC      = nvcc
 DBFLAGS   = -g
-CXXFLAGS  = -Wall -Wextra -c -Winline -Wformat -Wformat-security -Werror=calloc-transposed-args \
+CXXFLAGS  = -Wall -Wextra -c -Winline -Wformat -Wformat-security \
             -pthread --param max-inline-insns-single=1000 -lm \
 						-I/usr/include 
+CUDA_HOME ?= /usr/local/cuda
+CUDA_INC   = $(CUDA_HOME)/include
+CUDA_LIB   = $(CUDA_HOME)/lib64
+CUDA_ARCH ?= sm_70
+NVCCFLAGS ?= -std=c++14 -O3 -arch=$(CUDA_ARCH) -Xcompiler "-fPIC -pthread" -I$(CUDA_INC)
 LDFLAGS   = -lm -lcrypto -lmpfr -lgmp -pthread -lcurl -ljansson \
 					  -L/usr/lib/x86_64-linux-gnu -lOpenCL
+CUDA_LDFLAGS = -L$(CUDA_LIB) -lcudart
 OTFLAGS   = -O3 -march=skylake -mtune=skylake -mavx2 -mfma -ffast-math -fPIC -pipe
 
 
 
-.PHONY: clean test all install
+.PHONY: clean test all install gapminer gapminer-cuda cuda
 
 # default target
-all: link
-	$(CC) $(ALL_OBJ) $(EV_OBJ) $(LDFLAGS) -o $(BIN)/gapminer
+all: $(BIN)/gapminer
+
+gapminer: $(BIN)/gapminer
+
+gapminer-cuda: $(BIN)/gapminer-cuda
+
+cuda: gapminer-cuda
 
 install: all
 	cp $(BIN)/gapminer /usr/bin/
@@ -47,8 +59,13 @@ LDFLAGS   += $(OTFLAGS)
 
 EV_SRC  = $(shell find $(SRC)/Evolution -type f -name '*.c'|grep -v -e test -e evolution.c)
 EV_OBJ  = $(EV_SRC:%.c=%.o) $(SRC)/Evolution/src/evolution-O3.o
-ALL_SRC = $(shell find $(SRC) -type f -name '*.cpp')
-ALL_OBJ = $(ALL_SRC:%.cpp=%.o) 
+ALL_SRC = $(shell find $(SRC) -type f -name '*.cpp' ! -name 'main_cuda.cpp')
+ALL_OBJ = $(ALL_SRC:%.cpp=%.o)
+
+CUDA_CPP_SRCS = $(filter-out $(SRC)/GPUFermat.cpp,$(ALL_SRC))
+CUDA_CPP_SRCS := $(filter-out $(SRC)/main.cpp,$(CUDA_CPP_SRCS))
+CUDA_CPP_SRCS += $(SRC)/main_cuda.cpp
+CUDA_OBJ = $(CUDA_CPP_SRCS:%.cpp=%.cuda.o) $(SRC)/CUDAFermat.cu.o
 
 $(SRC)/GPUFermat.o:
 	$(CC) $(CXXFLAGS) -std=c++11  $(SRC)/GPUFermat.cpp -o  $(SRC)/GPUFermat.o
@@ -56,18 +73,30 @@ $(SRC)/GPUFermat.o:
 %.o: %.cpp
 	$(CC) $(CXXFLAGS) $^ -o $@
 
+%.cuda.o: %.cpp
+	$(CC) $(CXXFLAGS) -DUSE_CUDA_BACKEND -I$(CUDA_INC) $< -o $@
+
+%.cu.o: %.cu
+	$(NVCC) $(NVCCFLAGS) -DUSE_CUDA_BACKEND -c $< -o $@
+
 evolution:
 	$(MAKE) -C $(SRC)/Evolution evolution-O3
 
-compile: $(ALL_OBJ) $(ALL_OBJ) evolution
+compile: $(ALL_OBJ) evolution
 
 prepare:
 	@mkdir -p bin
 
 link: prepare compile
 
+$(BIN)/gapminer: link
+	$(CC) $(ALL_OBJ) $(EV_OBJ) $(LDFLAGS) -o $@
+
+$(BIN)/gapminer-cuda: prepare evolution $(CUDA_OBJ)
+	$(CC) $(CUDA_OBJ) $(EV_OBJ) $(LDFLAGS) $(CUDA_LDFLAGS) -o $@
+
 clean:
 	rm -rf $(BIN)
-	rm -f $(ALL_OBJ)
+	rm -f $(ALL_OBJ) $(CUDA_OBJ)
 	$(MAKE) -C $(SRC)/Evolution clean
 
