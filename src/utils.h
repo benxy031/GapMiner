@@ -32,6 +32,9 @@ extern pthread_mutex_t io_mutex;
 /* returns the current time */
 string get_time();
 
+/* writes extra verbose logs to the dedicated file */
+void extra_verbose_log(const string &str);
+
 /**
  * converts a given integer to a string
  */

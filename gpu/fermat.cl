@@ -54,7 +54,6 @@ void vectorAdd(__global uint4 *output,
 #define WIDTH 20
 #define PCOUNT 40960
 #define TARGET 10
-#define __NVIDIA
 __constant uint pow2[9] = {1, 2, 4, 8, 16, 32, 64, 128, 256};
 
 __constant uint32_t binvert_limb_table[128] = {
@@ -161,6 +160,29 @@ void shrreg(uint32_t *data, unsigned size, unsigned bits)
     shr32(data, size);
   if (bits%32)
     shr(data, size, bits%32);
+}
+
+static inline uint32_t extract_window_bits(const uint32_t *data,
+                                           unsigned wordCount,
+                                           unsigned startBit,
+                                           unsigned bitCount)
+{
+  if (!bitCount)
+    return 0u;
+
+  unsigned word = startBit >> 5;
+  unsigned shift = startBit & 31u;
+  if (word >= wordCount)
+    return 0u;
+
+  uint32_t low = data[word];
+  uint32_t high = (word + 1u < wordCount) ? data[word + 1u] : 0u;
+  uint32_t chunk = low >> shift;
+  if (shift + bitCount > 32u)
+    chunk |= high << (32u - shift);
+
+  uint32_t mask = (bitCount == 32u) ? 0xFFFFFFFFu : ((1u << bitCount) - 1u);
+  return chunk & mask;
 }
 
 uint32_t add128(uint4 *A, uint4 B)
@@ -964,69 +986,6 @@ void redcify352(unsigned shiftCount,
   result[0]++;
 }
 
-#if defined(__NVIDIA) || defined(__AMDLEGACY)
-void FermatTest352(uint4 *restrict limbs,
-                   uint4 *redcl)
-{
-  uint2 bitSize;
-  //   uint4 redcl0, redcl1, redcl2;
-  uint32_t inverted = invert_limb(limbs[0].x);  
-  
-  //   uint4 q0 = 0, q1 = 0;  
-  uint4 q[2] = {(uint4)(0u), (uint4)(0u)};
-  {
-    uint4 dl4 = {0, 0, 0, 0};    
-    uint4 dl3 = {0, 0, 0, 1};
-    uint4 dl2 = {0, 0, 0, 0};
-    uint4 dl1 = {0, 0, 0, 0};
-    uint4 dl0 = {0, 0, 0, 0};
-    divq640to384(dl0, dl1, dl2, dl3, dl4, limbs[0], limbs[1], limbs[2], &q[0], &q[1]);
-  }
-  
-  
-  // Retrieve of "2" in Montgomery representation
-  {
-    uint4 dl3 = {0, 0, 0, 0};
-    uint4 dl2 = {0, 0, 0, 2};
-    uint4 dl1 = {0, 0, 0, 0};
-    uint4 dl0 = {0, 0, 0, 0};    
-    bitSize = modulo512to384(dl0, dl1, dl2, dl3, limbs[0], limbs[1], limbs[2], &redcl[0], &redcl[1], &redcl[2]);
-    --bitSize.y;
-    if (bitSize.y == 0) {
-      --bitSize.x;
-      bitSize.y = 32;
-    }
-  }
-  
-  const int windowSize = 7;  
-  uint32_t *data = (uint32_t*)limbs;
-  int remaining = (bitSize.x-1)*32 + bitSize.y;
-  
-  uint32_t e[11];
-  for (unsigned i = 0; i < 11; i++)
-    e[i] = data[i];
-  e[0]--;
-  shlreg(e, 11, 352-remaining);    
-  
-  while (remaining > 0) {
-    int size = min(remaining, windowSize);
-    int index = e[10] >> (32-size);
-    
-    uint4 m[3];
-    for (unsigned i = 0; i < size; i++)
-      monSqr352(redcl, limbs, inverted);
-    
-    redcify352(index, q, limbs, m, windowSize);    
-    monMul352(redcl, m, limbs, inverted);
-    shl(e, 11, size);
-    remaining -= windowSize;
-  }
-  
-  redcHalf352(redcl, limbs, inverted);
-}
-
-#else
-
 void FermatTest352(uint4 *restrict limbs,
                       uint4 *redcl)
 {
@@ -1062,34 +1021,33 @@ void FermatTest352(uint4 *restrict limbs,
   }
   
   const int windowSize = 7;  
+  const unsigned exponentWords = 11;
   int remaining = (bitSize.x-1)*32 + bitSize.y;
   
-  uint32_t data[12];
-  for (unsigned i = 0; i < 11; i++)
+  uint32_t data[exponentWords + 1];
+  for (unsigned i = 0; i < exponentWords; i++)
     data[i] = ((uint32_t*)limbs)[i];  
-  data[0]--;  
+  data[0]--;
+  data[exponentWords] = 0u;
   
   while (remaining > 0) {
     int bitPos = max(remaining-windowSize, 0);
     int size = min(remaining, windowSize);
+    uint32_t index = extract_window_bits(data, exponentWords + 1, bitPos, size);
     
-    uint64_t v64 = *(uint64_t*)(data+bitPos/32);
-    v64 >>= bitPos % 32;
-    uint32_t index = ((uint32_t)v64) & ((1 << size) - 1);
-
     uint4 m[3];
     for (unsigned i = 0; i < size; i++)
       monSqr352(redcl, limbs, inverted);
 
     redcify352(index, q, limbs, m, windowSize);    
     monMul352(redcl, m, limbs, inverted);
-    remaining -= windowSize;
+    remaining -= size;
   }
 
   redcHalf352(redcl, limbs, inverted);
 }
 
-#endif
+ 
 
 void redcify320(unsigned shiftCount,
                 uint4 *quotient,
@@ -1121,96 +1079,29 @@ void redcify320(unsigned shiftCount,
   result[0]++;
 }
 
-#if defined(__NVIDIA) || defined(__AMDLEGACY)
 void FermatTest320(uint4 *restrict limbs, uint4 *redcl)
 {
   uint2 bitSize;
-  uint32_t inverted = invert_limb(limbs[0].x);  
-  
-  //   uint4 q0 = 0, q1 = 0;  
+  uint32_t inverted = invert_limb(limbs[0].x);
+
   uint4 q[2] = {(uint4)(0u), (uint4)(0u)};
   q[0] = 0;
   q[1] = 0;
+
   {
-    uint4 dl4 = {0, 0, 0, 0};    
+    uint4 dl4 = {0, 0, 0, 0};
     uint4 dl3 = {0, 0, 0, 0};
     uint4 dl2 = {0, 0, 0, 1};
     uint4 dl1 = {0, 0, 0, 0};
     uint4 dl0 = {0, 0, 0, 0};
     divq640to384(dl0, dl1, dl2, dl3, dl4, limbs[0], limbs[1], limbs[2], &q[0], &q[1]);
   }
-  
-  
-  // Retrieve of "2" in Montgomery representation
+
   {
     uint4 dl3 = {0, 0, 0, 0};
     uint4 dl2 = {0, 0, 2, 0};
-    uint4 dl1 = {0, 0, 0, 0};
-    uint4 dl0 = {0, 0, 0, 0};    
-    bitSize = modulo512to384(dl0, dl1, dl2, dl3, limbs[0], limbs[1], limbs[2], &redcl[0], &redcl[1], &redcl[2]);
-    --bitSize.y;
-    if (bitSize.y == 0) {
-      --bitSize.x;
-      bitSize.y = 32;
-    }
-  }
-  
-  uint32_t *data = (uint32_t*)limbs;
-  int remaining = (bitSize.x-1)*32 + bitSize.y;
-  
-  const int windowSize = 5;
-  uint32_t e[10];
-  for (unsigned i = 0; i < 10; i++)
-    e[i] = data[i];
-  e[0]--;
-  shlreg(e, 10, 320-remaining);  
-  
-  int counter = 0;
-  while (remaining > 0) {
-    int size = min(remaining, windowSize);
-    int index = e[9] >> (32-size);
-    
-    uint4 m[3];
-    for (unsigned i = 0; i < size; i++)
-      monSqr320(redcl, limbs, inverted);
-    
-    redcify320(index, q, limbs, m, windowSize);
-    monMul320(redcl, m, limbs, inverted);   
-    
-    shl(e, 10, size);    
-    remaining -= windowSize;
-  }
-  
-  redcHalf320(redcl, limbs, inverted);
-}
-
-#else
-
-void FermatTest320(uint4 *restrict limbs, uint4 *redcl)
-{
-  uint2 bitSize;
-  uint32_t inverted = invert_limb(limbs[0].x);  
-
-  uint4 q[2] = {(uint4)(0u), (uint4)(0u)};
-  q[0] = 0;
-  q[1] = 0;
-  
-  {
-    uint4 dl4 = {0, 0, 0, 0};    
-    uint4 dl3 = {0, 0, 0, 0};
-    uint4 dl2 = {0, 0, 0, 1};
     uint4 dl1 = {0, 0, 0, 0};
     uint4 dl0 = {0, 0, 0, 0};
-    divq640to384(dl0, dl1, dl2, dl3, dl4, limbs[0], limbs[1], limbs[2], &q[0], &q[1]);
-  }
-  
-  
-  // Retrieve of "2" in Montgomery representation
-  {
-    uint4 dl3 = {0, 0, 0, 0};
-    uint4 dl2 = {0, 0, 2, 0};
-    uint4 dl1 = {0, 0, 0, 0};
-    uint4 dl0 = {0, 0, 0, 0};    
     bitSize = modulo512to384(dl0, dl1, dl2, dl3, limbs[0], limbs[1], limbs[2], &redcl[0], &redcl[1], &redcl[2]);
     --bitSize.y;
     if (bitSize.y == 0) {
@@ -1219,34 +1110,33 @@ void FermatTest320(uint4 *restrict limbs, uint4 *redcl)
     }
   }
 
-  int remaining = (bitSize.x-1)*32 + bitSize.y;
   const int windowSize = 5;
-  
-  uint32_t data[11];
-  for (unsigned i = 0; i < 10; i++)
-    data[i] = ((uint32_t*)limbs)[i];  
-  data[0]--;  
-  
+  const unsigned exponentWords = 10;
+  int remaining = (bitSize.x - 1) * 32 + bitSize.y;
+
+  uint32_t data[exponentWords + 1];
+  for (unsigned i = 0; i < exponentWords; i++)
+    data[i] = ((uint32_t *)limbs)[i];
+  data[0]--;
+  data[exponentWords] = 0u;
+
   while (remaining > 0) {
-    int bitPos = max(remaining-windowSize, 0);
+    int bitPos = max(remaining - windowSize, 0);
     int size = min(remaining, windowSize);
-    
-    uint64_t v64 = *(uint64_t*)(data+bitPos/32);
-    v64 >>= bitPos % 32;
-    uint32_t index = ((uint32_t)v64) & ((1 << size) - 1);
+    uint32_t index = extract_window_bits(data, exponentWords + 1, bitPos, size);
 
     uint4 m[3];
     for (unsigned i = 0; i < size; i++)
       monSqr320(redcl, limbs, inverted);
     redcify320(index, q, limbs, m, windowSize);
-    monMul320(redcl, m, limbs, inverted);   
-    remaining -= windowSize;
+    monMul320(redcl, m, limbs, inverted);
+    remaining -= size;
   }
-  
+
   redcHalf320(redcl, limbs, inverted);
 }
 
-#endif
+ 
 
 bool fermat352(uint4* p) {
   uint4 modpowl[3];

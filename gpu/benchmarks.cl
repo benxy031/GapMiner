@@ -161,6 +161,28 @@ __kernel void multiplyBenchmark352(__global uint32_t *m1,
 #undef OperandSize
 }
 
+#define SMALL_PRIME_COUNT 4
+__constant uint kSmallPrimes[SMALL_PRIME_COUNT] = {3, 5, 7, 11};
+__constant uint kPrimeReciprocals[SMALL_PRIME_COUNT] = {
+  0x55555556u, // ceil(2^32 / 3)
+  0x33333334u, // ceil(2^32 / 5)
+  0x24924925u, // ceil(2^32 / 7)
+  0x1745D175u  // ceil(2^32 / 11)
+};
+
+inline uint mod_high_part(__global uint32_t *prime_base, uint prime) {
+  ulong acc = 0;
+  for (int idx = 9; idx >= 1; --idx)
+    acc = ((acc << 32) + prime_base[idx]) % prime;
+  return (uint)acc;
+}
+
+inline uint fast_mod_u32(uint value, uint prime, uint recip) {
+  uint q = mul_hi(value, recip);
+  uint r = value - q * prime;
+  return (r >= prime) ? r - prime : r;
+}
+
 __kernel void fermatTest320(__global uint32_t *restrict numbers,
                             __global uint32_t *restrict out,
                             __global uint32_t *restrict prime_base,
@@ -168,12 +190,27 @@ __kernel void fermatTest320(__global uint32_t *restrict numbers,
 {
 #define OperandSize 10  
   unsigned globalSize = get_global_size(0);
+  const uint lid = get_local_id(0);
+
+  __local uint4 sharedPrimeBase[3];
+  if (lid < 3) {
+    sharedPrimeBase[lid] = (uint4){prime_base[lid * 4 + 0],
+                                   prime_base[lid * 4 + 1],
+                                   prime_base[lid * 4 + 2],
+                                   (lid == 2) ? 0 : prime_base[lid * 4 + 3]};
+  }
+
+  __local uint sharedHighResidues[SMALL_PRIME_COUNT];
+  if (lid < SMALL_PRIME_COUNT)
+    sharedHighResidues[lid] = mod_high_part(prime_base, kSmallPrimes[lid]);
+
+  barrier(CLK_LOCAL_MEM_FENCE);
 
   uint4 lNumbersv[3] = {
-    (uint4){prime_base[0], prime_base[1], prime_base[2], prime_base[3]}, 
-    (uint4){prime_base[4], prime_base[5], prime_base[6], prime_base[7]}, 
-    (uint4){prime_base[8], prime_base[9], 0, 0}
-  };    
+    sharedPrimeBase[0],
+    sharedPrimeBase[1],
+    sharedPrimeBase[2]
+  };
 
   const uint4 one  = {1,0,0,0};
   const uint4 zero = {0,0,0,0};
@@ -181,8 +218,26 @@ __kernel void fermatTest320(__global uint32_t *restrict numbers,
 #pragma unroll
   for (unsigned i = get_global_id(0); i < elementsNum; i += globalSize) {
 
+    const uint offset = numbers[i];
+    uint compositeFlag = 0;
+    for (int primeIdx = 0; primeIdx < SMALL_PRIME_COUNT; ++primeIdx) {
+      const uint prime = kSmallPrimes[primeIdx];
+      const uint recip = kPrimeReciprocals[primeIdx];
+      uint candidateMod = sharedHighResidues[primeIdx] + fast_mod_u32(offset, prime, recip);
+      candidateMod -= (candidateMod >= prime) ? prime : 0;
+      if (candidateMod == 0) {
+        compositeFlag = 1;
+        break;
+      }
+    }
+
+    if (compositeFlag) {
+      out[i] = 0;
+      continue;
+    }
+
     uint4 result[3];
-    lNumbersv[0].x = numbers[i];
+    lNumbersv[0].x = offset;
     
     FermatTest320(lNumbersv, result);
 

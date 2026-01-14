@@ -407,9 +407,7 @@ void *Stratum::recv_thread(void *arg) {
 
 
   if (Opts::get_instance()->has_extra_vb()) {
-    pthread_mutex_lock(&io_mutex);
-    cout << get_time() << "Stratum thread started\n";
-    pthread_mutex_unlock(&io_mutex);
+    extra_verbose_log(get_time() + "Stratum thread started");
   }
 
   while (targs->running) {

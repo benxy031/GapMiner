@@ -198,6 +198,11 @@ class HybridSieve : public Sieve {
  
         /* number of candidates to test at once */
         uint32_t n_tests;
+        uint32_t max_n_tests;
+        uint32_t min_n_tests;
+        uint32_t active_n_tests;
+        uint32_t last_cycle_tests;
+        uint32_t last_candidate_count;
  
         /* List start and end */
         GPUWorkItem *start, *end;
@@ -218,6 +223,9 @@ class HybridSieve : public Sieve {
         pthread_mutex_t access_mutex;
         pthread_cond_t  notfull_cond;
         pthread_cond_t  full_cond;
+
+        /* reorders awaiting work items by urgency */
+        void rebalance_locked();
 
         /* mpz values */
         mpz_t mpz_hash, mpz_adder;
@@ -278,7 +286,7 @@ class HybridSieve : public Sieve {
         void add(GPUWorkItem *item);
 
         /* creates the candidate array to process */
-        void create_candidates();
+        uint32_t create_candidates();
 
         /* parse the gpu results */
         void parse_results(uint32_t *results);
@@ -288,6 +296,9 @@ class HybridSieve : public Sieve {
 
         /* clears the list */
         void clear();
+
+                        private:
+                                void adjust_active_tests(uint16_t observed_min, uint16_t observed_avg);
     };
 
     /* the GPUWorkList of this */

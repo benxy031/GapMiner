@@ -162,7 +162,7 @@ class GPUFermat {
     static void destroy_instance();
 
     /* public interface to the gpu Fermat test */
-    void fermat_gpu();
+    void fermat_gpu(uint32_t elementsNum);
 
     /* run a benchmark test */
     void benchmark();

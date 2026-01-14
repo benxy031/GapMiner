@@ -8,7 +8,7 @@ CXXFLAGS  = -Wall -Wextra -c -Winline -Wformat -Wformat-security -Werror=calloc-
 						-I/usr/include 
 LDFLAGS   = -lm -lcrypto -lmpfr -lgmp -pthread -lcurl -ljansson \
 					  -L/usr/lib/x86_64-linux-gnu -lOpenCL
-OTFLAGS   =  -O3 -msse4.1 -march=corei7-avx -mavx -ffast-math -fPIC -pipe
+OTFLAGS   = -O3 -march=skylake -mtune=skylake -mavx2 -mfma -ffast-math -fPIC -pipe
 
 
 
@@ -29,7 +29,7 @@ CXXFLAGS += $(DBFLAGS)
 #CXXFLAGS += -D DEBUG
 
 # GPU-Miner enable fast debugging
-#CXXFLAGS += -D DEBUG_BASIC -D DEBUG_FAST
+# CXXFLAGS += -D DEBUG_BASIC -D DEBUG_FAST
 
 # GPU-Miner enable slow debugging (more tests)
 #CXXFLAGS += -D DEBUG_BASIC -D DEBUG_FAST -D DEBUG_SLOW

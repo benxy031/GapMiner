@@ -131,9 +131,7 @@ void Miner::start(BlockHeader *header) {
     pthread_create(&threads[i], NULL, miner, (void *) args[i]);
 
     if (Opts::get_instance()->has_extra_vb()) {
-      pthread_mutex_lock(&io_mutex);
-      cout << get_time() << "Worker " << i << " started\n";
-      pthread_mutex_unlock(&io_mutex);
+      extra_verbose_log(get_time() + "Worker " + itoa((uint64_t) i) + " started");
     }
   }
 

@@ -521,9 +521,9 @@ uint32_t &GPUFermat::clBuffer::operator[](int index) {
 }
 
 /* public interface to the gpu Fermat test */
-void GPUFermat::fermat_gpu() {
-  
-  run_fermat(queue, mFermatKernel320, numbers, gpuResults, elementsNum);
+void GPUFermat::fermat_gpu(uint32_t batchElements) {
+  const uint32_t work = (batchElements == 0) ? elementsNum : batchElements;
+  run_fermat(queue, mFermatKernel320, numbers, gpuResults, work);
   gpuResults.copyToHost(queue);
   clFinish(queue);
 }
@@ -629,7 +629,7 @@ void GPUFermat::test_gpu() {
     printf("\r                                             \r");
 
     /* run the gpu test */
-    fermat_gpu();
+    fermat_gpu(size);
 
     /* check the results */
     unsigned failures = 0;

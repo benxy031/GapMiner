@@ -94,6 +94,11 @@ static int log_fd = 0;
 
 static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+static int extra_log_fd = -1;
+static pthread_mutex_t extra_log_mutex = PTHREAD_MUTEX_INITIALIZER;
+static off_t extra_log_bytes = 0;
+static const off_t EXTRA_LOG_MAX_BYTES = 10LL * 1024LL * 1024LL * 1024LL;
+
 #define write_str(fd, str) write(fd, str, strlen(str))
 
 #ifndef NO_LOGGING
@@ -131,3 +136,34 @@ void log_string(string str, int status) {
   pthread_mutex_unlock(&log_mutex);
 }
 #endif
+
+void extra_verbose_log(const string &str) {
+  pthread_mutex_lock(&extra_log_mutex);
+
+  if (extra_log_fd == -1) {
+    extra_log_fd = open("tests", O_CREAT | O_TRUNC | O_WRONLY, 00777);
+    if (extra_log_fd < 0) {
+      perror("failed to open extra verbose log");
+      pthread_mutex_unlock(&extra_log_mutex);
+      return;
+    }
+    extra_log_bytes = 0;
+  }
+
+  string msg = str;
+  if (msg.empty() || msg[msg.length() - 1] != '\n')
+    msg.push_back('\n');
+
+  const size_t msg_len = msg.length();
+  if (extra_log_bytes + (off_t) msg_len > EXTRA_LOG_MAX_BYTES) {
+    if (ftruncate(extra_log_fd, 0) == 0)
+      lseek(extra_log_fd, 0, SEEK_SET);
+    extra_log_bytes = 0;
+  }
+
+  ssize_t written = write(extra_log_fd, msg.c_str(), msg_len);
+  if (written > 0)
+    extra_log_bytes += written;
+
+  pthread_mutex_unlock(&extra_log_mutex);
+}

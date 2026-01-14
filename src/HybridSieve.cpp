@@ -35,6 +35,7 @@
 #include <limits>
 #include <memory>
 #include <vector>
+#include <sstream>
 
 #include "utils.h"
 #include "HybridSieve.h"
@@ -197,9 +198,9 @@ void HybridSieve::run_sieve(PoW *pow,
       itoa(pow->get_shift()) + " shift", LOG_D);
 
   if (Opts::get_instance()->has_extra_vb()) {
-    pthread_mutex_lock(&io_mutex);
-    cout << get_time() << "Starting new sieve" << endl;
-    pthread_mutex_unlock(&io_mutex);
+    std::ostringstream ss;
+    ss << get_time() << "Starting new sieve";
+    extra_verbose_log(ss.str());
   }
   running = true;
   sieve_queue->clear();
@@ -326,8 +327,14 @@ HybridSieve::SieveItem *HybridSieve::SieveQueue::pull() {
  
   pthread_mutex_lock(&access_mutex);
 
-  while (q.empty())
+  while (q.empty()) {
+    if (Opts::get_instance()->has_extra_vb()) {
+      std::ostringstream ss;
+      ss << get_time() << "GPU work thread waiting for queue";
+      extra_verbose_log(ss.str());
+    }
     pthread_cond_wait(&notfull_cond, &access_mutex);
+  }
    
   SieveItem *work = q.front();
   q.pop();
@@ -382,9 +389,9 @@ bool HybridSieve::SieveQueue::full() {
 void *HybridSieve::gpu_work_thread(void *args) {
   log_str("starting gpu_work_thread", LOG_D);
   if (Opts::get_instance()->has_extra_vb()) {
-    pthread_mutex_lock(&io_mutex);
-    cout << get_time() << "GPU work thread started\n";
-    pthread_mutex_unlock(&io_mutex);
+    std::ostringstream ss;
+    ss << get_time() << "GPU work thread started";
+    extra_verbose_log(ss.str());
   }
 
 #ifndef WINDOWS
@@ -506,9 +513,9 @@ void *HybridSieve::gpu_results_thread(void *args) {
 
   log_str("starting gpu_results_thread", LOG_D);
   if (Opts::get_instance()->has_extra_vb()) {
-    pthread_mutex_lock(&io_mutex);
-    cout << get_time() << "GPU result processing thread started\n";
-    pthread_mutex_unlock(&io_mutex);
+    std::ostringstream ss;
+    ss << get_time() << "GPU result processing thread started";
+    extra_verbose_log(ss.str());
   }
 
 #ifndef WINDOWS
@@ -526,11 +533,13 @@ void *HybridSieve::gpu_results_thread(void *args) {
   while (list->running) {
     const uint64_t cycle_start = PoWUtils::gettime_usec();
 
-    list->create_candidates();
+    uint32_t candidate_count = list->create_candidates();
+    if (!candidate_count)
+      continue;
     if (!list->running)
       break;
 
-    fermat->fermat_gpu();
+    fermat->fermat_gpu(candidate_count);
     if (!list->running)
       break;
 
@@ -538,16 +547,17 @@ void *HybridSieve::gpu_results_thread(void *args) {
     if (!list->running)
       break;
 
-    const uint32_t processed = list->n_candidates();
+    const uint32_t processed = candidate_count;
     *list->tests     += processed;
     *list->cur_tests += processed;
 
     if (extra_verbose) {
       const uint64_t cycle_end = PoWUtils::gettime_usec();
-      pthread_mutex_lock(&io_mutex);
-      cout << get_time() << "GPU cycle processed " << processed
-           << " candidates in " << (cycle_end - cycle_start) / 1000.0 << " ms\n";
-      pthread_mutex_unlock(&io_mutex);
+      const double duration_ms = (cycle_end - cycle_start) / 1000.0;
+      std::ostringstream ss;
+      ss << get_time() << "GPU cycle processed " << processed
+         << " candidates in " << duration_ms << " ms";
+      extra_verbose_log(ss.str());
     }
   }
 
@@ -782,10 +792,15 @@ HybridSieve::GPUWorkList::GPUWorkList(uint32_t len,
   this->len           = len;
   this->cur_len       = 0;
   this->n_tests       = n_tests;
+  this->max_n_tests   = n_tests;
+  this->min_n_tests   = std::max<uint32_t>(1u, n_tests / 2u);
+  this->active_n_tests = n_tests;
+  this->last_cycle_tests = n_tests;
   this->pprocessor    = pprocessor;
   this->sieve         = sieve;
   this->prime_base    = prime_base;
   this->candidates    = candidates;
+  this->last_candidate_count = len * n_tests;
   this->tests         = tests;
   this->cur_tests     = cur_tests;
   this->start         = NULL;
@@ -810,6 +825,61 @@ HybridSieve::GPUWorkList::~GPUWorkList() {
   mpz_clear(mpz_adder);
 }
 
+void HybridSieve::GPUWorkList::rebalance_locked() {
+  if (!start || !start->next)
+    return;
+
+  GPUWorkItem *best_prev = NULL;
+  GPUWorkItem *best_item = start;
+  uint16_t best_remaining = start->get_cur_len();
+  GPUWorkItem *prev = start;
+
+  for (GPUWorkItem *cur = start->next; cur != NULL; cur = cur->next) {
+    const uint16_t cur_remaining = cur->get_cur_len();
+    if (cur_remaining < best_remaining ||
+        (cur_remaining == best_remaining && cur->get_len() > best_item->get_len())) {
+      best_remaining = cur_remaining;
+      best_prev = prev;
+      best_item = cur;
+    }
+    prev = cur;
+  }
+
+  if (best_item == start)
+    return;
+
+  best_prev->next = best_item->next;
+  if (best_prev == end)
+    end = best_prev;
+
+  best_item->next = start;
+  start = best_item;
+}
+
+void HybridSieve::GPUWorkList::adjust_active_tests(uint16_t observed_min,
+                                                   uint16_t observed_avg) {
+  uint32_t new_tests = active_n_tests;
+  const uint32_t step = std::max<uint32_t>(1u, max_n_tests / 8u);
+
+  const uint32_t low_threshold = std::max<uint32_t>(1u, active_n_tests / 2u);
+  if (observed_min < low_threshold && active_n_tests > min_n_tests) {
+    new_tests = std::max(active_n_tests - step, min_n_tests);
+  } else {
+    const uint32_t high_threshold = active_n_tests * 3u;
+    if (observed_avg > high_threshold && active_n_tests < max_n_tests)
+      new_tests = std::min(active_n_tests + step, max_n_tests);
+  }
+
+  if (new_tests != active_n_tests) {
+    active_n_tests = new_tests;
+    if (extra_verbose) {
+      std::ostringstream ss;
+      ss << get_time() << "Adaptive GPU batch size set to " << active_n_tests;
+      extra_verbose_log(ss.str());
+    }
+  }
+}
+
 /* returns the size of this */
 size_t HybridSieve::GPUWorkList::size() {
   MutexGuard guard(access_mutex);
@@ -817,7 +887,7 @@ size_t HybridSieve::GPUWorkList::size() {
   while (cur_len < len)
     pthread_cond_wait(&full_cond, &access_mutex);
 
-  size_t size = sizeof(GPUWorkList) + sizeof(uint32_t) * 10 * len * n_tests;
+  size_t size = sizeof(GPUWorkList) + sizeof(uint32_t) * 10 * len * max_n_tests;
 
   for (GPUWorkItem *cur = start; cur != NULL; cur = cur->next) 
     size += sizeof(GPUWorkItem) + sizeof(uint32_t) * cur->get_len();
@@ -865,13 +935,18 @@ uint16_t HybridSieve::GPUWorkList::min_cur_len() {
     pthread_cond_wait(&full_cond, &access_mutex);
 
   uint16_t min = UINT16_MAX;
+  bool has_positive = false;
   for (GPUWorkItem *cur = start; cur != NULL; cur = cur->next) {
-    uint16_t cur_len_val = cur->get_cur_len();
+    const uint16_t cur_len_val = cur->get_cur_len();
+    if (cur_len_val == 0)
+      continue;
+    has_positive = true;
     if (cur_len_val < min)
       min = cur_len_val;
-    if (min == 0) break;  // Early exit optimization
   }
 
+  if (!has_positive)
+    return 0;
   return min;
 }
 
@@ -883,6 +958,9 @@ void HybridSieve::GPUWorkList::reinit(uint32_t prime_base[10], uint64_t target, 
   clear();
   this->target = target;
   this->nonce = nonce;
+  this->active_n_tests = max_n_tests;
+  this->last_cycle_tests = max_n_tests;
+  this->last_candidate_count = len * max_n_tests;
   memcpy(this->prime_base, prime_base, sizeof(uint32_t) * 10);
 
   pthread_cond_signal(&notfull_cond);
@@ -890,7 +968,7 @@ void HybridSieve::GPUWorkList::reinit(uint32_t prime_base[10], uint64_t target, 
 
 /* returns the number of candidates */
 uint32_t HybridSieve::GPUWorkList::n_candidates() { 
-  return len * n_tests; 
+  return last_candidate_count; 
 }
 
 /* add a item to the list */
@@ -921,28 +999,52 @@ void HybridSieve::GPUWorkList::add(GPUWorkItem *item) {
 }
 
 /* creates the candidate array to process */
-void HybridSieve::GPUWorkList::create_candidates() {
+uint32_t HybridSieve::GPUWorkList::create_candidates() {
 
   MutexGuard guard(access_mutex);
 
   while (cur_len < len)
     pthread_cond_wait(&full_cond, &access_mutex);
 
+  if (cur_len > 1)
+    rebalance_locked();
+
 #ifdef DEBUG_FAST
   this->check = get_xor(); 
 #endif
-  
+
+  const uint32_t current_tests = active_n_tests;
+  last_cycle_tests = current_tests;
   uint32_t i = 0;
+  uint16_t observed_min = UINT16_MAX;
+  uint64_t observed_sum = 0;
+  uint32_t observed_count = 0;
+
   for (GPUWorkItem *cur = start; cur != NULL; cur = cur->next) {
-    for (uint32_t n = 0; n < n_tests; n++)
+    const uint16_t remaining_before = cur->get_cur_len();
+    observed_min = std::min<uint16_t>(observed_min, remaining_before);
+    observed_sum += remaining_before;
+    observed_count++;
+
+    for (uint32_t n = 0; n < current_tests; n++)
       candidates[i + n] = cur->pop();
 
-    i += n_tests;
+    i += current_tests;
   }
+
+  if (observed_count > 0 && observed_min != UINT16_MAX) {
+    const uint16_t observed_avg = static_cast<uint16_t>(observed_sum / observed_count);
+    adjust_active_tests(observed_min, observed_avg);
+  }
+
+  last_candidate_count = len * current_tests;
+  return last_candidate_count;
 }
 
 /* parse the gpu results */
 void HybridSieve::GPUWorkList::parse_results(uint32_t *results) {
+
+  pthread_mutex_lock(&access_mutex);
 
 #ifdef DEBUG_FAST
   if (check != get_xor()) 
@@ -950,44 +1052,45 @@ void HybridSieve::GPUWorkList::parse_results(uint32_t *results) {
 #endif
   
   uint32_t i = 0;
+  const uint32_t cycle_tests = last_cycle_tests;
   GPUWorkItem *del = NULL;
   for (GPUWorkItem *cur = start, *prev = NULL; cur != NULL; cur = cur->next) {
 
     if (del != NULL)
       delete del;
 
-    for (uint32_t n = 0; n < n_tests; n++) {
+        for (uint32_t n = 0; n < cycle_tests; n++) {
       if (results[i + n]) {
 #ifndef DEBUG_BASIC
-        cur->set_prime(n_tests - n);    
+      cur->set_prime(cycle_tests - n);    
 #else
-        cur->set_prime(n_tests - n, prime_base);    
+      cur->set_prime(cycle_tests - n, prime_base);    
 #endif
           
 #ifdef DEBUG_SLOW
         mpz_import(mpz_hash, 10, -1, 4, 0, 0, prime_base);
-        mpz_add_ui(mpz_hash, mpz_hash, cur->get_prime(n_tests - n));
+        mpz_add_ui(mpz_hash, mpz_hash, cur->get_prime(cycle_tests - n));
    
         if (!mpz_probab_prime_p(mpz_hash, 25)) {
           cout << "[DD] in parse_results: prime test failed!!! i: " << i; 
-          cout << " n: " << n << " n_tests: " << n_tests << endl;
+          cout << " n: " << n << " n_tests: " << cycle_tests << endl;
         }
 #endif
       } 
 #ifdef DEBUG_SLOW
       else {
         mpz_import(mpz_hash, 10, -1, 4, 0, 0, prime_base);
-        mpz_add_ui(mpz_hash, mpz_hash, cur->get_prime(n_tests - n));
+        mpz_add_ui(mpz_hash, mpz_hash, cur->get_prime(cycle_tests - n));
    
         if (mpz_probab_prime_p(mpz_hash, 25)) {
           cout << "[DD] in parse_results: composite test failed!!! i: ";
-          cout << i << " n: " << n << " n_tests: " << n_tests << endl;
+          cout << i << " n: " << n << " n_tests: " << cycle_tests << endl;
         } 
       }
 
-      if (candidates[i + n] != cur->get_prime(n_tests - n)) {
+      if (candidates[i + n] != cur->get_prime(cycle_tests - n)) {
         cout << "[DD] candidates[" << i + n << "] = " << candidates[i + n];
-        cout << " != " <<  cur->get_prime(n_tests - n) << endl;
+        cout << " != " <<  cur->get_prime(cycle_tests - n) << endl;
       }
 #endif
     }
@@ -1022,7 +1125,7 @@ void HybridSieve::GPUWorkList::parse_results(uint32_t *results) {
       del = NULL;
     }
 
-    i += n_tests;
+    i += cycle_tests;
   }
 
   if (del != NULL)
@@ -1105,7 +1208,7 @@ bool HybridSieve::GPUWorkList::submit(uint32_t offset) {
   mpz_nextprime(next, mpz);
   mpz_sub(next, next, mpz);
 
-  if (!mpz_probab_prime_p(mpz, 25)) {
+  if (!mpz_probab_prime_p(mpz, 45)) {
     cout << "[DD] submit: prime test failed!!!\n";
   } else
     cout << "[DD] submit: prime test OK len: " << mpz_get_ui64(next) << endl;
