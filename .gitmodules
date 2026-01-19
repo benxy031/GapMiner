@@ -1,6 +1,6 @@
 [submodule "src/PoWCore"]
 	path = src/PoWCore
-	url = https://github.com/gapcoin-project/Gapcoin-PoWCore.git
+	url = https://github.com/benxy031/Gapcoin-PoWCore.git
 [submodule "src/Evolution"]
 	path = src/Evolution
 	url = https://github.com/gapcoin-project/Evolution
