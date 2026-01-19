@@ -76,6 +76,7 @@ class Opts {
     SingleOpt pass;
     SingleOpt quiet;
     SingleOpt extra_vb;
+    SingleOpt share_log;
     SingleOpt stats;
     SingleOpt threads;
     SingleOpt pull;
@@ -94,6 +95,11 @@ class Opts {
     SingleOpt queue_size;
     SingleOpt platform;
     SingleOpt n_tests;
+    SingleOpt cuda_sieve_proto;
+    SingleOpt bitmap_pool_buffers;
+    SingleOpt snapshot_pool_buffers;
+  SingleOpt gpu_launch_divisor;
+  SingleOpt gpu_launch_wait_ms;
 #endif    
     SingleOpt calc_ctr;
     SingleOpt ctr_strength;
@@ -139,6 +145,8 @@ class Opts {
                                                                 
     bool has_extra_vb()         { return extra_vb.active;       }
                                                                 
+    bool log_shares()           { return share_log.active;      }
+
     bool has_stats()            { return stats.active;          }
     string get_stats()          { return stats.arg;             }
                                                                 
@@ -187,6 +195,20 @@ class Opts {
                                                                 
     bool has_n_tests()          { return n_tests.active;        }
     string get_n_tests()        { return n_tests.arg;           }
+
+    bool use_cuda_sieve_proto() { return cuda_sieve_proto.active; }
+
+    bool has_bitmap_pool_buffers()   { return bitmap_pool_buffers.active; }
+    string get_bitmap_pool_buffers() { return bitmap_pool_buffers.arg;    }
+
+    bool has_snapshot_pool_buffers()   { return snapshot_pool_buffers.active; }
+    string get_snapshot_pool_buffers() { return snapshot_pool_buffers.arg;    }
+
+    bool has_gpu_launch_divisor()   { return gpu_launch_divisor.active; }
+    string get_gpu_launch_divisor() { return gpu_launch_divisor.arg;    }
+
+    bool has_gpu_launch_wait_ms()   { return gpu_launch_wait_ms.active; }
+    string get_gpu_launch_wait_ms() { return gpu_launch_wait_ms.arg;    }
 #endif    
 
     bool has_calc_ctr()         { return calc_ctr.active;       }

@@ -176,8 +176,12 @@ void *getwork_thread(void *arg) {
   
     new_header->shift = shift;
 
-    if (longpoll || 
-        !header->equal_block_height(new_header) || 
+    const bool same_height = header->equal_block_height(new_header);
+    const bool same_template = header->equal(new_header);
+
+    if (longpoll ||
+        !same_height ||
+        !same_template ||
         time(NULL) >= work_time + 180) {
 
       miner->update_header(new_header);
@@ -194,6 +198,8 @@ void *getwork_thread(void *arg) {
         cout << fixed << (((double) header->difficulty) / TWO_POW48) << endl;
         pthread_mutex_unlock(&io_mutex);
       }
+    } else {
+      delete new_header;
     }
   }
 

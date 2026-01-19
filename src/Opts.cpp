@@ -122,6 +122,7 @@ user(      "-u", "--user",           "user for gapcoin rpc authentification",   
 pass(      "-x", "--pwd",            "password for gapcoin rpc authentification",     true),
 quiet(     "-q", "--quiet",          "be quiet (only prints shares)",                 false),
 extra_vb(  "-e", "--extra-verbose",  "additional verbose output",                     false),
+share_log( "-S", "--share-log",      "append share results to shares.txt",            false),
 stats(     "-j", "--stats-interval", "interval (sec) to print mining informations",   true),
 threads(   "-t", "--threads",        "number of mining threads",                      true),
 pull(      "-l", "--pull-interval",  "seconds to wait between getwork request",       true),
@@ -140,6 +141,11 @@ work_items("-w", "--work-items",     "gpu work items (default 2048)",           
 queue_size("-z", "--queue-size",     "the gpu waiting queue size (memory intensive)", true),
 platform(  "-a", "--platform",       "opencl platform (amd or nvidia)",               true),
 n_tests(   "-n", "--num-gpu-tests",  "the number of test per gap per gpu run",        true),
+cuda_sieve_proto(NULL, "--cuda-sieve-proto", "run the experimental CUDA sieve prototype", false),
+bitmap_pool_buffers(NULL, "--bitmap-pool-buffers", "override bitmap buffer pool size (default queue-size+2)", true),
+snapshot_pool_buffers(NULL, "--snapshot-pool-buffers", "override CUDA residue snapshot pool size", true),
+gpu_launch_divisor(NULL, "--gpu-launch-divisor", "override GPU launch divisor (default 6, lower = faster launches)", true),
+gpu_launch_wait_ms(NULL, "--gpu-launch-wait-ms", "maximum wait in ms before forcing a partial GPU batch (default 50)", true),
 #endif
 calc_ctr(  NULL, "--calc-ctr",       "calculate a chinese remainder theorem file",    false),
 ctr_strength(NULL, "--ctr-strength", "more = longer time and mybe better result",     true),
@@ -173,6 +179,7 @@ license(   "-v", "--license",        "show license of this program",            
 
   quiet.active = has_arg(quiet.short_opt, quiet.long_opt);
   extra_vb.active = has_arg(extra_vb.short_opt,  extra_vb.long_opt);
+  share_log.active = has_arg(share_log.short_opt, share_log.long_opt);
 
   stats.active = has_arg(stats.short_opt, stats.long_opt);
   if (stats.active)
@@ -237,6 +244,33 @@ license(   "-v", "--license",        "show license of this program",            
   n_tests.active = has_arg(n_tests.short_opt,  n_tests.long_opt);
   if (n_tests.active)
     n_tests.arg = get_arg(n_tests.short_opt,  n_tests.long_opt);
+
+  cuda_sieve_proto.active = has_arg(cuda_sieve_proto.short_opt,
+                                    cuda_sieve_proto.long_opt);
+
+  bitmap_pool_buffers.active = has_arg(bitmap_pool_buffers.short_opt,
+                                       bitmap_pool_buffers.long_opt);
+  if (bitmap_pool_buffers.active)
+    bitmap_pool_buffers.arg = get_arg(bitmap_pool_buffers.short_opt,
+                                      bitmap_pool_buffers.long_opt);
+
+  snapshot_pool_buffers.active = has_arg(snapshot_pool_buffers.short_opt,
+                                         snapshot_pool_buffers.long_opt);
+  if (snapshot_pool_buffers.active)
+    snapshot_pool_buffers.arg = get_arg(snapshot_pool_buffers.short_opt,
+                                        snapshot_pool_buffers.long_opt);
+
+  gpu_launch_divisor.active = has_arg(gpu_launch_divisor.short_opt,
+                                      gpu_launch_divisor.long_opt);
+  if (gpu_launch_divisor.active)
+    gpu_launch_divisor.arg = get_arg(gpu_launch_divisor.short_opt,
+                                     gpu_launch_divisor.long_opt);
+
+  gpu_launch_wait_ms.active = has_arg(gpu_launch_wait_ms.short_opt,
+                                      gpu_launch_wait_ms.long_opt);
+  if (gpu_launch_wait_ms.active)
+    gpu_launch_wait_ms.arg = get_arg(gpu_launch_wait_ms.short_opt,
+                                     gpu_launch_wait_ms.long_opt);
 #endif    
 
   calc_ctr.active = has_arg(calc_ctr.short_opt, calc_ctr.long_opt);
@@ -322,6 +356,9 @@ string Opts::get_help()  {
   ss << "  " << extra_vb.short_opt  << "  " << left << setw(18);
   ss << extra_vb.long_opt << "  " << extra_vb.description << "\n\n";
 
+  ss << "  " << share_log.short_opt << "  " << left << setw(18);
+  ss << share_log.long_opt << "  " << share_log.description << "\n\n";
+
   ss << "  " << stats.short_opt << "  " << left << setw(18);
   ss << stats.long_opt << "  " << stats.description << "\n\n";
 
@@ -373,6 +410,21 @@ string Opts::get_help()  {
 
   ss << "  " << n_tests.short_opt  << "  " << left << setw(18);
   ss << n_tests.long_opt << "  " << n_tests.description << "\n\n";
+
+  ss << "      " << left << setw(18);
+  ss << cuda_sieve_proto.long_opt << "  " << cuda_sieve_proto.description << "\n\n";
+
+  ss << "      " << left << setw(18);
+  ss << bitmap_pool_buffers.long_opt << "  " << bitmap_pool_buffers.description << "\n\n";
+
+  ss << "      " << left << setw(18);
+  ss << snapshot_pool_buffers.long_opt << "  " << snapshot_pool_buffers.description << "\n\n";
+
+  ss << "      " << left << setw(18);
+  ss << gpu_launch_divisor.long_opt << "  " << gpu_launch_divisor.description << "\n\n";
+
+  ss << "      " << left << setw(18);
+  ss << gpu_launch_wait_ms.long_opt << "  " << gpu_launch_wait_ms.description << "\n\n";
 #endif  
 
   ss << "      " << left << setw(18);

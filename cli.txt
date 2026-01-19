@@ -1,0 +1,6 @@
+-w 9059 -t 1 -f 45 --num-gpu-tests 20 --extra-verbose --cuda-sieve-proto --sieve-size 10500000 --sieve-primes 500000 --share-log --bitmap-pool-buffers 1500 --snapshot-pool-buffers 64 --gpu-launch-divisor 8 --gpu-launch-wait-ms 1 --queue-size 6000
+
+
+-o 127.0.0.1 -p 31397 -u benxy031 -x xx --use-gpu -a nvidia -w 2048 -t 1 -f 45 --num-gpu-tests 21 --extra-verbose --cuda-sieve-proto --sieve-size 13000000 --sieve-primes 2000000 --share-log --bitmap-pool-buffers 2200 --snapshot-pool-buffers 68 --gpu-launch-divisor 12 --gpu-launch-wait-ms 3 --queue-size 54000
+
+./gapminer-cuda -o 127.0.0.1 -p 31397 -u benxy031 -x xx --use-gpu -a nvidia -w 8096 -t 1 -f 45 --num-gpu-tests 64 --extra-verbose --bitmap-pool-buffers 1024 --sieve-size 14000000 --sieve-primes 1000000 --queue-size 22000 --share-log

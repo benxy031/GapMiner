@@ -74,6 +74,10 @@ unsigned GPUFermat::get_group_size() {
   return GroupSize;
 }
 
+unsigned GPUFermat::get_block_size() {
+  return GroupSize;
+}
+
 GPUFermat::~GPUFermat() {
   if (mFermatBenchmarkKernel320) {
     clReleaseKernel(mFermatBenchmarkKernel320);
@@ -96,6 +100,10 @@ GPUFermat::~GPUFermat() {
     gContext = nullptr;
   }
 }
+
+  unsigned GPUFermat::get_result_word_size() {
+    return static_cast<unsigned>(sizeof(ResultWord));
+  }
 
 /* return the only instance of this */
 GPUFermat *GPUFermat::get_instance(unsigned device_id, 
@@ -154,7 +162,7 @@ void GPUFermat::initializeBuffers() {
   primeBase.init(operandSize, CL_MEM_READ_WRITE);
 }
 
-uint32_t *GPUFermat::get_results_buffer() {
+GPUFermat::ResultWord *GPUFermat::get_results_buffer() {
   return gpuResults.HostData;
 }
 
@@ -530,6 +538,17 @@ void GPUFermat::fermat_gpu(uint32_t batchElements) {
   run_fermat(queue, mFermatKernel320, numbers, gpuResults, work);
   gpuResults.copyToHost(queue);
   clFinish(queue);
+}
+
+/* Diagnostic no-op for non-CUDA backend */
+void GPUFermat::dump_device_samples(const uint32_t *sample_indices, unsigned sampleCount) {
+  (void)sample_indices;
+  (void)sampleCount;
+  return;
+}
+
+unsigned GPUFermat::get_elements_num() {
+  return elementsNum;
 }
 
 /* run the Fermat test on the gpu */

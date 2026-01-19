@@ -26,6 +26,8 @@
 #include <gmp.h>
 #include <mpfr.h>
 #include <queue>
+#include <vector>
+#include <memory>
 
 #include "PoWCore/src/PoW.h"
 #include "PoWCore/src/PoWUtils.h"
@@ -89,7 +91,54 @@ class HybridSieve : public Sieve {
     /* template array for the Fermat candidates */
     uint64_t *candidates_template;
     
-    /* one GPU work item (set of prime candidates for a prime gap */
+                /* double-buffered sieve storage so windows can be reused without memcpy */
+                class BitmapBufferPool {
+                        public:
+                                BitmapBufferPool();
+                                ~BitmapBufferPool();
+                                BitmapBufferPool(const BitmapBufferPool &) = delete;
+                                BitmapBufferPool &operator=(const BitmapBufferPool &) = delete;
+
+                                void init(size_t buffer_bytes,
+                                                                        size_t min_buffers,
+                                                                        sieve_t *primary_buffer);
+                                sieve_t *acquire();
+                                void release(sieve_t *buffer);
+                                sieve_t *shutdown();
+
+                        private:
+                                size_t buffer_bytes;
+                                sieve_t *primary;
+                                std::vector<std::unique_ptr<uint8_t[]>> extra_buffers;
+                                std::vector<sieve_t *> free_buffers;
+                                pthread_mutex_t pool_mutex;
+                                pthread_cond_t pool_cond;
+                                bool initialized;
+                };
+
+                        class PrimeStartPool {
+                                public:
+                                        PrimeStartPool();
+                                        ~PrimeStartPool();
+                                        PrimeStartPool(const PrimeStartPool &) = delete;
+                                        PrimeStartPool &operator=(const PrimeStartPool &) = delete;
+
+                                        void init(size_t value_count,
+                                                  size_t buffer_count);
+                                        uint32_t *acquire();
+                                        void release(uint32_t *buffer);
+                                        void shutdown();
+                                        bool initialized() const { return is_initialized; }
+
+                                private:
+                                        size_t value_count;
+                                        std::vector<std::unique_ptr<uint32_t[]>> storage;
+                                        std::vector<uint32_t *> free_buffers;
+                                        pthread_mutex_t pool_mutex;
+                                        pthread_cond_t pool_cond;
+                                        bool is_initialized;
+                        };
+                /* one GPU work item (set of prime candidates for a prime gap */
     class GPUWorkItem {
       
       private:
@@ -109,10 +158,10 @@ class HybridSieve : public Sieve {
 #endif        
        
         /* the length of the offsets arrays */
-        int16_t len;
-        
-        /* the current index */
-        int16_t index;
+        uint16_t len;
+
+        /* the current index into offsets; needs 32 bits so wrap never occurs */
+        int32_t index;
 
       public:
 
@@ -172,6 +221,7 @@ class HybridSieve : public Sieve {
         /* returns the number of current offsets of this */
         uint16_t get_cur_len();
 
+
 #ifdef DEBUG_BASIC
         /* simple xor check to validate the items */
         uint32_t get_xor();
@@ -199,12 +249,11 @@ class HybridSieve : public Sieve {
  
         /* number of candidates to test at once */
         uint32_t n_tests;
-        uint32_t max_n_tests;
-        uint32_t min_n_tests;
-        uint32_t active_n_tests;
         uint32_t last_cycle_tests;
         uint32_t last_cycle_items;
         uint32_t last_candidate_count;
+        std::vector<GPUWorkItem *> last_cycle_item_list;
+        std::vector<uint32_t> last_cycle_item_counts;
  
         /* List start and end */
         GPUWorkItem *start, *end;
@@ -226,8 +275,17 @@ class HybridSieve : public Sieve {
         pthread_cond_t  notfull_cond;
         pthread_cond_t  full_cond;
 
+        /* cached stats for logging */
+        double last_batch_megabytes;
+        uint16_t last_batch_avg_tests;
+        uint16_t last_batch_min_tests;
+        bool last_batch_stats_valid;
+
         /* reorders awaiting work items by urgency */
         void rebalance_locked();
+
+        /* minimum number of queued work items before launching GPU */
+        uint32_t preferred_launch_items() const;
 
         /* mpz values */
         mpz_t mpz_hash, mpz_adder;
@@ -240,6 +298,8 @@ class HybridSieve : public Sieve {
 
         /* use extra verbose ? */
         bool extra_verbose;
+                                uint32_t preferred_launch_divisor;
+                                uint32_t preferred_launch_max_wait_ms;
 
       public : 
 
@@ -294,7 +354,7 @@ class HybridSieve : public Sieve {
         uint32_t create_candidates();
 
         /* parse the gpu results */
-        void parse_results(uint32_t *results);
+        void parse_results(const GPUFermat::ResultWord *results);
 
         /* submits a given offset */
         bool submit(uint32_t offset);
@@ -302,12 +362,20 @@ class HybridSieve : public Sieve {
         /* clears the list */
         void clear();
 
-                        private:
-                                void adjust_active_tests(uint16_t observed_min, uint16_t observed_avg);
+        /* returns current number of queued items */
+        uint32_t queued_items();
+
+        /* returns maximum queue capacity */
+        uint32_t capacity() const;
+
     };
 
     /* the GPUWorkList of this */
     GPUWorkList *gpu_list;
+
+        /* reusable sieve bitmap backing store */
+        BitmapBufferPool bitmap_pool;
+        PrimeStartPool prime_start_pool;
 
     /* one set of work items for the GPU */
     class SieveItem {
@@ -316,6 +384,9 @@ class HybridSieve : public Sieve {
 
         /* the sieve */
         sieve_t *sieve;
+
+        /* pool that recycles the bitmap storage */
+        BitmapBufferPool *buffer_pool;
 
         /* candidate size */
         sieve_t sievesize;
@@ -346,6 +417,11 @@ class HybridSieve : public Sieve {
 
         /* the current mpz_start */
         mpz_t mpz_start;
+
+                /* optional GPU start snapshot */
+                PrimeStartPool *start_pool;
+                uint32_t *prime_starts;
+                uint32_t prime_start_count;
        
         /* create a new SieveItem */
         SieveItem(sieve_t *sieve, 
@@ -353,10 +429,17 @@ class HybridSieve : public Sieve {
                   sieve_t sieve_round,
                   uint8_t hash[SHA256_DIGEST_LENGTH],
                   mpz_t mpz_start,
-                  PoW *pow);
+                  PoW *pow,
+                                  BitmapBufferPool *pool,
+                                  PrimeStartPool *start_pool,
+                                  uint32_t *prime_starts,
+                                  uint32_t prime_start_count);
        
         /* destroys a SieveItem */
         ~SieveItem();
+
+                const uint32_t *get_prime_starts() const { return prime_starts; }
+                uint32_t get_prime_start_count() const { return prime_start_count; }
     };
 
 
@@ -396,6 +479,9 @@ class HybridSieve : public Sieve {
 
         /* remove the oldest gpu work */
         SieveItem *pull();
+
+        /* try to remove work without waiting */
+        SieveItem *try_pull();
 
         /* add an new SieveItem */
         void push(SieveItem *work);

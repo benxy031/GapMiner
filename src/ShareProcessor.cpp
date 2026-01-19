@@ -37,6 +37,8 @@
 //#include "UTILS.h"
 #include <iostream>
 #include <string>
+#include <fstream>
+#include <sstream>
 
 using namespace std;
 
@@ -179,7 +181,8 @@ void *ShareProcessor::share_processor(void *args) {
   BlockHeader *cur;
   Rpc *rpc = NULL;
   Stratum *stratum = NULL;
-  bool has_stratum = Opts::get_instance()->has_stratum();
+  Opts *opts = Opts::get_instance();
+  bool has_stratum = opts->has_stratum();
 
   if (has_stratum)
     stratum = Stratum::get_instance();
@@ -212,21 +215,58 @@ void *ShareProcessor::share_processor(void *args) {
       stratum->sendwork(cur);
     } else {
 
+      PoW pow = cur->get_pow();
+      const uint64_t share_difficulty = pow.difficulty();
+      const bool is_block_candidate = share_difficulty >= pow.get_target();
+
       /* submit share */
-      log_str("Submitting Share: " + itoa(cur->get_pow().difficulty()), LOG_D);
+      log_str("Submitting Share: " + itoa(share_difficulty), LOG_D);
       bool accepted = rpc->sendwork(cur);
 
-      log_str("Found Share: " + itoa(cur->get_pow().difficulty()) +
-              "  =>  " + (accepted ? "accepted" : "stale!"), LOG_I);
+      const string base_status = (accepted ? "accepted" : "stale!");
+      const string block_status = (is_block_candidate ? " (block)" : "");
+      log_str("Found Share: " + itoa(share_difficulty) +
+              "  =>  " + base_status + block_status, LOG_I);
+
+      const double normalized_merit = ((double) share_difficulty) / TWO_POW48;
+      const string status = base_status + block_status;
+      ostringstream share_line;
+      share_line.setf(std::ios::fixed, std::ios::floatfield);
+      share_line.precision(7);
+      share_line << get_time();
+      share_line << "Found Share: ";
+      share_line << normalized_merit;
+      share_line << "  =>  " << status;
+      const string formatted_share = share_line.str();
 
       pthread_mutex_lock(&io_mutex);
+      cout.setf(std::ios::fixed, std::ios::floatfield);
       cout.precision(7);
-      cout << get_time();
-      cout << "Found Share: ";
-      cout << fixed << (((double) cur->get_pow().difficulty()) 
-                                       / TWO_POW48);
-      cout << "  =>  " <<  (accepted ? "accepted" : "stale!");
-      cout << endl;
+      cout << formatted_share << endl;
+
+      if (opts->log_shares()) {
+        static ofstream share_log_file;
+        static bool share_log_initialized = false;
+        static bool share_log_failed = false;
+
+        if (!share_log_initialized) {
+          share_log_file.open("shares.txt", ios::app);
+          if (share_log_file) {
+            share_log_file.setf(std::ios::fixed, std::ios::floatfield);
+            share_log_file.precision(7);
+          } else if (!share_log_failed) {
+            log_str("failed to open shares.txt for share logging", LOG_W);
+            share_log_failed = true;
+          }
+          share_log_initialized = true;
+        }
+
+        if (share_log_file) {
+          share_log_file << formatted_share << endl;
+          share_log_file.flush();
+        }
+      }
+
       pthread_mutex_unlock(&io_mutex);
     }
 

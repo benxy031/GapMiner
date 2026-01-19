@@ -25,6 +25,7 @@
 #include "Rpc.h"
 #include <jansson.h>
 #include "utils.h"
+#include "Opts.h"
 
 using namespace std;
 
@@ -371,6 +372,9 @@ bool Rpc::sendwork(BlockHeader *header) {
   CURLcode res;
 
   /* Perform the request, res will get the return code */ 
+  if (Opts::get_instance() && Opts::get_instance()->has_extra_vb()) {
+    extra_verbose_log(get_time() + " rpc-payload: " + hex);
+  }
   res = curl_easy_perform(curl_send);
 
   /* Check for errors */ 
@@ -388,7 +392,11 @@ bool Rpc::sendwork(BlockHeader *header) {
   json_t *root;
   json_error_t error;
 
-  root = json_loads(recv_ss->str().c_str(), 0, &error);
+  std::string response = recv_ss->str();
+  if (Opts::get_instance() && Opts::get_instance()->has_extra_vb()) {
+    extra_verbose_log(get_time() + " rpc-response: " + response);
+  }
+  root = json_loads(response.c_str(), 0, &error);
   recv_ss->str("");
 
   if(!root) {

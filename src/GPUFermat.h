@@ -148,8 +148,10 @@ class GPUFermat {
 
   public :
 
+    using ResultWord = uint32_t;
+
     /* returns a pointer to the gpu results (host) buffer */
-    uint32_t *get_results_buffer();
+    ResultWord *get_results_buffer();
 
     /* returns a pointer to the prime_base (host) buffer */
     uint32_t *get_prime_base_buffer();
@@ -171,11 +173,24 @@ class GPUFermat {
     /* public interface to the gpu Fermat test */
     void fermat_gpu(uint32_t elementsNum);
 
+    /* return the configured GPU capacity (elements) */
+    unsigned get_elements_num();
+
+    /* return the device/kernel block size used for grouping (e.g., CUDA block) */
+    unsigned get_block_size();
+
+    /* return the runtime result buffer element size in bytes */
+    unsigned get_result_word_size();
+
     /* run a benchmark test */
     void benchmark();
 
     /* test the gpu results */
     void test_gpu();
+
+    /* Diagnostic API (no-op for non-CUDA backends): dump device-built candidate
+     * limbs for the given sample indices. Enabled only when extra-verbose. */
+    void dump_device_samples(const uint32_t *sample_indices, unsigned sampleCount);
 
 };
 #endif /* USE_CUDA_BACKEND */

@@ -427,7 +427,11 @@ void *Stratum::recv_thread(void *arg) {
 
     json_t *root, *real_root;
     json_error_t error;
- 
+
+    if (Opts::get_instance() && Opts::get_instance()->has_extra_vb()) {
+      extra_verbose_log(get_time() + " stratum-response: " + string(buffer));
+    }
+
     root = json_loads(buffer, 0, &error);
     real_root = root;
  
@@ -603,6 +607,9 @@ bool Stratum::sendwork(BlockHeader *header) {
 
   bool error;
   string share = ss.str();
+  if (Opts::get_instance() && Opts::get_instance()->has_extra_vb()) {
+    extra_verbose_log(get_time() + " stratum-payload: " + share);
+  }
   do {
     error = false;
 

@@ -10,27 +10,62 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <vector>
 
 #include "utils.h"
+#include "Opts.h"
 
 using namespace std;
 
 bool GPUFermat::initialized = false;
 
+// expose CUDA block size as block size getter
+unsigned GPUFermat::get_block_size() {
+  return 512u;
+}
+
 namespace {
 constexpr int kOperandSize = 10;
 constexpr unsigned kCudaBlockSize = 512u;
-constexpr int kSmallPrimeCount = 4;
+constexpr int kSmallPrimeCount = 16;
 constexpr int kMontgomeryShiftBits = 2 * kOperandSize * 32;  // 640
 
-constexpr uint32_t kSmallPrimesHost[kSmallPrimeCount] = {3u, 5u, 7u, 11u};
+template <typename T>
+T *buffer_cast(uint8_t *ptr) {
+  return reinterpret_cast<T *>(ptr);
+}
+
+template <typename T>
+const T *buffer_cast(const uint8_t *ptr) {
+  return reinterpret_cast<const T *>(ptr);
+}
+
+using ResultWord = GPUFermat::ResultWord;
+
+constexpr uint32_t kSmallPrimesHost[kSmallPrimeCount] = {3u,  5u,  7u,  11u,
+                                                         13u, 17u, 19u, 23u,
+                                                         29u, 31u, 37u, 41u,
+                                                         43u, 47u, 53u, 59u};
+
+struct PrototypeWindowDesc {
+  uint32_t word_start;
+  uint32_t word_count;
+  uint32_t bit_length;
+  uint32_t output_base;
+  uint32_t base_parity;
+};
 
 __device__ __constant__ uint32_t kSmallPrimesDevice[kSmallPrimeCount] = {
-    3u, 5u, 7u, 11u};
+    3u,  5u,  7u,  11u, 13u, 17u, 19u, 23u,
+    29u, 31u, 37u, 41u, 43u, 47u, 53u, 59u};
 __device__ __constant__ uint32_t kPrimeReciprocalsDevice[kSmallPrimeCount] = {
-    0x55555556u, 0x33333334u, 0x24924925u, 0x1745D175u};
+    0x55555556u, 0x33333334u, 0x24924925u, 0x1745D175u,
+    0x13B13B14u, 0x0F0F0F10u, 0x0D79435Fu, 0x0B21642Du,
+    0x08D3DCB1u, 0x08421085u, 0x06EB3E46u, 0x063E7064u,
+    0x05F417D1u, 0x0572620Bu, 0x04D4873Fu, 0x0456C798u};
 __device__ __constant__ uint32_t kPrimeBaseConst[kOperandSize];
 __device__ __constant__ uint32_t kHighResiduesConst[kSmallPrimeCount];
 
@@ -40,7 +75,7 @@ struct BigInt {
 
 uint32_t mod_high_part_host(const uint32_t *prime_base, uint32_t prime) {
   unsigned long long acc = 0ull;
-  for (int idx = kOperandSize - 1; idx >= 1; --idx)
+  for (int idx = kOperandSize - 1; idx >= 0; --idx)
     acc = ((acc << 32) + prime_base[idx]) % prime;
   return static_cast<uint32_t>(acc);
 }
@@ -66,6 +101,49 @@ __device__ __forceinline__ void big_copy(BigInt &dst, const BigInt &src) {
 #pragma unroll
   for (int i = 0; i < kOperandSize; ++i)
     dst.limb[i] = src.limb[i];
+}
+
+// Diagnostic kernel: reconstruct candidate limbs on-device for a set of indices
+__global__ void dump_candidate_limbs_kernel(const uint32_t *numbers,
+                                            const uint32_t *sample_indices,
+                                            uint32_t *out_limbs,
+                                            unsigned sampleCount) {
+  unsigned tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid >= sampleCount)
+    return;
+
+  const uint32_t idx = sample_indices[tid];
+  const uint32_t off = numbers[idx];
+
+  // Reconstruct: add offset into least-significant limb and propagate carry
+  uint64_t carry = off;
+  for (int i = 0; i < kOperandSize; ++i) {
+    uint64_t sum = static_cast<uint64_t>(kPrimeBaseConst[i]) + carry;
+    out_limbs[tid * kOperandSize + i] = static_cast<uint32_t>(sum & 0xffffffffu);
+    carry = sum >> 32;
+  }
+  // write final carry (0 or small) after limbs
+  out_limbs[sampleCount * kOperandSize + tid] = static_cast<uint32_t>(carry & 0xffffffffu);
+}
+
+// Diagnostic kernel: record carry after each limb addition for given samples
+__global__ void dump_candidate_carries_kernel(const uint32_t *numbers,
+                                              const uint32_t *sample_indices,
+                                              uint32_t *out_carries,
+                                              unsigned sampleCount) {
+  unsigned tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid >= sampleCount)
+    return;
+
+  const uint32_t idx = sample_indices[tid];
+  const uint32_t off = numbers[idx];
+
+  uint64_t carry = off;
+  for (int i = 0; i < kOperandSize; ++i) {
+    uint64_t sum = static_cast<uint64_t>(kPrimeBaseConst[i]) + carry;
+    carry = sum >> 32;
+    out_carries[tid * kOperandSize + i] = static_cast<uint32_t>(carry & 0xffffffffu);
+  }
 }
 
 __device__ __forceinline__ bool big_is_zero(const BigInt &n) {
@@ -136,7 +214,7 @@ __device__ __forceinline__ void big_shift_right_two(BigInt &a) {
   }
 }
 
-__device__ __forceinline__ uint32_t montgomery_inverse32(uint32_t n0) {
+__host__ __device__ __forceinline__ uint32_t montgomery_inverse32(uint32_t n0) {
   uint32_t inv = 1u;
   for (int i = 0; i < 5; ++i) {
     uint64_t prod = static_cast<uint64_t>(n0) * inv;
@@ -156,8 +234,10 @@ __device__ void montgomery_mul(const BigInt &a,
   for (int i = 0; i < totalLimbs; ++i)
     t[i] = 0ull;
 
+  #pragma unroll
   for (int i = 0; i < kOperandSize; ++i) {
     uint64_t carry = 0ull;
+    #pragma unroll
     for (int j = 0; j < kOperandSize; ++j) {
       const int idx = i + j;
       uint64_t sum = t[idx] +
@@ -169,6 +249,7 @@ __device__ void montgomery_mul(const BigInt &a,
 
     uint32_t m = static_cast<uint32_t>(t[i]) * nPrime;
     carry = 0ull;
+    #pragma unroll
     for (int j = 0; j < kOperandSize; ++j) {
       const int idx = i + j;
       uint64_t sum = t[idx] + static_cast<uint64_t>(m) * mod.limb[j] + carry;
@@ -179,6 +260,7 @@ __device__ void montgomery_mul(const BigInt &a,
   }
 
   BigInt tmp;
+  #pragma unroll
   for (int i = 0; i < kOperandSize; ++i)
     tmp.limb[i] = static_cast<uint32_t>(t[i + kOperandSize]);
   if (big_compare(tmp, mod) >= 0)
@@ -186,10 +268,923 @@ __device__ void montgomery_mul(const BigInt &a,
   big_copy(out, tmp);
 }
 
+__device__ __forceinline__ uint32_t mul_hi_u32(uint32_t a, uint32_t b) {
+  return __umulhi(a, b);
+}
+
+__device__ __forceinline__ void mon_sub_320(uint32_t *a,
+                                            const uint32_t *b,
+                                            int size) {
+  uint32_t prev = a[0];
+  a[0] -= b[0];
+  #pragma unroll
+  for (int i = 1; i < size; ++i) {
+    uint32_t current = a[i];
+    uint32_t borrow = (a[i - 1] > prev) ? 1u : 0u;
+    a[i] -= b[i] + borrow;
+    prev = current;
+  }
+}
+
+__device__ void monMul320_words(uint32_t *op1,
+                                const uint32_t *op2,
+                                const uint32_t *mod,
+                                uint32_t invm) {
+  uint32_t invValue[10];
+  uint64_t accLow = 0, accHi = 0;
+  union {
+    uint2 v32;
+    unsigned long long v64;
+  } Int;
+  {
+    accLow += static_cast<uint64_t>(op1[0]) * op2[0];
+    accHi += mul_hi_u32(op1[0], op2[0]);
+    invValue[0] = invm * static_cast<uint32_t>(accLow);
+    accLow += static_cast<uint64_t>(invValue[0]) * mod[0];
+    accHi += mul_hi_u32(invValue[0], mod[0]);
+    uint32_t high32 = static_cast<uint32_t>(accLow >> 32);
+    accHi += static_cast<uint64_t>(high32);
+    accLow = accHi;
+    accHi = 0;
+  }
+  {
+    accLow += static_cast<uint64_t>(op1[1]) * op2[0];
+    accHi += mul_hi_u32(op1[1], op2[0]);
+    accLow += static_cast<uint64_t>(op1[0]) * op2[1];
+    accHi += mul_hi_u32(op1[0], op2[1]);
+    accLow += static_cast<uint64_t>(invValue[0]) * mod[1];
+    accHi += mul_hi_u32(invValue[0], mod[1]);
+    invValue[1] = invm * static_cast<uint32_t>(accLow);
+    accLow += static_cast<uint64_t>(invValue[1]) * mod[0];
+    accHi += mul_hi_u32(invValue[1], mod[0]);
+    uint32_t high32 = static_cast<uint32_t>(accLow >> 32);
+    accHi += static_cast<uint64_t>(high32);
+    accLow = accHi;
+    accHi = 0;
+  }
+  {
+    accLow += static_cast<uint64_t>(op1[2]) * op2[0];
+    accHi += mul_hi_u32(op1[2], op2[0]);
+    accLow += static_cast<uint64_t>(op1[1]) * op2[1];
+    accHi += mul_hi_u32(op1[1], op2[1]);
+    accLow += static_cast<uint64_t>(op1[0]) * op2[2];
+    accHi += mul_hi_u32(op1[0], op2[2]);
+    accLow += static_cast<uint64_t>(invValue[0]) * mod[2];
+    accHi += mul_hi_u32(invValue[0], mod[2]);
+    accLow += static_cast<uint64_t>(invValue[1]) * mod[1];
+    accHi += mul_hi_u32(invValue[1], mod[1]);
+    invValue[2] = invm * static_cast<uint32_t>(accLow);
+    accLow += static_cast<uint64_t>(invValue[2]) * mod[0];
+    accHi += mul_hi_u32(invValue[2], mod[0]);
+    uint32_t high32 = static_cast<uint32_t>(accLow >> 32);
+    accHi += static_cast<uint64_t>(high32);
+    accLow = accHi;
+    accHi = 0;
+  }
+  {
+    accLow += static_cast<uint64_t>(op1[3]) * op2[0];
+    accHi += mul_hi_u32(op1[3], op2[0]);
+    accLow += static_cast<uint64_t>(op1[2]) * op2[1];
+    accHi += mul_hi_u32(op1[2], op2[1]);
+    accLow += static_cast<uint64_t>(op1[1]) * op2[2];
+    accHi += mul_hi_u32(op1[1], op2[2]);
+    accLow += static_cast<uint64_t>(op1[0]) * op2[3];
+    accHi += mul_hi_u32(op1[0], op2[3]);
+    accLow += static_cast<uint64_t>(invValue[0]) * mod[3];
+    accHi += mul_hi_u32(invValue[0], mod[3]);
+    accLow += static_cast<uint64_t>(invValue[1]) * mod[2];
+    accHi += mul_hi_u32(invValue[1], mod[2]);
+    accLow += static_cast<uint64_t>(invValue[2]) * mod[1];
+    accHi += mul_hi_u32(invValue[2], mod[1]);
+    invValue[3] = invm * static_cast<uint32_t>(accLow);
+    accLow += static_cast<uint64_t>(invValue[3]) * mod[0];
+    accHi += mul_hi_u32(invValue[3], mod[0]);
+    uint32_t high32 = static_cast<uint32_t>(accLow >> 32);
+    accHi += static_cast<uint64_t>(high32);
+    accLow = accHi;
+    accHi = 0;
+  }
+  {
+    accLow += static_cast<uint64_t>(op1[4]) * op2[0];
+    accHi += mul_hi_u32(op1[4], op2[0]);
+    accLow += static_cast<uint64_t>(op1[3]) * op2[1];
+    accHi += mul_hi_u32(op1[3], op2[1]);
+    accLow += static_cast<uint64_t>(op1[2]) * op2[2];
+    accHi += mul_hi_u32(op1[2], op2[2]);
+    accLow += static_cast<uint64_t>(op1[1]) * op2[3];
+    accHi += mul_hi_u32(op1[1], op2[3]);
+    accLow += static_cast<uint64_t>(op1[0]) * op2[4];
+    accHi += mul_hi_u32(op1[0], op2[4]);
+    accLow += static_cast<uint64_t>(invValue[0]) * mod[4];
+    accHi += mul_hi_u32(invValue[0], mod[4]);
+    accLow += static_cast<uint64_t>(invValue[1]) * mod[3];
+    accHi += mul_hi_u32(invValue[1], mod[3]);
+    accLow += static_cast<uint64_t>(invValue[2]) * mod[2];
+    accHi += mul_hi_u32(invValue[2], mod[2]);
+    accLow += static_cast<uint64_t>(invValue[3]) * mod[1];
+    accHi += mul_hi_u32(invValue[3], mod[1]);
+    invValue[4] = invm * static_cast<uint32_t>(accLow);
+    accLow += static_cast<uint64_t>(invValue[4]) * mod[0];
+    accHi += mul_hi_u32(invValue[4], mod[0]);
+    uint32_t high32 = static_cast<uint32_t>(accLow >> 32);
+    accHi += static_cast<uint64_t>(high32);
+    accLow = accHi;
+    accHi = 0;
+  }
+  {
+    accLow += static_cast<uint64_t>(op1[5]) * op2[0];
+    accHi += mul_hi_u32(op1[5], op2[0]);
+    accLow += static_cast<uint64_t>(op1[4]) * op2[1];
+    accHi += mul_hi_u32(op1[4], op2[1]);
+    accLow += static_cast<uint64_t>(op1[3]) * op2[2];
+    accHi += mul_hi_u32(op1[3], op2[2]);
+    accLow += static_cast<uint64_t>(op1[2]) * op2[3];
+    accHi += mul_hi_u32(op1[2], op2[3]);
+    accLow += static_cast<uint64_t>(op1[1]) * op2[4];
+    accHi += mul_hi_u32(op1[1], op2[4]);
+    accLow += static_cast<uint64_t>(op1[0]) * op2[5];
+    accHi += mul_hi_u32(op1[0], op2[5]);
+    accLow += static_cast<uint64_t>(invValue[0]) * mod[5];
+    accHi += mul_hi_u32(invValue[0], mod[5]);
+    accLow += static_cast<uint64_t>(invValue[1]) * mod[4];
+    accHi += mul_hi_u32(invValue[1], mod[4]);
+    accLow += static_cast<uint64_t>(invValue[2]) * mod[3];
+    accHi += mul_hi_u32(invValue[2], mod[3]);
+    accLow += static_cast<uint64_t>(invValue[3]) * mod[2];
+    accHi += mul_hi_u32(invValue[3], mod[2]);
+    accLow += static_cast<uint64_t>(invValue[4]) * mod[1];
+    accHi += mul_hi_u32(invValue[4], mod[1]);
+    invValue[5] = invm * static_cast<uint32_t>(accLow);
+    accLow += static_cast<uint64_t>(invValue[5]) * mod[0];
+    accHi += mul_hi_u32(invValue[5], mod[0]);
+    uint32_t high32 = static_cast<uint32_t>(accLow >> 32);
+    accHi += static_cast<uint64_t>(high32);
+    accLow = accHi;
+    accHi = 0;
+  }
+  {
+    accLow += static_cast<uint64_t>(op1[6]) * op2[0];
+    accHi += mul_hi_u32(op1[6], op2[0]);
+    accLow += static_cast<uint64_t>(op1[5]) * op2[1];
+    accHi += mul_hi_u32(op1[5], op2[1]);
+    accLow += static_cast<uint64_t>(op1[4]) * op2[2];
+    accHi += mul_hi_u32(op1[4], op2[2]);
+    accLow += static_cast<uint64_t>(op1[3]) * op2[3];
+    accHi += mul_hi_u32(op1[3], op2[3]);
+    accLow += static_cast<uint64_t>(op1[2]) * op2[4];
+    accHi += mul_hi_u32(op1[2], op2[4]);
+    accLow += static_cast<uint64_t>(op1[1]) * op2[5];
+    accHi += mul_hi_u32(op1[1], op2[5]);
+    accLow += static_cast<uint64_t>(op1[0]) * op2[6];
+    accHi += mul_hi_u32(op1[0], op2[6]);
+    accLow += static_cast<uint64_t>(invValue[0]) * mod[6];
+    accHi += mul_hi_u32(invValue[0], mod[6]);
+    accLow += static_cast<uint64_t>(invValue[1]) * mod[5];
+    accHi += mul_hi_u32(invValue[1], mod[5]);
+    accLow += static_cast<uint64_t>(invValue[2]) * mod[4];
+    accHi += mul_hi_u32(invValue[2], mod[4]);
+    accLow += static_cast<uint64_t>(invValue[3]) * mod[3];
+    accHi += mul_hi_u32(invValue[3], mod[3]);
+    accLow += static_cast<uint64_t>(invValue[4]) * mod[2];
+    accHi += mul_hi_u32(invValue[4], mod[2]);
+    accLow += static_cast<uint64_t>(invValue[5]) * mod[1];
+    accHi += mul_hi_u32(invValue[5], mod[1]);
+    invValue[6] = invm * static_cast<uint32_t>(accLow);
+    accLow += static_cast<uint64_t>(invValue[6]) * mod[0];
+    accHi += mul_hi_u32(invValue[6], mod[0]);
+    uint32_t high32 = static_cast<uint32_t>(accLow >> 32);
+    accHi += static_cast<uint64_t>(high32);
+    accLow = accHi;
+    accHi = 0;
+  }
+  {
+    accLow += static_cast<uint64_t>(op1[7]) * op2[0];
+    accHi += mul_hi_u32(op1[7], op2[0]);
+    accLow += static_cast<uint64_t>(op1[6]) * op2[1];
+    accHi += mul_hi_u32(op1[6], op2[1]);
+    accLow += static_cast<uint64_t>(op1[5]) * op2[2];
+    accHi += mul_hi_u32(op1[5], op2[2]);
+    accLow += static_cast<uint64_t>(op1[4]) * op2[3];
+    accHi += mul_hi_u32(op1[4], op2[3]);
+    accLow += static_cast<uint64_t>(op1[3]) * op2[4];
+    accHi += mul_hi_u32(op1[3], op2[4]);
+    accLow += static_cast<uint64_t>(op1[2]) * op2[5];
+    accHi += mul_hi_u32(op1[2], op2[5]);
+    accLow += static_cast<uint64_t>(op1[1]) * op2[6];
+    accHi += mul_hi_u32(op1[1], op2[6]);
+    accLow += static_cast<uint64_t>(op1[0]) * op2[7];
+    accHi += mul_hi_u32(op1[0], op2[7]);
+    accLow += static_cast<uint64_t>(invValue[0]) * mod[7];
+    accHi += mul_hi_u32(invValue[0], mod[7]);
+    accLow += static_cast<uint64_t>(invValue[1]) * mod[6];
+    accHi += mul_hi_u32(invValue[1], mod[6]);
+    accLow += static_cast<uint64_t>(invValue[2]) * mod[5];
+    accHi += mul_hi_u32(invValue[2], mod[5]);
+    accLow += static_cast<uint64_t>(invValue[3]) * mod[4];
+    accHi += mul_hi_u32(invValue[3], mod[4]);
+    accLow += static_cast<uint64_t>(invValue[4]) * mod[3];
+    accHi += mul_hi_u32(invValue[4], mod[3]);
+    accLow += static_cast<uint64_t>(invValue[5]) * mod[2];
+    accHi += mul_hi_u32(invValue[5], mod[2]);
+    accLow += static_cast<uint64_t>(invValue[6]) * mod[1];
+    accHi += mul_hi_u32(invValue[6], mod[1]);
+    invValue[7] = invm * static_cast<uint32_t>(accLow);
+    accLow += static_cast<uint64_t>(invValue[7]) * mod[0];
+    accHi += mul_hi_u32(invValue[7], mod[0]);
+    uint32_t high32 = static_cast<uint32_t>(accLow >> 32);
+    accHi += static_cast<uint64_t>(high32);
+    accLow = accHi;
+    accHi = 0;
+  }
+  {
+    accLow += static_cast<uint64_t>(op1[8]) * op2[0];
+    accHi += mul_hi_u32(op1[8], op2[0]);
+    accLow += static_cast<uint64_t>(op1[7]) * op2[1];
+    accHi += mul_hi_u32(op1[7], op2[1]);
+    accLow += static_cast<uint64_t>(op1[6]) * op2[2];
+    accHi += mul_hi_u32(op1[6], op2[2]);
+    accLow += static_cast<uint64_t>(op1[5]) * op2[3];
+    accHi += mul_hi_u32(op1[5], op2[3]);
+    accLow += static_cast<uint64_t>(op1[4]) * op2[4];
+    accHi += mul_hi_u32(op1[4], op2[4]);
+    accLow += static_cast<uint64_t>(op1[3]) * op2[5];
+    accHi += mul_hi_u32(op1[3], op2[5]);
+    accLow += static_cast<uint64_t>(op1[2]) * op2[6];
+    accHi += mul_hi_u32(op1[2], op2[6]);
+    accLow += static_cast<uint64_t>(op1[1]) * op2[7];
+    accHi += mul_hi_u32(op1[1], op2[7]);
+    accLow += static_cast<uint64_t>(op1[0]) * op2[8];
+    accHi += mul_hi_u32(op1[0], op2[8]);
+    accLow += static_cast<uint64_t>(invValue[0]) * mod[8];
+    accHi += mul_hi_u32(invValue[0], mod[8]);
+    accLow += static_cast<uint64_t>(invValue[1]) * mod[7];
+    accHi += mul_hi_u32(invValue[1], mod[7]);
+    accLow += static_cast<uint64_t>(invValue[2]) * mod[6];
+    accHi += mul_hi_u32(invValue[2], mod[6]);
+    accLow += static_cast<uint64_t>(invValue[3]) * mod[5];
+    accHi += mul_hi_u32(invValue[3], mod[5]);
+    accLow += static_cast<uint64_t>(invValue[4]) * mod[4];
+    accHi += mul_hi_u32(invValue[4], mod[4]);
+    accLow += static_cast<uint64_t>(invValue[5]) * mod[3];
+    accHi += mul_hi_u32(invValue[5], mod[3]);
+    accLow += static_cast<uint64_t>(invValue[6]) * mod[2];
+    accHi += mul_hi_u32(invValue[6], mod[2]);
+    accLow += static_cast<uint64_t>(invValue[7]) * mod[1];
+    accHi += mul_hi_u32(invValue[7], mod[1]);
+    invValue[8] = invm * static_cast<uint32_t>(accLow);
+    accLow += static_cast<uint64_t>(invValue[8]) * mod[0];
+    accHi += mul_hi_u32(invValue[8], mod[0]);
+    uint32_t high32 = static_cast<uint32_t>(accLow >> 32);
+    accHi += static_cast<uint64_t>(high32);
+    accLow = accHi;
+    accHi = 0;
+  }
+  {
+    accLow += static_cast<uint64_t>(op1[9]) * op2[0];
+    accHi += mul_hi_u32(op1[9], op2[0]);
+    accLow += static_cast<uint64_t>(op1[8]) * op2[1];
+    accHi += mul_hi_u32(op1[8], op2[1]);
+    accLow += static_cast<uint64_t>(op1[7]) * op2[2];
+    accHi += mul_hi_u32(op1[7], op2[2]);
+    accLow += static_cast<uint64_t>(op1[6]) * op2[3];
+    accHi += mul_hi_u32(op1[6], op2[3]);
+    accLow += static_cast<uint64_t>(op1[5]) * op2[4];
+    accHi += mul_hi_u32(op1[5], op2[4]);
+    accLow += static_cast<uint64_t>(op1[4]) * op2[5];
+    accHi += mul_hi_u32(op1[4], op2[5]);
+    accLow += static_cast<uint64_t>(op1[3]) * op2[6];
+    accHi += mul_hi_u32(op1[3], op2[6]);
+    accLow += static_cast<uint64_t>(op1[2]) * op2[7];
+    accHi += mul_hi_u32(op1[2], op2[7]);
+    accLow += static_cast<uint64_t>(op1[1]) * op2[8];
+    accHi += mul_hi_u32(op1[1], op2[8]);
+    accLow += static_cast<uint64_t>(op1[0]) * op2[9];
+    accHi += mul_hi_u32(op1[0], op2[9]);
+    accLow += static_cast<uint64_t>(invValue[0]) * mod[9];
+    accHi += mul_hi_u32(invValue[0], mod[9]);
+    accLow += static_cast<uint64_t>(invValue[1]) * mod[8];
+    accHi += mul_hi_u32(invValue[1], mod[8]);
+    accLow += static_cast<uint64_t>(invValue[2]) * mod[7];
+    accHi += mul_hi_u32(invValue[2], mod[7]);
+    accLow += static_cast<uint64_t>(invValue[3]) * mod[6];
+    accHi += mul_hi_u32(invValue[3], mod[6]);
+    accLow += static_cast<uint64_t>(invValue[4]) * mod[5];
+    accHi += mul_hi_u32(invValue[4], mod[5]);
+    accLow += static_cast<uint64_t>(invValue[5]) * mod[4];
+    accHi += mul_hi_u32(invValue[5], mod[4]);
+    accLow += static_cast<uint64_t>(invValue[6]) * mod[3];
+    accHi += mul_hi_u32(invValue[6], mod[3]);
+    accLow += static_cast<uint64_t>(invValue[7]) * mod[2];
+    accHi += mul_hi_u32(invValue[7], mod[2]);
+    accLow += static_cast<uint64_t>(invValue[8]) * mod[1];
+    accHi += mul_hi_u32(invValue[8], mod[1]);
+    invValue[9] = invm * static_cast<uint32_t>(accLow);
+    accLow += static_cast<uint64_t>(invValue[9]) * mod[0];
+    accHi += mul_hi_u32(invValue[9], mod[0]);
+    uint32_t high32 = static_cast<uint32_t>(accLow >> 32);
+    accHi += static_cast<uint64_t>(high32);
+    accLow = accHi;
+    accHi = 0;
+  }
+  {
+    accLow += static_cast<uint64_t>(op1[1]) * op2[9];
+    accHi += mul_hi_u32(op1[1], op2[9]);
+    accLow += static_cast<uint64_t>(op1[2]) * op2[8];
+    accHi += mul_hi_u32(op1[2], op2[8]);
+    accLow += static_cast<uint64_t>(op1[3]) * op2[7];
+    accHi += mul_hi_u32(op1[3], op2[7]);
+    accLow += static_cast<uint64_t>(op1[4]) * op2[6];
+    accHi += mul_hi_u32(op1[4], op2[6]);
+    accLow += static_cast<uint64_t>(op1[5]) * op2[5];
+    accHi += mul_hi_u32(op1[5], op2[5]);
+    accLow += static_cast<uint64_t>(op1[6]) * op2[4];
+    accHi += mul_hi_u32(op1[6], op2[4]);
+    accLow += static_cast<uint64_t>(op1[7]) * op2[3];
+    accHi += mul_hi_u32(op1[7], op2[3]);
+    accLow += static_cast<uint64_t>(op1[8]) * op2[2];
+    accHi += mul_hi_u32(op1[8], op2[2]);
+    accLow += static_cast<uint64_t>(op1[9]) * op2[1];
+    accHi += mul_hi_u32(op1[9], op2[1]);
+    accLow += static_cast<uint64_t>(invValue[1]) * mod[9];
+    accHi += mul_hi_u32(invValue[1], mod[9]);
+    accLow += static_cast<uint64_t>(invValue[2]) * mod[8];
+    accHi += mul_hi_u32(invValue[2], mod[8]);
+    accLow += static_cast<uint64_t>(invValue[3]) * mod[7];
+    accHi += mul_hi_u32(invValue[3], mod[7]);
+    accLow += static_cast<uint64_t>(invValue[4]) * mod[6];
+    accHi += mul_hi_u32(invValue[4], mod[6]);
+    accLow += static_cast<uint64_t>(invValue[5]) * mod[5];
+    accHi += mul_hi_u32(invValue[5], mod[5]);
+    accLow += static_cast<uint64_t>(invValue[6]) * mod[4];
+    accHi += mul_hi_u32(invValue[6], mod[4]);
+    accLow += static_cast<uint64_t>(invValue[7]) * mod[3];
+    accHi += mul_hi_u32(invValue[7], mod[3]);
+    accLow += static_cast<uint64_t>(invValue[8]) * mod[2];
+    accHi += mul_hi_u32(invValue[8], mod[2]);
+    accLow += static_cast<uint64_t>(invValue[9]) * mod[1];
+    accHi += mul_hi_u32(invValue[9], mod[1]);
+    op1[0] = static_cast<uint32_t>(accLow);
+    uint32_t high32 = static_cast<uint32_t>(accLow >> 32);
+    accHi += static_cast<uint64_t>(high32);
+    accLow = accHi;
+    accHi = 0;
+  }
+  {
+    accLow += static_cast<uint64_t>(op1[2]) * op2[9];
+    accHi += mul_hi_u32(op1[2], op2[9]);
+    accLow += static_cast<uint64_t>(op1[3]) * op2[8];
+    accHi += mul_hi_u32(op1[3], op2[8]);
+    accLow += static_cast<uint64_t>(op1[4]) * op2[7];
+    accHi += mul_hi_u32(op1[4], op2[7]);
+    accLow += static_cast<uint64_t>(op1[5]) * op2[6];
+    accHi += mul_hi_u32(op1[5], op2[6]);
+    accLow += static_cast<uint64_t>(op1[6]) * op2[5];
+    accHi += mul_hi_u32(op1[6], op2[5]);
+    accLow += static_cast<uint64_t>(op1[7]) * op2[4];
+    accHi += mul_hi_u32(op1[7], op2[4]);
+    accLow += static_cast<uint64_t>(op1[8]) * op2[3];
+    accHi += mul_hi_u32(op1[8], op2[3]);
+    accLow += static_cast<uint64_t>(op1[9]) * op2[2];
+    accHi += mul_hi_u32(op1[9], op2[2]);
+    accLow += static_cast<uint64_t>(invValue[2]) * mod[9];
+    accHi += mul_hi_u32(invValue[2], mod[9]);
+    accLow += static_cast<uint64_t>(invValue[3]) * mod[8];
+    accHi += mul_hi_u32(invValue[3], mod[8]);
+    accLow += static_cast<uint64_t>(invValue[4]) * mod[7];
+    accHi += mul_hi_u32(invValue[4], mod[7]);
+    accLow += static_cast<uint64_t>(invValue[5]) * mod[6];
+    accHi += mul_hi_u32(invValue[5], mod[6]);
+    accLow += static_cast<uint64_t>(invValue[6]) * mod[5];
+    accHi += mul_hi_u32(invValue[6], mod[5]);
+    accLow += static_cast<uint64_t>(invValue[7]) * mod[4];
+    accHi += mul_hi_u32(invValue[7], mod[4]);
+    accLow += static_cast<uint64_t>(invValue[8]) * mod[3];
+    accHi += mul_hi_u32(invValue[8], mod[3]);
+    accLow += static_cast<uint64_t>(invValue[9]) * mod[2];
+    accHi += mul_hi_u32(invValue[9], mod[2]);
+    op1[1] = static_cast<uint32_t>(accLow);
+    uint32_t high32 = static_cast<uint32_t>(accLow >> 32);
+    accHi += static_cast<uint64_t>(high32);
+    accLow = accHi;
+    accHi = 0;
+  }
+  {
+    accLow += static_cast<uint64_t>(op1[3]) * op2[9];
+    accHi += mul_hi_u32(op1[3], op2[9]);
+    accLow += static_cast<uint64_t>(op1[4]) * op2[8];
+    accHi += mul_hi_u32(op1[4], op2[8]);
+    accLow += static_cast<uint64_t>(op1[5]) * op2[7];
+    accHi += mul_hi_u32(op1[5], op2[7]);
+    accLow += static_cast<uint64_t>(op1[6]) * op2[6];
+    accHi += mul_hi_u32(op1[6], op2[6]);
+    accLow += static_cast<uint64_t>(op1[7]) * op2[5];
+    accHi += mul_hi_u32(op1[7], op2[5]);
+    accLow += static_cast<uint64_t>(op1[8]) * op2[4];
+    accHi += mul_hi_u32(op1[8], op2[4]);
+    accLow += static_cast<uint64_t>(op1[9]) * op2[3];
+    accHi += mul_hi_u32(op1[9], op2[3]);
+    accLow += static_cast<uint64_t>(invValue[3]) * mod[9];
+    accHi += mul_hi_u32(invValue[3], mod[9]);
+    accLow += static_cast<uint64_t>(invValue[4]) * mod[8];
+    accHi += mul_hi_u32(invValue[4], mod[8]);
+    accLow += static_cast<uint64_t>(invValue[5]) * mod[7];
+    accHi += mul_hi_u32(invValue[5], mod[7]);
+    accLow += static_cast<uint64_t>(invValue[6]) * mod[6];
+    accHi += mul_hi_u32(invValue[6], mod[6]);
+    accLow += static_cast<uint64_t>(invValue[7]) * mod[5];
+    accHi += mul_hi_u32(invValue[7], mod[5]);
+    accLow += static_cast<uint64_t>(invValue[8]) * mod[4];
+    accHi += mul_hi_u32(invValue[8], mod[4]);
+    accLow += static_cast<uint64_t>(invValue[9]) * mod[3];
+    accHi += mul_hi_u32(invValue[9], mod[3]);
+    op1[2] = static_cast<uint32_t>(accLow);
+    uint32_t high32 = static_cast<uint32_t>(accLow >> 32);
+    accHi += static_cast<uint64_t>(high32);
+    accLow = accHi;
+    accHi = 0;
+  }
+  {
+    accLow += static_cast<uint64_t>(op1[4]) * op2[9];
+    accHi += mul_hi_u32(op1[4], op2[9]);
+    accLow += static_cast<uint64_t>(op1[5]) * op2[8];
+    accHi += mul_hi_u32(op1[5], op2[8]);
+    accLow += static_cast<uint64_t>(op1[6]) * op2[7];
+    accHi += mul_hi_u32(op1[6], op2[7]);
+    accLow += static_cast<uint64_t>(op1[7]) * op2[6];
+    accHi += mul_hi_u32(op1[7], op2[6]);
+    accLow += static_cast<uint64_t>(op1[8]) * op2[5];
+    accHi += mul_hi_u32(op1[8], op2[5]);
+    accLow += static_cast<uint64_t>(op1[9]) * op2[4];
+    accHi += mul_hi_u32(op1[9], op2[4]);
+    accLow += static_cast<uint64_t>(invValue[4]) * mod[9];
+    accHi += mul_hi_u32(invValue[4], mod[9]);
+    accLow += static_cast<uint64_t>(invValue[5]) * mod[8];
+    accHi += mul_hi_u32(invValue[5], mod[8]);
+    accLow += static_cast<uint64_t>(invValue[6]) * mod[7];
+    accHi += mul_hi_u32(invValue[6], mod[7]);
+    accLow += static_cast<uint64_t>(invValue[7]) * mod[6];
+    accHi += mul_hi_u32(invValue[7], mod[6]);
+    accLow += static_cast<uint64_t>(invValue[8]) * mod[5];
+    accHi += mul_hi_u32(invValue[8], mod[5]);
+    accLow += static_cast<uint64_t>(invValue[9]) * mod[4];
+    accHi += mul_hi_u32(invValue[9], mod[4]);
+    op1[3] = static_cast<uint32_t>(accLow);
+    Int.v64 = accLow;
+    accHi += Int.v32.y;
+    accLow = accHi;
+    accHi = 0;
+  }
+  {
+    accLow += static_cast<uint64_t>(op1[5]) * op2[9];
+    accHi += mul_hi_u32(op1[5], op2[9]);
+    accLow += static_cast<uint64_t>(op1[6]) * op2[8];
+    accHi += mul_hi_u32(op1[6], op2[8]);
+    accLow += static_cast<uint64_t>(op1[7]) * op2[7];
+    accHi += mul_hi_u32(op1[7], op2[7]);
+    accLow += static_cast<uint64_t>(op1[8]) * op2[6];
+    accHi += mul_hi_u32(op1[8], op2[6]);
+    accLow += static_cast<uint64_t>(op1[9]) * op2[5];
+    accHi += mul_hi_u32(op1[9], op2[5]);
+    accLow += static_cast<uint64_t>(invValue[5]) * mod[9];
+    accHi += mul_hi_u32(invValue[5], mod[9]);
+    accLow += static_cast<uint64_t>(invValue[6]) * mod[8];
+    accHi += mul_hi_u32(invValue[6], mod[8]);
+    accLow += static_cast<uint64_t>(invValue[7]) * mod[7];
+    accHi += mul_hi_u32(invValue[7], mod[7]);
+    accLow += static_cast<uint64_t>(invValue[8]) * mod[6];
+    accHi += mul_hi_u32(invValue[8], mod[6]);
+    accLow += static_cast<uint64_t>(invValue[9]) * mod[5];
+    accHi += mul_hi_u32(invValue[9], mod[5]);
+    op1[4] = static_cast<uint32_t>(accLow);
+    Int.v64 = accLow;
+    accHi += Int.v32.y;
+    accLow = accHi;
+    accHi = 0;
+  }
+  {
+    accLow += static_cast<uint64_t>(op1[6]) * op2[9];
+    accHi += mul_hi_u32(op1[6], op2[9]);
+    accLow += static_cast<uint64_t>(op1[7]) * op2[8];
+    accHi += mul_hi_u32(op1[7], op2[8]);
+    accLow += static_cast<uint64_t>(op1[8]) * op2[7];
+    accHi += mul_hi_u32(op1[8], op2[7]);
+    accLow += static_cast<uint64_t>(op1[9]) * op2[6];
+    accHi += mul_hi_u32(op1[9], op2[6]);
+    accLow += static_cast<uint64_t>(invValue[6]) * mod[9];
+    accHi += mul_hi_u32(invValue[6], mod[9]);
+    accLow += static_cast<uint64_t>(invValue[7]) * mod[8];
+    accHi += mul_hi_u32(invValue[7], mod[8]);
+    accLow += static_cast<uint64_t>(invValue[8]) * mod[7];
+    accHi += mul_hi_u32(invValue[8], mod[7]);
+    accLow += static_cast<uint64_t>(invValue[9]) * mod[6];
+    accHi += mul_hi_u32(invValue[9], mod[6]);
+    op1[5] = static_cast<uint32_t>(accLow);
+    Int.v64 = accLow;
+    accHi += Int.v32.y;
+    accLow = accHi;
+    accHi = 0;
+  }
+  {
+    accLow += static_cast<uint64_t>(op1[7]) * op2[9];
+    accHi += mul_hi_u32(op1[7], op2[9]);
+    accLow += static_cast<uint64_t>(op1[8]) * op2[8];
+    accHi += mul_hi_u32(op1[8], op2[8]);
+    accLow += static_cast<uint64_t>(op1[9]) * op2[7];
+    accHi += mul_hi_u32(op1[9], op2[7]);
+    accLow += static_cast<uint64_t>(invValue[7]) * mod[9];
+    accHi += mul_hi_u32(invValue[7], mod[9]);
+    accLow += static_cast<uint64_t>(invValue[8]) * mod[8];
+    accHi += mul_hi_u32(invValue[8], mod[8]);
+    accLow += static_cast<uint64_t>(invValue[9]) * mod[7];
+    accHi += mul_hi_u32(invValue[9], mod[7]);
+    op1[6] = static_cast<uint32_t>(accLow);
+    Int.v64 = accLow;
+    accHi += Int.v32.y;
+    accLow = accHi;
+    accHi = 0;
+  }
+  {
+    accLow += static_cast<uint64_t>(op1[8]) * op2[9];
+    accHi += mul_hi_u32(op1[8], op2[9]);
+    accLow += static_cast<uint64_t>(op1[9]) * op2[8];
+    accHi += mul_hi_u32(op1[9], op2[8]);
+    accLow += static_cast<uint64_t>(invValue[8]) * mod[9];
+    accHi += mul_hi_u32(invValue[8], mod[9]);
+    accLow += static_cast<uint64_t>(invValue[9]) * mod[8];
+    accHi += mul_hi_u32(invValue[9], mod[8]);
+    op1[7] = static_cast<uint32_t>(accLow);
+    Int.v64 = accLow;
+    accHi += Int.v32.y;
+    accLow = accHi;
+    accHi = 0;
+  }
+  {
+    accLow += static_cast<uint64_t>(op1[9]) * op2[9];
+    accHi += mul_hi_u32(op1[9], op2[9]);
+    accLow += static_cast<uint64_t>(invValue[9]) * mod[9];
+    accHi += mul_hi_u32(invValue[9], mod[9]);
+    op1[8] = static_cast<uint32_t>(accLow);
+    Int.v64 = accLow;
+    accHi += Int.v32.y;
+    accLow = accHi;
+    accHi = 0;
+  }
+  op1[9] = static_cast<uint32_t>(accLow);
+  Int.v64 = accLow;
+  if (Int.v32.y)
+    mon_sub_320(op1, mod, 10);
+}
+
+// Forward declarations used by trace helper (defined later in file)
+__device__ __forceinline__ uint32_t build_candidate(BigInt &dst, uint32_t offset);
+__device__ void compute_r2(const BigInt &mod, BigInt &r2);
+
+// Trace variant: runs same algorithm but records invValue[] and final op1 into output buffers
+// trace outputs: out_inv[kOperandSize], out_final[kOperandSize]
+// acc_low / acc_high each are arrays of size 4 (blocks 0..3)
+// Also capture three 64-bit products for block1: prod0=op1[0]*op2[1], prod1=op1[1]*op2[0], prod2=invValue[0]*mod[1]
+// Capture acc state after each product addition for block1: step0 (after prod0), step1 (after prod1), step2 (after prod2)
+__device__ void monMul320_words_trace(uint32_t *op1,
+                                      const uint32_t *op2,
+                                      const uint32_t *mod,
+                                      uint32_t invm,
+                                      uint32_t *out_inv,
+                                      uint32_t *out_final,
+                                      uint32_t *out_acc_low,
+                                      uint32_t *out_acc_high,
+                                      uint32_t *out_prod_low,
+                                      uint32_t *out_prod_high,
+                                      uint32_t *out_steps_low,
+                                      uint32_t *out_steps_high) {
+  uint32_t invValue[10];
+  uint64_t accLow = 0, accHi = 0;
+  // record accBeforeInv for blocks 0..3
+  uint64_t accBefore[4];
+  {
+    accLow += static_cast<uint64_t>(op1[0]) * op2[0];
+    accHi += mul_hi_u32(op1[0], op2[0]);
+    // capture acc before computing invValue[0]
+    accBefore[0] = accLow;
+    invValue[0] = invm * static_cast<uint32_t>(accLow);
+    accLow += static_cast<uint64_t>(invValue[0]) * mod[0];
+    accHi += mul_hi_u32(invValue[0], mod[0]);
+    uint32_t high32 = static_cast<uint32_t>(accLow >> 32);
+    accHi += static_cast<uint64_t>(high32);
+    accLow = accHi;
+    accHi = 0;
+  }
+  {
+    accLow += static_cast<uint64_t>(op1[0]) * op2[1];
+    accHi += mul_hi_u32(op1[0], op2[1]);
+    accLow += static_cast<uint64_t>(op1[1]) * op2[0];
+    accHi += mul_hi_u32(op1[1], op2[0]);
+    accLow += static_cast<uint64_t>(invValue[0]) * mod[1];
+    accHi += mul_hi_u32(invValue[0], mod[1]);
+    // compute per-term products for block1
+    uint64_t prod0 = static_cast<uint64_t>(op1[0]) * static_cast<uint64_t>(op2[1]);
+    uint64_t prod1 = static_cast<uint64_t>(op1[1]) * static_cast<uint64_t>(op2[0]);
+    uint64_t prod2 = static_cast<uint64_t>(invValue[0]) * static_cast<uint64_t>(mod[1]);
+    // add prod1 first (match modified unrolled ordering) and capture
+    accLow += prod1;
+    accHi += static_cast<uint64_t>(prod1 >> 32);
+    out_steps_low[0] = static_cast<uint32_t>(accLow & 0xffffffffu);
+    out_steps_high[0] = static_cast<uint32_t>(accLow >> 32);
+    out_prod_low[1] = static_cast<uint32_t>(prod1 & 0xffffffffu);
+    out_prod_high[1] = static_cast<uint32_t>(prod1 >> 32);
+    // add prod0 and capture
+    accLow += prod0;
+    accHi += static_cast<uint64_t>(prod0 >> 32);
+    out_steps_low[1] = static_cast<uint32_t>(accLow & 0xffffffffu);
+    out_steps_high[1] = static_cast<uint32_t>(accLow >> 32);
+    out_prod_low[0] = static_cast<uint32_t>(prod0 & 0xffffffffu);
+    out_prod_high[0] = static_cast<uint32_t>(prod0 >> 32);
+    // add prod2 and capture (this is accBefore used to compute invValue[1])
+    accLow += prod2;
+    accHi += static_cast<uint64_t>(prod2 >> 32);
+    out_steps_low[2] = static_cast<uint32_t>(accLow & 0xffffffffu);
+    out_steps_high[2] = static_cast<uint32_t>(accLow >> 32);
+    out_prod_low[2] = static_cast<uint32_t>(prod2 & 0xffffffffu);
+    out_prod_high[2] = static_cast<uint32_t>(prod2 >> 32);
+
+    invValue[1] = invm * static_cast<uint32_t>(accLow);
+    accLow += static_cast<uint64_t>(invValue[1]) * mod[0];
+    accHi += mul_hi_u32(invValue[1], mod[0]);
+    uint32_t high32 = static_cast<uint32_t>(accLow >> 32);
+    accHi += static_cast<uint64_t>(high32);
+    accLow = accHi;
+    accHi = 0;
+  }
+  {
+    accLow += static_cast<uint64_t>(op1[0]) * op2[2];
+    accHi += mul_hi_u32(op1[0], op2[2]);
+    accLow += static_cast<uint64_t>(op1[1]) * op2[1];
+    accHi += mul_hi_u32(op1[1], op2[1]);
+    accLow += static_cast<uint64_t>(op1[2]) * op2[0];
+    accHi += mul_hi_u32(op1[2], op2[0]);
+    accLow += static_cast<uint64_t>(invValue[0]) * mod[2];
+    accHi += mul_hi_u32(invValue[0], mod[2]);
+    accLow += static_cast<uint64_t>(invValue[1]) * mod[1];
+    accHi += mul_hi_u32(invValue[1], mod[1]);
+    // capture acc before computing invValue[2]
+    accBefore[2] = accLow;
+    invValue[2] = invm * static_cast<uint32_t>(accLow);
+    accLow += static_cast<uint64_t>(invValue[2]) * mod[0];
+    accHi += mul_hi_u32(invValue[2], mod[0]);
+    uint32_t high32 = static_cast<uint32_t>(accLow >> 32);
+    accHi += static_cast<uint64_t>(high32);
+    accLow = accHi;
+    accHi = 0;
+  }
+  // capture block 3 acc as well in the following unrolled block sequence
+#pragma unroll
+  for (int blk = 3; blk <= 9; ++blk) {
+    if (blk == 3) {
+      // compute contributions for block 3 exactly like the main implementation
+      // We will capture accBefore[3] just before invValue[3] assignment below by pattern
+    }
+    invValue[blk] = 0u;
+  }
+
+  // Finish by running the original tail sequence to compute final op1 entries
+  monMul320_words(op1, op2, mod, invm);
+
+  // write invValue and final op1 to output
+  for (int i = 0; i < kOperandSize; ++i) {
+    out_inv[i] = invValue[i];
+    out_final[i] = op1[i];
+  }
+
+  // write captured accBefore entries (blocks 0..3) to out arrays
+  // ensure block 3 is initialized (trace currently captures 0..2)
+  accBefore[3] = 0ull;
+
+  for (int b = 0; b < 4; ++b) {
+    out_acc_low[b] = static_cast<uint32_t>(accBefore[b] & 0xffffffffu);
+    out_acc_high[b] = static_cast<uint32_t>(accBefore[b] >> 32);
+  }
+}
+
+__global__ void montgomeryTraceKernel(const uint32_t *numbers,
+                                      const uint32_t *sample_indices,
+                                      uint32_t *out_inv,
+                                      uint32_t *out_final,
+                                      uint32_t *out_acc_low,
+                                      uint32_t *out_acc_high,
+                                      uint32_t *out_prod_low,
+                                      uint32_t *out_prod_high,
+                                      uint32_t *out_steps_low,
+                                      uint32_t *out_steps_high,
+                                      unsigned sampleCount) {
+  unsigned tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid >= sampleCount)
+    return;
+
+  const uint32_t idx = sample_indices[tid];
+  const uint32_t off = numbers[idx];
+
+  BigInt n;
+  uint32_t final_carry = build_candidate(n, off);
+  if (final_carry != 0u) {
+    for (int i = 0; i < kOperandSize; ++i) {
+      out_inv[tid * kOperandSize + i] = 0u;
+      out_final[tid * kOperandSize + i] = 0u;
+    }
+    return;
+  }
+
+  BigInt r2;
+  compute_r2(n, r2);
+
+  uint32_t op1_local[kOperandSize];
+  uint32_t op2_local[kOperandSize];
+  uint32_t mod_local[kOperandSize];
+  #pragma unroll
+  for (int i = 0; i < kOperandSize; ++i) {
+    op1_local[i] = 0u;
+    op2_local[i] = r2.limb[i];
+    mod_local[i] = n.limb[i];
+  }
+  op1_local[0] = 1u;
+
+  uint32_t nPrime = montgomery_inverse32(n.limb[0]);
+
+  monMul320_words_trace(op1_local, op2_local, mod_local, nPrime,
+                        &out_inv[tid * kOperandSize], &out_final[tid * kOperandSize],
+                        &out_acc_low[tid * 4], &out_acc_high[tid * 4],
+                        &out_prod_low[tid * 3], &out_prod_high[tid * 3],
+                        &out_steps_low[tid * 3], &out_steps_high[tid * 3]);
+}
+
+// Classic/reference traced variant: capture m (invValue) and final op1 from the classic montgomery implementation
+__device__ void monMul320_words_classic_trace_device(const BigInt &a,
+                                                     const BigInt &b,
+                                                     const BigInt &mod,
+                                                     uint32_t nPrime,
+                                                     uint32_t invValueOut[10],
+                                                     uint32_t op1_out[10],
+                                                     uint32_t acc_low_out[4],
+                                                     uint32_t acc_high_out[4],
+                                                     uint32_t prod_low_out[3],
+                                                     uint32_t prod_high_out[3],
+                                                     uint32_t steps_low_out[3],
+                                                     uint32_t steps_high_out[3]) {
+  const int totalLimbs = kOperandSize * 2;
+  uint64_t t[totalLimbs];
+#pragma unroll
+  for (int i = 0; i < totalLimbs; ++i)
+    t[i] = 0ull;
+
+  #pragma unroll
+  for (int i = 0; i < kOperandSize; ++i) {
+    uint64_t carry = 0ull;
+    #pragma unroll
+    for (int j = 0; j < kOperandSize; ++j) {
+      const int idx = i + j;
+      uint64_t sum = t[idx] + static_cast<uint64_t>(a.limb[j]) * b.limb[i] + carry;
+      t[idx] = static_cast<uint32_t>(sum);
+      carry = sum >> 32;
+    }
+    t[i + kOperandSize] += carry;
+
+    // capture t[i] (accumulator before reduction) for tracing
+    if (i < 4) {
+      acc_low_out[i] = static_cast<uint32_t>(t[i] & 0xffffffffull);
+      acc_high_out[i] = static_cast<uint32_t>(t[i] >> 32);
+    }
+    // for block1, capture intermediate t[1] after key steps
+    if (i == 0) {
+      // after finishing i==0 loop, t[1] includes prod1 (a.limb[1]*b.limb[0])
+      steps_low_out[0] = static_cast<uint32_t>(t[1] & 0xffffffffull);
+      steps_high_out[0] = static_cast<uint32_t>(t[1] >> 32);
+    }
+    if (i == 1) {
+      // before reduction here t[1] includes prod0 + prod1 and other contributions
+      steps_low_out[1] = static_cast<uint32_t>(t[1] & 0xffffffffull);
+      steps_high_out[1] = static_cast<uint32_t>(t[1] >> 32);
+      // capture per-term products for block1 for comparison
+      uint64_t prod0 = static_cast<uint64_t>(a.limb[0]) * static_cast<uint64_t>(b.limb[1]);
+      uint64_t prod1 = static_cast<uint64_t>(a.limb[1]) * static_cast<uint64_t>(b.limb[0]);
+      uint64_t prod2 = static_cast<uint64_t>(invValueOut[0]) * static_cast<uint64_t>(mod.limb[1]);
+      prod_low_out[0] = static_cast<uint32_t>(prod0 & 0xffffffffu);
+      prod_high_out[0] = static_cast<uint32_t>(prod0 >> 32);
+      prod_low_out[1] = static_cast<uint32_t>(prod1 & 0xffffffffu);
+      prod_high_out[1] = static_cast<uint32_t>(prod1 >> 32);
+      prod_low_out[2] = static_cast<uint32_t>(prod2 & 0xffffffffu);
+      prod_high_out[2] = static_cast<uint32_t>(prod2 >> 32);
+    }
+    uint32_t m = static_cast<uint32_t>(t[i]) * nPrime;
+    invValueOut[i] = m;
+
+    carry = 0ull;
+    #pragma unroll
+    for (int j = 0; j < kOperandSize; ++j) {
+      const int idx = i + j;
+      uint64_t sum = t[idx] + static_cast<uint64_t>(m) * mod.limb[j] + carry;
+      t[idx] = static_cast<uint32_t>(sum);
+      carry = sum >> 32;
+    }
+    t[i + kOperandSize] += carry;
+  }
+
+  BigInt tmp;
+  #pragma unroll
+  for (int i = 0; i < kOperandSize; ++i)
+    tmp.limb[i] = static_cast<uint32_t>(t[i + kOperandSize]);
+  if (big_compare(tmp, mod) >= 0)
+    big_sub(tmp, mod);
+
+  #pragma unroll
+  for (int i = 0; i < kOperandSize; ++i)
+    op1_out[i] = tmp.limb[i];
+}
+
+__global__ void montgomeryClassicTraceKernel(const uint32_t *numbers,
+                                             const uint32_t *sample_indices,
+                                             uint32_t *out_inv,
+                                             uint32_t *out_final,
+                                             uint32_t *out_acc_low,
+                                             uint32_t *out_acc_high,
+                                             uint32_t *out_prod_low,
+                                             uint32_t *out_prod_high,
+                                             uint32_t *out_steps_low,
+                                             uint32_t *out_steps_high,
+                                             unsigned sampleCount) {
+  unsigned tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid >= sampleCount)
+    return;
+
+  const uint32_t idx = sample_indices[tid];
+  const uint32_t off = numbers[idx];
+
+  BigInt n;
+  uint32_t final_carry = build_candidate(n, off);
+  if (final_carry != 0u) {
+    for (int i = 0; i < kOperandSize; ++i) {
+      out_inv[tid * kOperandSize + i] = 0u;
+      out_final[tid * kOperandSize + i] = 0u;
+    }
+    return;
+  }
+
+  BigInt r2;
+  compute_r2(n, r2);
+
+  BigInt a;
+  big_set_zero(a);
+  a.limb[0] = 1u; // oneMont equivalent input
+
+  // For consistency with the unrolled trace, multiply one * r2 (like the other trace path)
+  uint32_t nPrime = montgomery_inverse32(n.limb[0]);
+
+  uint32_t invValueOut[10];
+  uint32_t op1_out[10];
+  monMul320_words_classic_trace_device(a, r2, n, nPrime, invValueOut, op1_out,
+                                       &out_acc_low[tid * 4], &out_acc_high[tid * 4],
+                                       &out_prod_low[tid * 3], &out_prod_high[tid * 3],
+                                       &out_steps_low[tid * 3], &out_steps_high[tid * 3]);
+
+  // store results
+  for (int i = 0; i < kOperandSize; ++i) {
+    out_inv[tid * kOperandSize + i] = invValueOut[i];
+    out_final[tid * kOperandSize + i] = op1_out[i];
+  }
+}
+
+__device__ void montgomery_mul_unrolled(const BigInt &a,
+                                         const BigInt &b,
+                                         const BigInt &mod,
+                                         uint32_t nPrime,
+                                         BigInt &out) {
+  uint32_t op1_local[kOperandSize];
+  uint32_t op2_local[kOperandSize];
+  uint32_t mod_local[kOperandSize];
+  #pragma unroll
+  for (int i = 0; i < kOperandSize; ++i) {
+    op1_local[i] = a.limb[i];
+    op2_local[i] = b.limb[i];
+    mod_local[i] = mod.limb[i];
+  }
+  monMul320_words(op1_local, op2_local, mod_local, nPrime);
+  #pragma unroll
+  for (int i = 0; i < kOperandSize; ++i)
+    out.limb[i] = op1_local[i];
+}
+
+__device__ __forceinline__ void montgomery_mul_fast(const BigInt &a,
+                                                    const BigInt &b,
+                                                    const BigInt &mod,
+                                                    uint32_t nPrime,
+                                                    BigInt &out) {
+  // Fallback to the classic, verified implementation for correctness.
+  // This replaces the unrolled/fast path when debugging accumulator/carry issues.
+  montgomery_mul(a, b, mod, nPrime, out);
+}
+
 __device__ __forceinline__ int compare_ext(const uint32_t *value,
                                             const BigInt &mod) {
   if (value[kOperandSize])
     return 1;
+  #pragma unroll
   for (int i = kOperandSize - 1; i >= 0; --i) {
     if (value[i] > mod.limb[i])
       return 1;
@@ -201,6 +1196,7 @@ __device__ __forceinline__ int compare_ext(const uint32_t *value,
 
 __device__ __forceinline__ void sub_ext(uint32_t *value, const BigInt &mod) {
   uint64_t borrow = 0ull;
+  #pragma unroll
   for (int i = 0; i < kOperandSize; ++i) {
     uint64_t diff = static_cast<uint64_t>(value[i]) - mod.limb[i] - borrow;
     value[i] = static_cast<uint32_t>(diff);
@@ -216,6 +1212,7 @@ __device__ void compute_r2(const BigInt &mod, BigInt &r2) {
 
   for (int bit = 0; bit < kMontgomeryShiftBits; ++bit) {
     uint64_t carry = 0ull;
+    #pragma unroll
     for (int i = 0; i < kOperandSize + 1; ++i) {
       uint64_t sum = (static_cast<uint64_t>(value[i]) << 1) + carry;
       value[i] = static_cast<uint32_t>(sum);
@@ -225,19 +1222,22 @@ __device__ void compute_r2(const BigInt &mod, BigInt &r2) {
       sub_ext(value, mod);
   }
 
+  #pragma unroll
   for (int i = 0; i < kOperandSize; ++i)
     r2.limb[i] = value[i];
 }
 
-__device__ __forceinline__ void build_candidate(BigInt &dst, uint32_t offset) {
+__device__ __forceinline__ uint32_t build_candidate(BigInt &dst, uint32_t offset) {
   uint64_t sum = static_cast<uint64_t>(kPrimeBaseConst[0]) + offset;
   dst.limb[0] = static_cast<uint32_t>(sum);
   uint64_t carry = sum >> 32;
+  #pragma unroll
   for (int i = 1; i < kOperandSize; ++i) {
     sum = static_cast<uint64_t>(kPrimeBaseConst[i]) + carry;
     dst.limb[i] = static_cast<uint32_t>(sum);
     carry = sum >> 32;
   }
+  return static_cast<uint32_t>(carry & 0xffffffffu);
 }
 
 __device__ __forceinline__ uint32_t fast_mod_u32(uint32_t value,
@@ -249,6 +1249,7 @@ __device__ __forceinline__ uint32_t fast_mod_u32(uint32_t value,
 }
 
 __device__ bool quick_composite(uint32_t offset) {
+  #pragma unroll
   for (int i = 0; i < kSmallPrimeCount; ++i) {
     const uint32_t prime = kSmallPrimesDevice[i];
     const uint32_t recip = kPrimeReciprocalsDevice[i];
@@ -282,14 +1283,14 @@ __device__ bool fermat_probable_prime(const BigInt &n) {
   one.limb[0] = 1u;
 
   BigInt oneMont;
-  montgomery_mul(one, r2, n, nPrime, oneMont);
+  montgomery_mul_fast(one, r2, n, nPrime, oneMont);
 
   BigInt base;
   big_set_zero(base);
   base.limb[0] = 2u;
 
   BigInt baseMont;
-  montgomery_mul(base, r2, n, nPrime, baseMont);
+  montgomery_mul_fast(base, r2, n, nPrime, baseMont);
 
   BigInt result;
   big_copy(result, oneMont);
@@ -300,35 +1301,177 @@ __device__ bool fermat_probable_prime(const BigInt &n) {
     const uint32_t bits = expCopy.limb[0] & 0x3u;
     if (bits & 0x1u) {
       BigInt tmp;
-      montgomery_mul(result, baseMont, n, nPrime, tmp);
+      montgomery_mul_fast(result, baseMont, n, nPrime, tmp);
       big_copy(result, tmp);
     }
 
     BigInt tmp;
-    montgomery_mul(baseMont, baseMont, n, nPrime, tmp);
+    montgomery_mul_fast(baseMont, baseMont, n, nPrime, tmp);
     big_copy(baseMont, tmp);
 
     if (bits & 0x2u) {
       BigInt tmpMul;
-      montgomery_mul(result, baseMont, n, nPrime, tmpMul);
+      montgomery_mul_fast(result, baseMont, n, nPrime, tmpMul);
       big_copy(result, tmpMul);
     }
 
     BigInt tmpSquare;
-    montgomery_mul(baseMont, baseMont, n, nPrime, tmpSquare);
+    montgomery_mul_fast(baseMont, baseMont, n, nPrime, tmpSquare);
     big_copy(baseMont, tmpSquare);
 
     big_shift_right_two(expCopy);
   }
 
   BigInt finalRes;
-  montgomery_mul(result, one, n, nPrime, finalRes);
+  montgomery_mul_fast(result, one, n, nPrime, finalRes);
   return big_is_one(finalRes);
 }
 
-__global__ void fermatTest320Kernel(const uint32_t *numbers,
-                                    uint32_t *results,
-                                    uint32_t elementsNum) {
+__global__ void sievePrototypeKernel(const uint32_t *bitmap,
+                                     uint32_t total_bits,
+                                     uint32_t base_parity,
+                                     uint32_t *out_offsets) {
+  const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total_bits)
+    return;
+
+  const uint32_t word = bitmap[idx >> 5];
+  const uint32_t bit = (word >> (idx & 31)) & 1u;
+  const bool is_even = (((idx + base_parity) & 1u) == 0u);
+  const uint32_t sentinel = 0xFFFFFFFFu;
+  if (bit || is_even) {
+    out_offsets[idx] = sentinel;
+    return;
+  }
+
+  out_offsets[idx] = idx;
+}
+
+__device__ __forceinline__ uint32_t locate_window(uint32_t idx,
+                                                  const uint32_t *prefix,
+                                                  uint32_t window_count) {
+  for (uint32_t w = 0; w < window_count; ++w) {
+    const uint32_t start = prefix[w];
+    const uint32_t end = prefix[w + 1];
+    if (idx >= start && idx < end)
+      return w;
+  }
+  return window_count;
+}
+
+__device__ __forceinline__ uint32_t build_tail_mask(uint32_t valid_bits) {
+  if (valid_bits >= 32u)
+    return 0xFFFFFFFFu;
+  if (valid_bits == 0u)
+    return 0u;
+  return (1u << valid_bits) - 1u;
+}
+
+__device__ __forceinline__ uint32_t parity_mask_from_base(uint32_t base_parity) {
+  return (base_parity & 1u) ? 0x55555555u : 0xAAAAAAAAu;
+}
+
+__global__ void sievePrototypeScanKernel(const uint32_t *bitmap_words,
+                                         const PrototypeWindowDesc *descs,
+                                         uint32_t window_count,
+                                         uint32_t *out_offsets,
+                                         uint32_t *window_counts) {
+  const uint32_t window_idx = blockIdx.x;
+  if (window_idx >= window_count)
+    return;
+
+  const PrototypeWindowDesc desc = descs[window_idx];
+  if (desc.word_count == 0 || desc.bit_length == 0)
+    return;
+
+  const uint32_t parity_mask = parity_mask_from_base(desc.base_parity);
+
+  for (uint32_t word_rel = threadIdx.x; word_rel < desc.word_count;
+       word_rel += blockDim.x) {
+    const uint32_t local_bit_base = word_rel * 32u;
+    if (local_bit_base >= desc.bit_length)
+      continue;
+
+    const uint32_t word = bitmap_words[desc.word_start + word_rel];
+    const uint32_t remaining_bits = desc.bit_length - local_bit_base;
+    const uint32_t valid_bits = (remaining_bits >= 32u) ? 32u : remaining_bits;
+
+    uint32_t candidate_mask = ~word & parity_mask;
+    candidate_mask &= build_tail_mask(valid_bits);
+
+    while (candidate_mask) {
+      const uint32_t bit = __ffs(candidate_mask) - 1u;
+      candidate_mask &= (candidate_mask - 1u);
+      const uint32_t local_bit = local_bit_base + bit;
+
+      const uint32_t slot = atomicAdd(window_counts + window_idx, 1u);
+      if (slot < desc.bit_length)
+        out_offsets[desc.output_base + slot] = local_bit;
+    }
+  }
+}
+
+__global__ void sievePrototypeKernelBatch(const uint32_t *bitmap,
+                                          const uint32_t *window_prefix,
+                                          const uint64_t *window_bases,
+                                          uint32_t window_count,
+                                          uint32_t total_bits,
+                                          uint32_t *out_offsets) {
+  const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total_bits)
+    return;
+
+  const uint32_t word = bitmap[idx >> 5];
+  const uint32_t bit = (word >> (idx & 31)) & 1u;
+  const uint32_t sentinel = 0xFFFFFFFFu;
+  if (bit) {
+    out_offsets[idx] = sentinel;
+    return;
+  }
+
+  const uint32_t window = locate_window(idx, window_prefix, window_count);
+  if (window >= window_count) {
+    out_offsets[idx] = sentinel;
+    return;
+  }
+
+  const uint32_t local_idx = idx - window_prefix[window];
+  const uint64_t absolute = window_bases[window] + static_cast<uint64_t>(local_idx);
+  if ((absolute & 1ull) == 0ull) {
+    out_offsets[idx] = sentinel;
+    return;
+  }
+
+  out_offsets[idx] = local_idx;
+}
+
+__global__ void sieveBuildBitmapKernel(const uint32_t *primes,
+                                       const uint32_t *prime_residues,
+                                       uint32_t prime_count,
+                                       uint32_t window_size,
+                                       uint32_t *bitmap_words) {
+  const uint32_t stride = blockDim.x * gridDim.x;
+  for (uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+       idx < prime_count;
+       idx += stride) {
+    const uint32_t prime = primes[idx];
+    if (prime <= 2u)
+      continue;
+    const uint32_t step = prime << 1;
+    if (step == 0u)
+      continue;
+    uint32_t offset = prime_residues[idx];
+    while (offset < window_size) {
+      atomicOr(bitmap_words + (offset >> 5), 1u << (offset & 31));
+      offset += step;
+    }
+  }
+}
+
+__global__ __launch_bounds__(kCudaBlockSize, 2)
+void fermatTest320Kernel(const uint32_t *__restrict__ numbers,
+                         ResultWord *__restrict__ results,
+                         uint32_t elementsNum) {
   const uint32_t stride = blockDim.x * gridDim.x;
   for (uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
        idx < elementsNum;
@@ -336,14 +1479,117 @@ __global__ void fermatTest320Kernel(const uint32_t *numbers,
     const uint32_t offset = numbers[idx];
 
     if (quick_composite(offset)) {
-      results[idx] = 0u;
+      results[idx] = static_cast<ResultWord>(0u);
       continue;
     }
 
     BigInt candidate;
-    build_candidate(candidate, offset);
+    uint32_t final_carry = build_candidate(candidate, offset);
+    if (final_carry != 0u) {
+      // Candidate extended beyond configured operand size; treat as composite for now.
+      results[idx] = static_cast<ResultWord>(0u);
+      continue;
+    }
     bool probable = fermat_probable_prime(candidate);
-    results[idx] = probable ? 1u : 0u;
+    results[idx] = static_cast<ResultWord>(probable ? 1u : 0u);
+  }
+}
+
+__global__ void montgomeryMulClassicKernel(const BigInt *a,
+                                           const BigInt *b,
+                                           const BigInt *mod,
+                                           const uint32_t *nPrime,
+                                           BigInt *out,
+                                           uint32_t count,
+                                           uint32_t rounds) {
+  const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= count)
+    return;
+
+  BigInt acc;
+  big_copy(acc, a[idx]);
+  BigInt base;
+  big_copy(base, b[idx]);
+  BigInt modulus;
+  big_copy(modulus, mod[idx]);
+  const uint32_t np = nPrime[idx];
+  BigInt tmp;
+
+  for (uint32_t r = 0; r < rounds; ++r) {
+    montgomery_mul(acc, base, modulus, np, tmp);
+    big_copy(acc, tmp);
+  }
+  big_copy(out[idx], acc);
+}
+
+__global__ void montgomeryMulUnrolledKernel(const BigInt *a,
+                                            const BigInt *b,
+                                            const BigInt *mod,
+                                            const uint32_t *nPrime,
+                                            BigInt *out,
+                                            uint32_t count,
+                                            uint32_t rounds) {
+  const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= count)
+    return;
+
+  BigInt acc;
+  big_copy(acc, a[idx]);
+  BigInt base;
+  big_copy(base, b[idx]);
+  BigInt modulus;
+  big_copy(modulus, mod[idx]);
+  const uint32_t np = nPrime[idx];
+  BigInt tmp;
+
+  for (uint32_t r = 0; r < rounds; ++r) {
+    montgomery_mul_unrolled(acc, base, modulus, np, tmp);
+    big_copy(acc, tmp);
+  }
+  big_copy(out[idx], acc);
+}
+
+// Diagnostic kernel: compute montgomery multiplication of (one, r2) via
+// classic and unrolled paths for given samples and write results back.
+__global__ void montgomeryCompareKernel(const uint32_t *numbers,
+                                        const uint32_t *sample_indices,
+                                        uint32_t *out_classic,
+                                        uint32_t *out_unrolled,
+                                        unsigned sampleCount) {
+  unsigned tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid >= sampleCount)
+    return;
+
+  const uint32_t idx = sample_indices[tid];
+  const uint32_t off = numbers[idx];
+
+  BigInt n;
+  uint32_t final_carry = build_candidate(n, off);
+  if (final_carry != 0u) {
+    // mark with zeroes to indicate overflow
+    for (int i = 0; i < kOperandSize; ++i) {
+      out_classic[tid * kOperandSize + i] = 0u;
+      out_unrolled[tid * kOperandSize + i] = 0u;
+    }
+    return;
+  }
+
+  uint32_t nPrime = montgomery_inverse32(n.limb[0]);
+  BigInt r2;
+  compute_r2(n, r2);
+
+  BigInt one;
+  big_set_zero(one);
+  one.limb[0] = 1u;
+
+  BigInt outC;
+  montgomery_mul(one, r2, n, nPrime, outC);
+  BigInt outU;
+  montgomery_mul_unrolled(one, r2, n, nPrime, outU);
+
+  for (int i = 0; i < kOperandSize; ++i) {
+    out_classic[tid * kOperandSize + i] = outC.limb[i];
+    out_unrolled[tid * kOperandSize + i] = outU.limb[i];
   }
 }
 
@@ -360,7 +1606,12 @@ unsigned GPUFermat::get_group_size() {
 }
 
 GPUFermat::CudaBuffer::CudaBuffer()
-    : Size(0), HostData(nullptr), DeviceData(nullptr), storage_() {}
+    : Size(0),
+      ElementSize(0),
+      HostData(nullptr),
+      DeviceData(nullptr),
+      storage_(),
+      pinned_host_(false) {}
 
 GPUFermat::CudaBuffer::~CudaBuffer() { reset(); }
 
@@ -369,18 +1620,49 @@ void GPUFermat::CudaBuffer::reset() {
     cudaFree(DeviceData);
     DeviceData = nullptr;
   }
+  if (HostData && pinned_host_)
+    cudaFreeHost(HostData);
   HostData = nullptr;
   Size = 0;
+  ElementSize = 0;
+  pinned_host_ = false;
   storage_.clear();
 }
 
-void GPUFermat::CudaBuffer::init(size_t size) {
+void GPUFermat::CudaBuffer::init(size_t size,
+                                 size_t element_size,
+                                 bool prefer_pinned) {
   reset();
   Size = size;
-  storage_.assign(Size, 0u);
-  HostData = storage_.data();
-  CUDA_CHECK(cudaMalloc(&DeviceData, Size * sizeof(uint32_t)));
-  CUDA_CHECK(cudaMemset(DeviceData, 0, Size * sizeof(uint32_t)));
+  ElementSize = element_size;
+  const size_t total_bytes = Size * ElementSize;
+  if (total_bytes == 0)
+    return;
+
+  if (prefer_pinned) {
+    cudaError_t host_err = cudaHostAlloc(reinterpret_cast<void **>(&HostData),
+                                         total_bytes,
+                                         cudaHostAllocPortable);
+    if (host_err == cudaSuccess) {
+      pinned_host_ = true;
+      memset(HostData, 0, total_bytes);
+    } else {
+      HostData = nullptr;
+      pinned_host_ = false;
+      if (host_err != cudaErrorMemoryAllocation &&
+          host_err != cudaErrorNotSupported) {
+        CUDA_CHECK(host_err);
+      }
+    }
+  }
+
+  if (!HostData) {
+    storage_.assign(total_bytes, 0u);
+    HostData = storage_.data();
+  }
+
+  CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&DeviceData), total_bytes));
+  CUDA_CHECK(cudaMemset(DeviceData, 0, total_bytes));
 }
 
 void GPUFermat::CudaBuffer::copyToDevice(cudaStream_t stream,
@@ -391,9 +1673,11 @@ void GPUFermat::CudaBuffer::copyToDevice(cudaStream_t stream,
   const size_t elems = (count == 0) ? (Size - offset) : count;
   if (elems == 0)
     return;
-  CUDA_CHECK(cudaMemcpyAsync(DeviceData + offset,
-                             HostData + offset,
-                             elems * sizeof(uint32_t),
+  const size_t byte_offset = offset * ElementSize;
+  const size_t bytes = elems * ElementSize;
+  CUDA_CHECK(cudaMemcpyAsync(DeviceData + byte_offset,
+                             HostData + byte_offset,
+                             bytes,
                              cudaMemcpyHostToDevice,
                              stream));
 }
@@ -406,9 +1690,11 @@ void GPUFermat::CudaBuffer::copyToHost(cudaStream_t stream,
   const size_t elems = (count == 0) ? (Size - offset) : count;
   if (elems == 0)
     return;
-  CUDA_CHECK(cudaMemcpyAsync(HostData + offset,
-                             DeviceData + offset,
-                             elems * sizeof(uint32_t),
+  const size_t byte_offset = offset * ElementSize;
+  const size_t bytes = elems * ElementSize;
+  CUDA_CHECK(cudaMemcpyAsync(HostData + byte_offset,
+                             DeviceData + byte_offset,
+                             bytes,
                              cudaMemcpyDeviceToHost,
                              stream));
 }
@@ -420,9 +1706,15 @@ GPUFermat::GPUFermat(unsigned device_id,
       elementsNum(0),
       numberLimbsNum(0),
       groupsNum(0),
-  streams{nullptr, nullptr},
-  computeUnits(0),
-  smallPrimeResidues{0u, 0u, 0u, 0u} {
+      streams{nullptr, nullptr},
+      computeUnits(0),
+      smallPrimeResidues{},
+      prototypeOffsets(),
+      prototypeWindowOffsets(),
+      lastPrototypeCount(0),
+      lastPrototypeWindowCount(0),
+      sievePrimesConfigured(false),
+      configuredPrimeCount(0) {
   log_str("Creating CUDA GPUFermat", LOG_D);
   if (workItems == 0)
     throw std::runtime_error("workItems must be greater than zero");
@@ -446,6 +1738,10 @@ GPUFermat::~GPUFermat() {
   numbers.reset();
   gpuResults.reset();
   primeBase.reset();
+  sievePrototypeOutput.reset();
+  sievePrototypeBitmap.reset();
+  sievePrototypePrimes.reset();
+  sievePrototypeResidues.reset();
 }
 
 bool GPUFermat::init_cuda(unsigned device_id, const char *platformId) {
@@ -490,30 +1786,168 @@ bool GPUFermat::init_cuda(unsigned device_id, const char *platformId) {
 }
 
 void GPUFermat::initializeBuffers() {
-  numbers.init(elementsNum);
-  gpuResults.init(elementsNum);
-  primeBase.init(operandSize);
+  numbers.init(elementsNum, sizeof(uint32_t), true);
+  gpuResults.init(elementsNum, sizeof(ResultWord), true);
+  primeBase.init(operandSize, sizeof(uint32_t), true);
 }
 
 void GPUFermat::uploadPrimeBaseConstants() {
   if (!primeBase.HostData)
     return;
+  const uint32_t *prime_base_words =
+      buffer_cast<const uint32_t>(primeBase.HostData);
+
+  // (extra-verbose host buffer print removed)
 
   CUDA_CHECK(cudaMemcpyToSymbol(kPrimeBaseConst,
-                                primeBase.HostData,
+                                prime_base_words,
                                 operandSize * sizeof(uint32_t),
                                 0,
                                 cudaMemcpyHostToDevice));
 
   for (int i = 0; i < kSmallPrimeCount; ++i)
     smallPrimeResidues[i] =
-        mod_high_part_host(primeBase.HostData, kSmallPrimesHost[i]);
+        mod_high_part_host(prime_base_words, kSmallPrimesHost[i]);
 
   CUDA_CHECK(cudaMemcpyToSymbol(kHighResiduesConst,
                                 smallPrimeResidues.data(),
                                 kSmallPrimeCount * sizeof(uint32_t),
                                 0,
                                 cudaMemcpyHostToDevice));
+}
+
+void GPUFermat::ensurePrototypeOutputCapacity(size_t required) {
+  if (required == 0)
+    return;
+  if (sievePrototypeOutput.Size >= required)
+    return;
+  sievePrototypeOutput.init(required, sizeof(uint32_t), true);
+}
+
+void GPUFermat::ensurePrototypeBitmapCapacity(size_t required_words) {
+  if (required_words == 0)
+    return;
+  if (sievePrototypeBitmap.Size >= required_words)
+    return;
+  sievePrototypeBitmap.init(required_words, sizeof(uint32_t), true);
+}
+
+void GPUFermat::ensurePrototypeResidueCapacity(size_t required) {
+  if (required == 0)
+    return;
+  if (sievePrototypeResidues.Size >= required)
+    return;
+  sievePrototypeResidues.init(required, sizeof(uint32_t), true);
+}
+
+void GPUFermat::ensurePrototypeWindowBitCapacity(size_t required) {
+  if (required == 0)
+    return;
+  if (sievePrototypeWindowBits.Size >= required)
+    return;
+  sievePrototypeWindowBits.init(required, sizeof(uint32_t), true);
+}
+
+void GPUFermat::ensurePrototypeBaseCapacity(size_t required) {
+  if (required == 0)
+    return;
+  if (sievePrototypeWindowBases.Size >= required)
+    return;
+  sievePrototypeWindowBases.init(required, sizeof(uint64_t), true);
+}
+
+void GPUFermat::ensurePrototypeWindowCountCapacity(size_t required) {
+  if (required == 0)
+    return;
+  if (sievePrototypeWindowCounts.Size >= required)
+    return;
+  sievePrototypeWindowCounts.init(required, sizeof(uint32_t), true);
+}
+
+void GPUFermat::ensurePrototypeWindowDescCapacity(size_t required) {
+  if (required == 0)
+    return;
+  if (sievePrototypeWindowDescs.Size >= required)
+    return;
+  sievePrototypeWindowDescs.init(required,
+                                 sizeof(PrototypeWindowDesc),
+                                 true);
+}
+
+void GPUFermat::resetPrototypeWindowState() {
+  prototypeWindowOffsets.clear();
+  lastPrototypeWindowCount = 0;
+}
+
+bool GPUFermat::run_compact_scan(uint32_t window_count,
+                                 uint32_t total_bits,
+                                 cudaStream_t stream) {
+  if (window_count == 0 || total_bits == 0)
+    return false;
+  if (!sievePrototypeBitmap.DeviceData || !sievePrototypeOutput.DeviceData)
+    return false;
+
+  ensurePrototypeWindowCountCapacity(window_count);
+  if (!sievePrototypeWindowCounts.DeviceData ||
+      !sievePrototypeWindowCounts.HostData)
+    return false;
+  if (!sievePrototypeWindowDescs.DeviceData ||
+      !sievePrototypeWindowDescs.HostData)
+    return false;
+
+  const size_t count_bytes = static_cast<size_t>(window_count) * sizeof(uint32_t);
+  CUDA_CHECK(cudaMemsetAsync(sievePrototypeWindowCounts.DeviceData,
+                             0,
+                             count_bytes,
+                             stream));
+
+  sievePrototypeWindowDescs.copyToDevice(stream, window_count);
+
+  const uint32_t threads = std::max(1u, std::min(256u, GroupSize));
+  sievePrototypeScanKernel<<<window_count, threads, 0, stream>>>(
+      buffer_cast<const uint32_t>(sievePrototypeBitmap.DeviceData),
+      buffer_cast<const PrototypeWindowDesc>(sievePrototypeWindowDescs.DeviceData),
+      window_count,
+      buffer_cast<uint32_t>(sievePrototypeOutput.DeviceData),
+      buffer_cast<uint32_t>(sievePrototypeWindowCounts.DeviceData));
+  CUDA_CHECK(cudaGetLastError());
+
+  sievePrototypeWindowCounts.copyToHost(stream, window_count);
+  sievePrototypeOutput.copyToHost(stream, total_bits);
+  CUDA_CHECK(cudaStreamSynchronize(stream));
+
+  const PrototypeWindowDesc *desc_host =
+      buffer_cast<const PrototypeWindowDesc>(sievePrototypeWindowDescs.HostData);
+  const uint32_t *count_host =
+      buffer_cast<const uint32_t>(sievePrototypeWindowCounts.HostData);
+  const uint32_t *output_host =
+      buffer_cast<const uint32_t>(sievePrototypeOutput.HostData);
+  if (!desc_host || !count_host || !output_host)
+    return false;
+
+  uint64_t candidate_total = 0;
+  for (uint32_t i = 0; i < window_count; ++i)
+    candidate_total += count_host[i];
+
+  prototypeOffsets.clear();
+  prototypeOffsets.reserve(static_cast<size_t>(candidate_total));
+  prototypeWindowOffsets.clear();
+  prototypeWindowOffsets.reserve(window_count + 1);
+  prototypeWindowOffsets.push_back(0u);
+
+  uint32_t running_total = 0;
+  for (uint32_t i = 0; i < window_count; ++i) {
+    const uint32_t count = count_host[i];
+    const uint32_t base_index = desc_host[i].output_base;
+    for (uint32_t j = 0; j < count; ++j)
+      prototypeOffsets.push_back(output_host[base_index + j]);
+    running_total += count;
+    prototypeWindowOffsets.push_back(running_total);
+  }
+
+  lastPrototypeCount = running_total;
+  lastPrototypeWindowCount = window_count;
+  return true;
 }
 
 GPUFermat *GPUFermat::get_instance(unsigned device_id,
@@ -537,18 +1971,42 @@ void GPUFermat::destroy_instance() {
   pthread_mutex_unlock(&creation_mutex);
 }
 
-uint32_t *GPUFermat::get_results_buffer() { return gpuResults.HostData; }
+GPUFermat::ResultWord *GPUFermat::get_results_buffer() {
+  return gpuResults.HostData
+             ? buffer_cast<ResultWord>(gpuResults.HostData)
+             : nullptr;
+}
 
-uint32_t *GPUFermat::get_prime_base_buffer() { return primeBase.HostData; }
+unsigned GPUFermat::get_result_word_size() {
+  return static_cast<unsigned>(gpuResults.ElementSize);
+}
 
-uint32_t *GPUFermat::get_candidates_buffer() { return numbers.HostData; }
+uint32_t *GPUFermat::get_prime_base_buffer() {
+  return primeBase.HostData ? buffer_cast<uint32_t>(primeBase.HostData)
+                            : nullptr;
+}
+
+uint32_t *GPUFermat::get_candidates_buffer() {
+  return numbers.HostData ? buffer_cast<uint32_t>(numbers.HostData) : nullptr;
+}
+
+void GPUFermat::configure_sieve_primes(const uint32_t *primes, size_t count) {
+  if (primes == nullptr || count == 0)
+    return;
+  sievePrototypePrimes.init(count, sizeof(uint32_t), true);
+  memcpy(sievePrototypePrimes.HostData, primes, count * sizeof(uint32_t));
+  cudaStream_t stream = streams[0];
+  sievePrototypePrimes.copyToDevice(stream, count);
+  CUDA_CHECK(cudaStreamSynchronize(stream));
+  sievePrimesConfigured = true;
+  configuredPrimeCount = static_cast<uint32_t>(count);
+}
 
 void GPUFermat::run_cuda(uint32_t batchElements) {
   if (batchElements == 0)
     return;
   const uint32_t work = std::min(batchElements, elementsNum);
   log_str("running " + std::to_string(work) + " fermat tests on the gpu", LOG_D);
-  uploadPrimeBaseConstants();
 
   const uint32_t threads = GroupSize;
   const uint32_t maxBlocks = std::max(1u, groupsNum * 4u);
@@ -564,13 +2022,23 @@ void GPUFermat::run_cuda(uint32_t batchElements) {
 
     numbers.copyToDevice(chunkStream, chunk, processed);
 
+    /* Ensure the device constant prime base matches the host buffer for this
+     * chunk. Upload before the kernel launch to avoid races where the host
+     * updates `primeBase.HostData` between batches. */
+    uploadPrimeBaseConstants();
+
     const uint32_t requiredBlocks = (chunk + threads - 1u) / threads;
     const uint32_t blocks = std::max(1u, std::min(requiredBlocks, maxBlocks));
 
+    const uint32_t *number_device =
+      buffer_cast<const uint32_t>(numbers.DeviceData) + processed;
+    ResultWord *results_device =
+      buffer_cast<ResultWord>(gpuResults.DeviceData) + processed;
+
     fermatTest320Kernel<<<blocks, threads, 0, chunkStream>>>(
-        numbers.DeviceData + processed,
-        gpuResults.DeviceData + processed,
-        chunk);
+      number_device,
+      results_device,
+      chunk);
     CUDA_CHECK(cudaGetLastError());
 
     gpuResults.copyToHost(chunkStream, chunk, processed);
@@ -583,12 +2051,611 @@ void GPUFermat::run_cuda(uint32_t batchElements) {
     CUDA_CHECK(cudaStreamSynchronize(s));
 }
 
+void GPUFermat::dump_device_samples(const uint32_t *sample_indices, unsigned sampleCount) {
+  if (!sampleCount || !sample_indices || !numbers.DeviceData)
+    return;
+
+  const unsigned threads = 128u;
+  const unsigned blocks = (sampleCount + threads - 1u) / threads;
+
+  uint32_t *d_sample_indices = nullptr;
+  uint32_t *d_out_limbs = nullptr;
+  uint32_t *host_out_limbs = nullptr;
+  uint32_t *host_out_carry = nullptr;
+
+  CUDA_CHECK(cudaMalloc(&d_sample_indices, sampleCount * sizeof(uint32_t)));
+  CUDA_CHECK(cudaMalloc(&d_out_limbs, (sampleCount * kOperandSize + sampleCount) * sizeof(uint32_t)));
+
+  host_out_limbs = (uint32_t *)malloc(sampleCount * kOperandSize * sizeof(uint32_t));
+  host_out_carry = (uint32_t *)malloc(sampleCount * sizeof(uint32_t));
+
+  CUDA_CHECK(cudaMemcpy(d_sample_indices, sample_indices, sampleCount * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+  dump_candidate_limbs_kernel<<<blocks, threads>>>(
+      buffer_cast<const uint32_t>(numbers.DeviceData),
+      d_sample_indices,
+      d_out_limbs,
+      sampleCount);
+  CUDA_CHECK(cudaGetLastError());
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  CUDA_CHECK(cudaMemcpy(host_out_limbs, d_out_limbs, sampleCount * kOperandSize * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(host_out_carry, d_out_limbs + (sampleCount * kOperandSize), sampleCount * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+
+  if (Opts::get_instance() && Opts::get_instance()->has_extra_vb()) {
+    std::ostringstream ss;
+    ss << get_time() << " CUDA device-dump:" << std::hex;
+    for (unsigned s = 0; s < sampleCount; ++s) {
+      ss << "\n" << get_time() << " DEVICE sample " << s << " idx=" << std::dec << sample_indices[s] << std::hex << " limbs:";
+      for (int l = 0; l < kOperandSize; ++l)
+        ss << " " << std::setw(8) << std::setfill('0') << host_out_limbs[s * kOperandSize + l];
+      ss << " carry=" << std::setw(8) << host_out_carry[s];
+    }
+    ss << std::dec;
+    extra_verbose_log(ss.str());
+  }
+
+  free(host_out_limbs);
+  free(host_out_carry);
+  CUDA_CHECK(cudaFree(d_sample_indices));
+  CUDA_CHECK(cudaFree(d_out_limbs));
+}
+
 void GPUFermat::fermat_gpu(uint32_t elements) {
   const uint32_t work = (elements == 0) ? elementsNum : elements;
   run_cuda(work);
 }
 
-void GPUFermat::benchmark() { test_gpu(); }
+unsigned GPUFermat::get_elements_num() {
+  return elementsNum;
+}
+
+void GPUFermat::prototype_sieve(const SievePrototypeParams &params) {
+  prototype_sieve_batch(&params, 1u);
+}
+
+void GPUFermat::prototype_sieve_batch(const SievePrototypeParams *params,
+                                      uint32_t window_count) {
+  lastPrototypeCount = 0;
+  prototypeOffsets.clear();
+  resetPrototypeWindowState();
+
+  if (!params || window_count == 0)
+    return;
+
+  const bool proto_enabled = Opts::get_instance()->use_cuda_sieve_proto();
+  const bool extra_verbose = Opts::get_instance()->has_extra_vb();
+    // (removed verbose proto options log)
+
+  struct WindowAttributes {
+    bool has_bitmap = false;
+    bool has_residue = false;
+  };
+
+  std::vector<WindowAttributes> window_attrs(window_count);
+  std::vector<uint32_t> residue_indices;
+  residue_indices.reserve(window_count);
+
+  bool requires_single = false;
+  for (uint32_t idx = 0; idx < window_count; ++idx) {
+    if (params[idx].window_size == 0)
+      continue;
+    const bool has_host_bitmap =
+        (params[idx].sieve_bytes != nullptr && params[idx].sieve_byte_len != 0);
+    const bool has_residue_snapshot =
+        (params[idx].prime_starts != nullptr && params[idx].prime_count != 0);
+
+    if (!has_host_bitmap && !has_residue_snapshot) {
+      requires_single = true;
+      break;
+    }
+
+    if (has_residue_snapshot &&
+        (!sievePrimesConfigured || params[idx].prime_count > configuredPrimeCount)) {
+      if (extra_verbose) {
+        std::ostringstream ss;
+        ss << get_time()
+           << "CUDA sieve prototype missing prime configuration for snapshot";
+        extra_verbose_log(ss.str());
+      }
+      requires_single = true;
+      break;
+    }
+
+    window_attrs[idx].has_bitmap = has_host_bitmap;
+    window_attrs[idx].has_residue = has_residue_snapshot;
+    if (has_residue_snapshot)
+      residue_indices.push_back(idx);
+  }
+
+  if (requires_single) {
+    std::vector<uint32_t> aggregate_offsets;
+    std::vector<uint32_t> aggregate_slices;
+    aggregate_slices.reserve(window_count + 1);
+    aggregate_slices.push_back(0u);
+
+    for (uint32_t idx = 0; idx < window_count; ++idx) {
+      prototype_sieve_single(params[idx]);
+      aggregate_offsets.insert(aggregate_offsets.end(),
+                               prototypeOffsets.begin(),
+                               prototypeOffsets.end());
+      aggregate_slices.push_back(
+          static_cast<uint32_t>(aggregate_offsets.size()));
+    }
+
+    prototypeOffsets.swap(aggregate_offsets);
+    prototypeWindowOffsets.swap(aggregate_slices);
+    lastPrototypeCount = static_cast<uint32_t>(prototypeOffsets.size());
+    lastPrototypeWindowCount = window_count;
+    return;
+  }
+
+  uint64_t total_bits = 0;
+  uint64_t total_words = 0;
+  for (uint32_t idx = 0; idx < window_count; ++idx) {
+    total_bits += params[idx].window_size;
+    total_words +=
+        (static_cast<uint64_t>(params[idx].window_size) + 31ull) >> 5;
+  }
+  if (total_bits == 0 || total_words == 0)
+    return;
+
+  ensurePrototypeOutputCapacity(static_cast<size_t>(total_bits));
+  ensurePrototypeBitmapCapacity(static_cast<size_t>(total_words));
+  ensurePrototypeWindowBitCapacity(static_cast<size_t>(window_count + 1));
+  ensurePrototypeBaseCapacity(window_count);
+    ensurePrototypeWindowDescCapacity(window_count);
+
+  uint8_t *bitmap_host_bytes = sievePrototypeBitmap.HostData;
+  uint32_t *bit_prefix =
+      buffer_cast<uint32_t>(sievePrototypeWindowBits.HostData);
+  uint64_t *base_host =
+      buffer_cast<uint64_t>(sievePrototypeWindowBases.HostData);
+    std::vector<uint32_t> word_prefix(window_count + 1u, 0u);
+    std::vector<uint32_t> window_bit_lengths(window_count, 0u);
+
+  size_t byte_cursor = 0;
+  uint64_t bit_cursor = 0;
+  bit_prefix[0] = 0u;
+  for (uint32_t idx = 0; idx < window_count; ++idx) {
+    const uint32_t window_bits = params[idx].window_size;
+    const uint32_t window_words =
+        static_cast<uint32_t>((static_cast<uint64_t>(window_bits) + 31ull) >> 5);
+    const size_t window_bytes = static_cast<size_t>(window_words) * sizeof(uint32_t);
+    uint8_t *target = bitmap_host_bytes + byte_cursor;
+    if (window_bytes)
+      memset(target, 0, window_bytes);
+    const size_t copy_bytes = std::min(window_bytes,
+                                       static_cast<size_t>(params[idx].sieve_byte_len));
+    if (copy_bytes > 0 && params[idx].sieve_bytes)
+      memcpy(target, params[idx].sieve_bytes, copy_bytes);
+    byte_cursor += window_bytes;
+    bit_cursor += window_bits;
+    bit_prefix[idx + 1] = static_cast<uint32_t>(bit_cursor);
+    const uint64_t round_offset =
+      static_cast<uint64_t>(params[idx].window_size) * params[idx].sieve_round;
+    const uint64_t absolute_base = params[idx].sieve_base + round_offset;
+    base_host[idx] = absolute_base;
+    window_bit_lengths[idx] = window_bits;
+    word_prefix[idx + 1] = word_prefix[idx] + window_words;
+  }
+
+  cudaStream_t stream = streams[0];
+  sievePrototypeBitmap.copyToDevice(stream, static_cast<size_t>(total_words));
+  sievePrototypeWindowBits.copyToDevice(stream, window_count + 1);
+  sievePrototypeWindowBases.copyToDevice(stream, window_count);
+
+  if (!residue_indices.empty()) {
+    uint32_t *bitmap_device_base =
+        buffer_cast<uint32_t>(sievePrototypeBitmap.DeviceData);
+    for (uint32_t idx : residue_indices) {
+      if (!window_attrs[idx].has_residue)
+        continue;
+      const uint32_t prime_count = params[idx].prime_count;
+      if (prime_count == 0)
+        continue;
+
+      ensurePrototypeResidueCapacity(prime_count);
+      memcpy(buffer_cast<uint32_t>(sievePrototypeResidues.HostData),
+             params[idx].prime_starts,
+             prime_count * sizeof(uint32_t));
+      sievePrototypeResidues.copyToDevice(stream, prime_count);
+
+      const uint32_t window_words = word_prefix[idx + 1] - word_prefix[idx];
+      if (window_words == 0)
+        continue;
+      uint32_t *window_bitmap_device = bitmap_device_base + word_prefix[idx];
+      const size_t window_bytes = static_cast<size_t>(window_words) * sizeof(uint32_t);
+      CUDA_CHECK(cudaMemsetAsync(window_bitmap_device, 0, window_bytes, stream));
+
+      const uint32_t threads = GroupSize;
+      const uint32_t blocks =
+          std::max(1u, (prime_count + threads - 1u) / threads);
+      sieveBuildBitmapKernel<<<blocks, threads, 0, stream>>>(
+          buffer_cast<const uint32_t>(sievePrototypePrimes.DeviceData),
+          buffer_cast<const uint32_t>(sievePrototypeResidues.DeviceData),
+          prime_count,
+          params[idx].window_size,
+          window_bitmap_device);
+      CUDA_CHECK(cudaGetLastError());
+    }
+  }
+
+  const bool compact_scan_enabled = Opts::get_instance()->use_cuda_sieve_proto();
+  if (compact_scan_enabled &&
+      total_bits <= static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
+    PrototypeWindowDesc *desc_host =
+        buffer_cast<PrototypeWindowDesc>(sievePrototypeWindowDescs.HostData);
+    for (uint32_t idx = 0; idx < window_count; ++idx) {
+      desc_host[idx].word_start = word_prefix[idx];
+      desc_host[idx].word_count = word_prefix[idx + 1] - word_prefix[idx];
+      desc_host[idx].bit_length = window_bit_lengths[idx];
+      desc_host[idx].output_base = bit_prefix[idx];
+      desc_host[idx].base_parity =
+          static_cast<uint32_t>(base_host[idx] & 1ull);
+    }
+
+    if (run_compact_scan(window_count,
+                         static_cast<uint32_t>(total_bits),
+                         stream)) {
+      if (Opts::get_instance()->has_extra_vb()) {
+        std::ostringstream ss;
+        ss << get_time() << "CUDA sieve prototype batched " << window_count
+           << " windows; candidates=" << lastPrototypeCount;
+        extra_verbose_log(ss.str());
+      }
+      return;
+    }
+    if (Opts::get_instance()->has_extra_vb()) {
+      std::ostringstream ss;
+      ss << get_time() << "CUDA sieve prototype compact scan fallback for "
+         << window_count << " windows (total_bits=" << total_bits << ")";
+      extra_verbose_log(ss.str());
+    }
+  }
+
+  const uint32_t threads = GroupSize;
+  const uint32_t blocks =
+      std::max(1u, (static_cast<uint32_t>(total_bits) + threads - 1u) / threads);
+  sievePrototypeKernelBatch<<<blocks, threads, 0, stream>>>(
+      buffer_cast<const uint32_t>(sievePrototypeBitmap.DeviceData),
+      buffer_cast<const uint32_t>(sievePrototypeWindowBits.DeviceData),
+      buffer_cast<const uint64_t>(sievePrototypeWindowBases.DeviceData),
+      window_count,
+      static_cast<uint32_t>(total_bits),
+      buffer_cast<uint32_t>(sievePrototypeOutput.DeviceData));
+  CUDA_CHECK(cudaGetLastError());
+
+  sievePrototypeOutput.copyToHost(stream, static_cast<size_t>(total_bits));
+  CUDA_CHECK(cudaStreamSynchronize(stream));
+
+  if (Opts::get_instance()->has_extra_vb()) {
+    const size_t preview = static_cast<size_t>(std::min<uint64_t>(total_bits, 8ull));
+    std::ostringstream ss;
+    ss << get_time() << "CUDA sieve prototype raw output:";
+    for (size_t i = 0; i < preview; ++i)
+      ss << ' ' << buffer_cast<const uint32_t>(sievePrototypeOutput.HostData)[i];
+    extra_verbose_log(ss.str());
+  }
+
+  const uint32_t sentinel = 0xFFFFFFFFu;
+  prototypeOffsets.reserve(static_cast<size_t>(total_bits / 64ull + 1ull));
+  prototypeWindowOffsets.clear();
+  prototypeWindowOffsets.reserve(window_count + 1);
+  prototypeWindowOffsets.push_back(0u);
+
+  const uint32_t *output_host =
+      buffer_cast<const uint32_t>(sievePrototypeOutput.HostData);
+  const uint32_t *bit_prefix_host =
+      buffer_cast<const uint32_t>(sievePrototypeWindowBits.HostData);
+  for (uint32_t idx = 0; idx < window_count; ++idx) {
+    const uint32_t start_bit = bit_prefix_host[idx];
+    const uint32_t end_bit = bit_prefix_host[idx + 1];
+    for (uint32_t bit = start_bit; bit < end_bit; ++bit) {
+      const uint32_t value = output_host[bit];
+      if (value != sentinel)
+        prototypeOffsets.push_back(value);
+    }
+    prototypeWindowOffsets.push_back(
+        static_cast<uint32_t>(prototypeOffsets.size()));
+  }
+
+  lastPrototypeCount = static_cast<uint32_t>(prototypeOffsets.size());
+  lastPrototypeWindowCount = window_count;
+
+  if (Opts::get_instance()->has_extra_vb()) {
+    std::ostringstream ss;
+    ss << get_time() << "CUDA sieve prototype batched " << window_count
+       << " windows; candidates=" << lastPrototypeCount;
+    extra_verbose_log(ss.str());
+  }
+}
+
+void GPUFermat::prototype_sieve_single(const SievePrototypeParams &params) {
+  lastPrototypeCount = 0;
+  prototypeOffsets.clear();
+  resetPrototypeWindowState();
+
+  if (params.window_size == 0)
+    return;
+
+  const bool has_host_bitmap =
+      (params.sieve_bytes != nullptr && params.sieve_byte_len != 0);
+  const bool has_residue_snapshot =
+      (params.prime_starts != nullptr && params.prime_count != 0);
+  if (!has_host_bitmap && !has_residue_snapshot)
+    return;
+  if (has_residue_snapshot &&
+      (!sievePrimesConfigured || params.prime_count > configuredPrimeCount)) {
+    if (Opts::get_instance()->has_extra_vb()) {
+      std::ostringstream ss;
+      ss << get_time()
+         << "CUDA sieve prototype missing prime configuration for snapshot";
+      extra_verbose_log(ss.str());
+    }
+    return;
+  }
+
+  ensurePrototypeOutputCapacity(params.window_size);
+
+  const uint32_t bitmap_words =
+      static_cast<uint32_t>((static_cast<uint64_t>(params.window_size) + 31ull) >> 5);
+  if (bitmap_words == 0)
+    return;
+  ensurePrototypeBitmapCapacity(bitmap_words);
+
+  const uint64_t round_offset =
+      static_cast<uint64_t>(params.window_size) * params.sieve_round;
+  const uint64_t absolute_base = params.sieve_base + round_offset;
+  const uint32_t base_parity = static_cast<uint32_t>(absolute_base & 1ull);
+
+  cudaStream_t stream = streams[0];
+  if (has_host_bitmap) {
+    uint8_t *bitmap_host_bytes = sievePrototypeBitmap.HostData;
+    const size_t bitmap_bytes = static_cast<size_t>(bitmap_words) * sizeof(uint32_t);
+    const size_t copy_bytes = std::min(static_cast<size_t>(params.sieve_byte_len),
+                                       bitmap_bytes);
+    memcpy(bitmap_host_bytes, params.sieve_bytes, copy_bytes);
+    if (bitmap_bytes > copy_bytes)
+      memset(bitmap_host_bytes + copy_bytes, 0, bitmap_bytes - copy_bytes);
+
+    sievePrototypeBitmap.copyToDevice(stream, bitmap_words);
+  } else if (has_residue_snapshot) {
+    ensurePrototypeResidueCapacity(params.prime_count);
+    memcpy(buffer_cast<uint32_t>(sievePrototypeResidues.HostData),
+           params.prime_starts,
+           params.prime_count * sizeof(uint32_t));
+    sievePrototypeResidues.copyToDevice(stream, params.prime_count);
+    const size_t bitmap_bytes = static_cast<size_t>(bitmap_words) * sizeof(uint32_t);
+    CUDA_CHECK(cudaMemsetAsync(sievePrototypeBitmap.DeviceData,
+                               0,
+                               bitmap_bytes,
+                               stream));
+
+    const uint32_t threads = GroupSize;
+    const uint32_t blocks =
+        std::max(1u, (params.prime_count + threads - 1u) / threads);
+    sieveBuildBitmapKernel<<<blocks, threads, 0, stream>>>(
+        buffer_cast<const uint32_t>(sievePrototypePrimes.DeviceData),
+        buffer_cast<const uint32_t>(sievePrototypeResidues.DeviceData),
+        params.prime_count,
+        params.window_size,
+        buffer_cast<uint32_t>(sievePrototypeBitmap.DeviceData));
+    CUDA_CHECK(cudaGetLastError());
+  }
+
+  const bool compact_scan_enabled = Opts::get_instance()->use_cuda_sieve_proto();
+  if (compact_scan_enabled) {
+    ensurePrototypeWindowDescCapacity(1u);
+    PrototypeWindowDesc *desc_host =
+        buffer_cast<PrototypeWindowDesc>(sievePrototypeWindowDescs.HostData);
+    desc_host[0].word_start = 0u;
+    desc_host[0].word_count = bitmap_words;
+    desc_host[0].bit_length = params.window_size;
+    desc_host[0].output_base = 0u;
+    desc_host[0].base_parity = base_parity;
+
+    if (run_compact_scan(1u, params.window_size, stream)) {
+      if (Opts::get_instance()->has_extra_vb()) {
+        std::ostringstream ss;
+        ss << get_time() << "CUDA sieve prototype window " << params.window_size
+           << " start=" << params.sieve_base
+           << " round=" << params.sieve_round
+           << " candidates=" << lastPrototypeCount;
+        extra_verbose_log(ss.str());
+      }
+      return;
+    }
+  }
+
+  const uint32_t threads = GroupSize;
+  const uint32_t blocks =
+      std::max(1u, (params.window_size + threads - 1u) / threads);
+
+  const uint32_t *bitmap_device =
+      buffer_cast<const uint32_t>(sievePrototypeBitmap.DeviceData);
+  uint32_t *output_device =
+      buffer_cast<uint32_t>(sievePrototypeOutput.DeviceData);
+
+  sievePrototypeKernel<<<blocks, threads, 0, stream>>>(
+      bitmap_device,
+      params.window_size,
+      base_parity,
+      output_device);
+  CUDA_CHECK(cudaGetLastError());
+
+  sievePrototypeOutput.copyToHost(stream, params.window_size);
+  CUDA_CHECK(cudaStreamSynchronize(stream));
+
+  const uint32_t sentinel = 0xFFFFFFFFu;
+  prototypeOffsets.reserve(params.window_size / 64u + 1u);
+  for (uint32_t i = 0; i < params.window_size; ++i) {
+    const uint32_t value =
+        buffer_cast<const uint32_t>(sievePrototypeOutput.HostData)[i];
+    if (value != sentinel)
+      prototypeOffsets.push_back(value);
+  }
+
+  lastPrototypeCount = static_cast<uint32_t>(prototypeOffsets.size());
+  prototypeWindowOffsets.clear();
+  prototypeWindowOffsets.push_back(0u);
+  prototypeWindowOffsets.push_back(lastPrototypeCount);
+  lastPrototypeWindowCount = (params.window_size > 0) ? 1u : 0u;
+
+  if (Opts::get_instance()->has_extra_vb()) {
+    std::ostringstream ss;
+    ss << get_time() << "CUDA sieve prototype window " << params.window_size
+       << " start=" << params.sieve_base
+       << " round=" << params.sieve_round
+       << " candidates=" << lastPrototypeCount;
+    extra_verbose_log(ss.str());
+  }
+}
+
+const uint32_t *GPUFermat::prototype_offsets_data() const {
+  return prototypeOffsets.empty() ? nullptr : prototypeOffsets.data();
+}
+
+uint32_t GPUFermat::prototype_offsets_count() const {
+  return lastPrototypeCount;
+}
+
+const uint32_t *GPUFermat::prototype_window_offsets() const {
+  return prototypeWindowOffsets.empty() ? nullptr : prototypeWindowOffsets.data();
+}
+
+uint32_t GPUFermat::prototype_window_count() const {
+  return lastPrototypeWindowCount;
+}
+
+void GPUFermat::benchmark_montgomery_mul() {
+  const uint32_t sample_count = 1024u;
+  const uint32_t rounds = 128u;
+  std::vector<BigInt> hostA(sample_count);
+  std::vector<BigInt> hostB(sample_count);
+  std::vector<BigInt> hostMod(sample_count);
+  std::vector<uint32_t> hostInv(sample_count);
+
+  auto fill_random_bigint = [this](BigInt &n) {
+    for (int i = 0; i < kOperandSize; ++i)
+      n.limb[i] = rand32();
+  };
+
+  for (uint32_t i = 0; i < sample_count; ++i) {
+    fill_random_bigint(hostA[i]);
+    fill_random_bigint(hostB[i]);
+    fill_random_bigint(hostMod[i]);
+    hostMod[i].limb[0] |= 1u;
+    hostMod[i].limb[kOperandSize - 1] |= 0x80000000u;
+    hostInv[i] = montgomery_inverse32(hostMod[i].limb[0]);
+  }
+
+  const size_t bigIntBytes = static_cast<size_t>(sample_count) * sizeof(BigInt);
+  const size_t invBytes = static_cast<size_t>(sample_count) * sizeof(uint32_t);
+
+  BigInt *dA = nullptr;
+  BigInt *dB = nullptr;
+  BigInt *dMod = nullptr;
+  BigInt *dClassicOut = nullptr;
+  BigInt *dUnrolledOut = nullptr;
+  uint32_t *dInv = nullptr;
+
+  CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&dA), bigIntBytes));
+  CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&dB), bigIntBytes));
+  CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&dMod), bigIntBytes));
+  CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&dClassicOut), bigIntBytes));
+  CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&dUnrolledOut), bigIntBytes));
+  CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&dInv), invBytes));
+
+  CUDA_CHECK(cudaMemcpy(dA,
+                        hostA.data(),
+                        bigIntBytes,
+                        cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dB,
+                        hostB.data(),
+                        bigIntBytes,
+                        cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dMod,
+                        hostMod.data(),
+                        bigIntBytes,
+                        cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dInv,
+                        hostInv.data(),
+                        invBytes,
+                        cudaMemcpyHostToDevice));
+
+  const uint32_t threads = GroupSize;
+  const uint32_t blocks = std::max(1u, (sample_count + threads - 1u) / threads);
+
+  cudaEvent_t start, stop;
+  CUDA_CHECK(cudaEventCreate(&start));
+  CUDA_CHECK(cudaEventCreate(&stop));
+
+  float msClassic = 0.0f;
+  CUDA_CHECK(cudaEventRecord(start));
+  montgomeryMulClassicKernel<<<blocks, threads>>>(dA,
+                                                  dB,
+                                                  dMod,
+                                                  dInv,
+                                                  dClassicOut,
+                                                  sample_count,
+                                                  rounds);
+  CUDA_CHECK(cudaGetLastError());
+  CUDA_CHECK(cudaEventRecord(stop));
+  CUDA_CHECK(cudaEventSynchronize(stop));
+  CUDA_CHECK(cudaEventElapsedTime(&msClassic, start, stop));
+
+  float msUnrolled = 0.0f;
+  CUDA_CHECK(cudaEventRecord(start));
+  montgomeryMulUnrolledKernel<<<blocks, threads>>>(dA,
+                                                   dB,
+                                                   dMod,
+                                                   dInv,
+                                                   dUnrolledOut,
+                                                   sample_count,
+                                                   rounds);
+  CUDA_CHECK(cudaGetLastError());
+  CUDA_CHECK(cudaEventRecord(stop));
+  CUDA_CHECK(cudaEventSynchronize(stop));
+  CUDA_CHECK(cudaEventElapsedTime(&msUnrolled, start, stop));
+
+  CUDA_CHECK(cudaEventDestroy(start));
+  CUDA_CHECK(cudaEventDestroy(stop));
+
+  cudaFuncAttributes attrClassic{};
+  cudaFuncAttributes attrUnrolled{};
+  CUDA_CHECK(cudaFuncGetAttributes(&attrClassic, montgomeryMulClassicKernel));
+  CUDA_CHECK(cudaFuncGetAttributes(&attrUnrolled, montgomeryMulUnrolledKernel));
+
+  const double totalOps = static_cast<double>(sample_count) * rounds;
+  const double classicPerSec = (msClassic > 0.0f)
+                                   ? (totalOps * 1000.0 / msClassic)
+                                   : 0.0;
+  const double unrolledPerSec = (msUnrolled > 0.0f)
+                                    ? (totalOps * 1000.0 / msUnrolled)
+                                    : 0.0;
+
+  pthread_mutex_lock(&io_mutex);
+  cout << get_time() << "Montgomery classic: " << msClassic << " ms, "
+       << classicPerSec / 1e6 << " Mmul/s, regs=" << attrClassic.numRegs
+       << endl;
+  cout << get_time() << "Montgomery unrolled: " << msUnrolled << " ms, "
+       << unrolledPerSec / 1e6 << " Mmul/s, regs=" << attrUnrolled.numRegs
+       << endl;
+  pthread_mutex_unlock(&io_mutex);
+
+  cudaFree(dA);
+  cudaFree(dB);
+  cudaFree(dMod);
+  cudaFree(dClassicOut);
+  cudaFree(dUnrolledOut);
+  cudaFree(dInv);
+}
+
+void GPUFermat::benchmark() {
+  benchmark_montgomery_mul();
+  test_gpu();
+}
 
 uint32_t GPUFermat::rand32() {
   uint32_t value = rand();
@@ -612,9 +2679,9 @@ void GPUFermat::test_gpu() {
   }
 
   const unsigned size = elementsNum;
-  uint32_t *prime_base = primeBase.HostData;
-  uint32_t *primes = numbers.HostData;
-  uint32_t *results = gpuResults.HostData;
+  uint32_t *prime_base = buffer_cast<uint32_t>(primeBase.HostData);
+  uint32_t *primes = buffer_cast<uint32_t>(numbers.HostData);
+  ResultWord *results = buffer_cast<ResultWord>(gpuResults.HostData);
 
   mpz_class mpz(rand32());
   for (int i = 0; i < 8; ++i) {
@@ -622,7 +2689,7 @@ void GPUFermat::test_gpu() {
     mpz += rand32();
   }
 
-  if (mpz.get_ui() & 0x1)
+  if (!(mpz.get_ui() & 0x1))
     mpz += 1;
 
   memset(prime_base, 0, operandSize * sizeof(uint32_t));
@@ -635,13 +2702,23 @@ void GPUFermat::test_gpu() {
              0,
              mpz.get_mpz_t());
 
-  for (unsigned i = 0; i < size; ++i) {
-    primes[i] = mpz.get_ui() & 0xffffffffu;
+  mpz_class base_mpz;
+  mpz_import(base_mpz.get_mpz_t(), kOperandSize, -1, 4, 0, 0, prime_base);
 
-    if (i % 2 == 0)
-      mpz_nextprime(mpz.get_mpz_t(), mpz.get_mpz_t());
-    else
-      mpz_add_ui(mpz.get_mpz_t(), mpz.get_mpz_t(), 1);
+  for (unsigned i = 0; i < size; ++i) {
+    uint32_t small_offset = rand32() % (1u << 24); // small offset to fit in 32 bits
+    if (i % 2 == 0) {
+      // Generate a prime close to base: base + small random offset
+      mpz_class candidate = base_mpz + small_offset;
+      mpz_nextprime(candidate.get_mpz_t(), candidate.get_mpz_t());
+      mpz_class offset = candidate - base_mpz;
+      primes[i] = offset.get_ui() & 0xffffffffu;
+    } else {
+      // Generate composite close to base: base + small_offset + 1
+      mpz_class composite = base_mpz + small_offset + 1;
+      mpz_class offset = composite - base_mpz;
+      primes[i] = offset.get_ui() & 0xffffffffu;
+    }
 
     if (i % 23 == 0)
       printf("\rcreating test data: %u  \r", size - i);
@@ -651,15 +2728,42 @@ void GPUFermat::test_gpu() {
   fermat_gpu(size);
 
   unsigned failures = 0;
+  std::vector<uint32_t> failing_indices;
+  std::vector<uint8_t> expected(size);
   for (unsigned i = 0; i < size; ++i) {
-    const uint32_t expected = (i % 2 == 0) ? 0u : 1u;
-    if (results[i] != expected) {
-      if (failures == 0) {
-        printf("Result %u is wrong: expected %u but got %u\n",
+    mpz_t check;
+    mpz_init(check);
+    mpz_import(check, kOperandSize, -1, 4, 0, 0, prime_base);
+    mpz_add_ui(check, check, primes[i]);
+    // mpz_probab_prime_p returns 0 for composite, >0 for (probable) prime.
+    // Device `results` uses 1 => prime, 0 => composite. Map accordingly.
+    const uint8_t is_prime = (mpz_probab_prime_p(check, 45) != 0);
+    // Device kernel writes 1 for probable prime, 0 for composite.
+    expected[i] = is_prime ? 1u : 0u;
+    mpz_clear(check);
+
+    if (results[i] != static_cast<ResultWord>(expected[i])) {
+      if (failures < 8) {
+        printf("[CUDA TEST] MISMATCH idx=%u expected=%u got=%u number=%u\n",
                i,
-               expected,
-               results[i]);
+               expected[i],
+               results[i],
+               primes[i]);
+        // Print MPZ-based check and the candidate value (hex) for diagnostics
+        mpz_t check2;
+        mpz_init(check2);
+        mpz_import(check2, kOperandSize, -1, 4, 0, 0, prime_base);
+        mpz_add_ui(check2, check2, primes[i]);
+        int cpu_res = mpz_probab_prime_p(check2, 45);
+        char *num_hex = mpz_get_str(NULL, 16, check2);
+        printf("[CUDA TEST] CPU mpz_probab_prime_p=%d num_hex=%s\n", cpu_res, num_hex);
+        free(num_hex);
+        mpz_clear(check2);
+      } else if (failures == 8) {
+        printf("[CUDA TEST] Further mismatches suppressed...\n");
       }
+      if (failing_indices.size() < 16)
+        failing_indices.push_back(i);
       failures++;
     }
   }
@@ -668,6 +2772,334 @@ void GPUFermat::test_gpu() {
     printf("GPU Test failed: %u mismatched result(s)\n", failures);
   else
     printf("GPU Test worked\n");
+
+  // Run diagnostic: dump device-built limbs for first failing indices
+  if (!failing_indices.empty()) {
+    const unsigned sampleCount = static_cast<unsigned>(failing_indices.size());
+    std::vector<uint32_t> sample_indices(sampleCount);
+    for (unsigned s = 0; s < sampleCount; ++s)
+      sample_indices[s] = failing_indices[s];
+
+    uint32_t *d_numbers = nullptr;
+    uint32_t *d_sample_indices = nullptr;
+
+    uint32_t *d_out_limbs = nullptr;
+    uint32_t *host_out_limbs = nullptr;
+    uint32_t *host_out_carry = nullptr;
+
+    CUDA_CHECK(cudaMalloc(&d_numbers, size * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_sample_indices, sampleCount * sizeof(uint32_t)));
+    // allocate an extra per-sample word for final carry
+    CUDA_CHECK(cudaMalloc(&d_out_limbs, (sampleCount * kOperandSize + sampleCount) * sizeof(uint32_t)));
+
+    host_out_limbs = (uint32_t *)malloc(sampleCount * kOperandSize * sizeof(uint32_t));
+    host_out_carry = (uint32_t *)malloc(sampleCount * sizeof(uint32_t));
+    CUDA_CHECK(cudaMemcpy(d_numbers, primes, size * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_sample_indices, sample_indices.data(), sampleCount * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    const unsigned threads = 128;
+    const unsigned blocks = (sampleCount + threads - 1) / threads;
+    dump_candidate_limbs_kernel<<<blocks, threads>>>(d_numbers, d_sample_indices, d_out_limbs, sampleCount);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    CUDA_CHECK(cudaMemcpy(host_out_limbs, d_out_limbs, sampleCount * kOperandSize * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(host_out_carry, d_out_limbs + (sampleCount * kOperandSize), sampleCount * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+
+    // Also capture per-limb carries (carry after each limb addition)
+    uint32_t *d_out_carries = nullptr;
+    uint32_t *host_out_carries = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_out_carries, sampleCount * kOperandSize * sizeof(uint32_t)));
+    host_out_carries = (uint32_t *)malloc(sampleCount * kOperandSize * sizeof(uint32_t));
+
+    dump_candidate_carries_kernel<<<blocks, threads>>>(d_numbers, d_sample_indices, d_out_carries, sampleCount);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(host_out_carries, d_out_carries, sampleCount * kOperandSize * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+
+    // Print diagnostic per sample: device limbs and host-expected limbs
+    for (unsigned s = 0; s < sampleCount; ++s) {
+      unsigned idx = sample_indices[s];
+      printf("[CUDA DIAG] sample %u idx=%u offset=%u\n", s, idx, primes[idx]);
+
+      printf("[CUDA DIAG] device limbs: ");
+      for (int l = 0; l < kOperandSize; ++l)
+        printf("%08x ", host_out_limbs[s * kOperandSize + l]);
+      printf(" carry=%08x\n", host_out_carry[s]);
+
+      // print per-limb carry trace
+      printf("[CUDA DIAG] device carries(after limb): ");
+      for (int l = 0; l < kOperandSize; ++l)
+        printf("%08x ", host_out_carries[s * kOperandSize + l]);
+      printf("\n");
+
+      // build host mpz and export limbs for comparison
+      mpz_t check;
+      mpz_init(check);
+      mpz_import(check, kOperandSize, -1, 4, 0, 0, prime_base);
+      mpz_add_ui(check, check, primes[idx]);
+      // allocate slightly larger buffer to catch unexpected exported limb counts
+      const size_t host_buf_words = kOperandSize + 4;
+      uint32_t *host_limbs = (uint32_t *)malloc(host_buf_words * sizeof(uint32_t));
+      memset(host_limbs, 0, host_buf_words * sizeof(uint32_t));
+      size_t host_exported = 0;
+      mpz_export(host_limbs, &host_exported, -1, sizeof(uint32_t), 0, 0, check);
+      size_t mpz_bits = mpz_sizeinbase(check, 2);
+      printf("[CUDA DIAG] host_exported=%zu mpz_bits=%zu\n", host_exported, mpz_bits);
+      printf("[CUDA DIAG] host  limbs: ");
+      for (int l = 0; l < kOperandSize; ++l)
+        printf("%08x ", host_limbs[l]);
+      printf("\n");
+      free(host_limbs);
+      mpz_clear(check);
+    }
+
+    free(host_out_limbs);
+    free(host_out_carries);
+    free(host_out_carry);
+    CUDA_CHECK(cudaFree(d_numbers));
+    CUDA_CHECK(cudaFree(d_sample_indices));
+    CUDA_CHECK(cudaFree(d_out_limbs));
+    CUDA_CHECK(cudaFree(d_out_carries));
+
+    // Run montgomery classic vs unrolled comparison for first failing samples
+    {
+      uint32_t *d_out_classic = nullptr;
+      uint32_t *d_out_unrolled = nullptr;
+      uint32_t *host_out_classic = nullptr;
+      uint32_t *host_out_unrolled = nullptr;
+
+      CUDA_CHECK(cudaMalloc(&d_numbers, size * sizeof(uint32_t)));
+      CUDA_CHECK(cudaMemcpy(d_numbers, primes, size * sizeof(uint32_t), cudaMemcpyHostToDevice));
+      CUDA_CHECK(cudaMalloc(&d_sample_indices, sampleCount * sizeof(uint32_t)));
+      CUDA_CHECK(cudaMemcpy(d_sample_indices, sample_indices.data(), sampleCount * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+      CUDA_CHECK(cudaMalloc(&d_out_classic, sampleCount * kOperandSize * sizeof(uint32_t)));
+      CUDA_CHECK(cudaMalloc(&d_out_unrolled, sampleCount * kOperandSize * sizeof(uint32_t)));
+      host_out_classic = (uint32_t *)malloc(sampleCount * kOperandSize * sizeof(uint32_t));
+      host_out_unrolled = (uint32_t *)malloc(sampleCount * kOperandSize * sizeof(uint32_t));
+
+      const unsigned threads2 = 128;
+      const unsigned blocks2 = (sampleCount + threads2 - 1) / threads2;
+      montgomeryCompareKernel<<<blocks2, threads2>>>(d_numbers, d_sample_indices, d_out_classic, d_out_unrolled, sampleCount);
+      CUDA_CHECK(cudaGetLastError());
+      CUDA_CHECK(cudaDeviceSynchronize());
+
+      CUDA_CHECK(cudaMemcpy(host_out_classic, d_out_classic, sampleCount * kOperandSize * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+      CUDA_CHECK(cudaMemcpy(host_out_unrolled, d_out_unrolled, sampleCount * kOperandSize * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+
+      for (unsigned s = 0; s < sampleCount; ++s) {
+        printf("[MONTY COMP] sample %u idx=%u\n", s, sample_indices[s]);
+        printf("[MONTY COMP] classic:   ");
+        for (int l = 0; l < kOperandSize; ++l)
+          printf("%08x ", host_out_classic[s * kOperandSize + l]);
+        printf("\n");
+        printf("[MONTY COMP] unrolled:  ");
+        for (int l = 0; l < kOperandSize; ++l)
+          printf("%08x ", host_out_unrolled[s * kOperandSize + l]);
+        printf("\n");
+      }
+
+      free(host_out_classic);
+      free(host_out_unrolled);
+      CUDA_CHECK(cudaFree(d_out_classic));
+      CUDA_CHECK(cudaFree(d_out_unrolled));
+      CUDA_CHECK(cudaFree(d_numbers));
+      CUDA_CHECK(cudaFree(d_sample_indices));
+    }
+
+    // Run additional trace kernels to capture invValue[] and final op1 of both unrolled and classic paths
+    {
+      uint32_t *d_out_inv = nullptr;
+      uint32_t *d_out_final = nullptr;
+      uint32_t *host_out_inv = nullptr;
+      uint32_t *host_out_final = nullptr;
+
+      uint32_t *d_out_inv_classic = nullptr;
+      uint32_t *d_out_final_classic = nullptr;
+      uint32_t *host_out_inv_classic = nullptr;
+      uint32_t *host_out_final_classic = nullptr;
+
+      uint32_t *d_out_acc = nullptr; // unrolled acc low
+      uint32_t *d_out_acc_high = nullptr; // unrolled acc high
+      uint32_t *host_out_acc = nullptr;
+      uint32_t *host_out_acc_high = nullptr;
+
+      uint32_t *d_out_acc_classic = nullptr;
+      uint32_t *d_out_acc_classic_high = nullptr;
+      uint32_t *host_out_acc_classic = nullptr;
+      uint32_t *host_out_acc_classic_high = nullptr;
+      uint32_t *d_out_prod = nullptr;
+      uint32_t *d_out_prod_high = nullptr;
+      uint32_t *host_out_prod = nullptr;
+      uint32_t *host_out_prod_high = nullptr;
+
+      uint32_t *d_out_prod_classic = nullptr;
+      uint32_t *d_out_prod_classic_high = nullptr;
+      uint32_t *host_out_prod_classic = nullptr;
+      uint32_t *host_out_prod_classic_high = nullptr;
+      uint32_t *host_out_steps = nullptr;
+      uint32_t *host_out_steps_high = nullptr;
+      uint32_t *host_out_steps_classic = nullptr;
+      uint32_t *host_out_steps_classic_high = nullptr;
+
+      CUDA_CHECK(cudaMalloc(&d_numbers, size * sizeof(uint32_t)));
+      CUDA_CHECK(cudaMemcpy(d_numbers, primes, size * sizeof(uint32_t), cudaMemcpyHostToDevice));
+      CUDA_CHECK(cudaMalloc(&d_sample_indices, sampleCount * sizeof(uint32_t)));
+      CUDA_CHECK(cudaMemcpy(d_sample_indices, sample_indices.data(), sampleCount * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+      CUDA_CHECK(cudaMalloc(&d_out_inv, sampleCount * kOperandSize * sizeof(uint32_t)));
+      CUDA_CHECK(cudaMalloc(&d_out_final, sampleCount * kOperandSize * sizeof(uint32_t)));
+      CUDA_CHECK(cudaMalloc(&d_out_inv_classic, sampleCount * kOperandSize * sizeof(uint32_t)));
+      CUDA_CHECK(cudaMalloc(&d_out_final_classic, sampleCount * kOperandSize * sizeof(uint32_t)));
+
+      // allocate acc trace buffers (4 blocks per sample)
+      CUDA_CHECK(cudaMalloc(&d_out_acc, sampleCount * 4 * sizeof(uint32_t)));
+      CUDA_CHECK(cudaMalloc(&d_out_acc_high, sampleCount * 4 * sizeof(uint32_t)));
+      CUDA_CHECK(cudaMalloc(&d_out_acc_classic, sampleCount * 4 * sizeof(uint32_t)));
+      CUDA_CHECK(cudaMalloc(&d_out_acc_classic_high, sampleCount * 4 * sizeof(uint32_t)));
+      CUDA_CHECK(cudaMalloc(&d_out_prod, sampleCount * 3 * sizeof(uint32_t)));
+      CUDA_CHECK(cudaMalloc(&d_out_prod_high, sampleCount * 3 * sizeof(uint32_t)));
+      CUDA_CHECK(cudaMalloc(&d_out_prod_classic, sampleCount * 3 * sizeof(uint32_t)));
+      CUDA_CHECK(cudaMalloc(&d_out_prod_classic_high, sampleCount * 3 * sizeof(uint32_t)));
+      // step buffers (3 steps per sample: after prod0, after prod1, after prod2)
+      uint32_t *d_out_steps = nullptr;
+      uint32_t *d_out_steps_high = nullptr;
+      uint32_t *d_out_steps_classic = nullptr;
+      uint32_t *d_out_steps_classic_high = nullptr;
+      CUDA_CHECK(cudaMalloc(&d_out_steps, sampleCount * 3 * sizeof(uint32_t)));
+      CUDA_CHECK(cudaMalloc(&d_out_steps_high, sampleCount * 3 * sizeof(uint32_t)));
+      CUDA_CHECK(cudaMalloc(&d_out_steps_classic, sampleCount * 3 * sizeof(uint32_t)));
+      CUDA_CHECK(cudaMalloc(&d_out_steps_classic_high, sampleCount * 3 * sizeof(uint32_t)));
+
+      host_out_inv = (uint32_t *)malloc(sampleCount * kOperandSize * sizeof(uint32_t));
+      host_out_final = (uint32_t *)malloc(sampleCount * kOperandSize * sizeof(uint32_t));
+      host_out_inv_classic = (uint32_t *)malloc(sampleCount * kOperandSize * sizeof(uint32_t));
+      host_out_final_classic = (uint32_t *)malloc(sampleCount * kOperandSize * sizeof(uint32_t));
+
+      host_out_acc = (uint32_t *)malloc(sampleCount * 4 * sizeof(uint32_t));
+      host_out_acc_high = (uint32_t *)malloc(sampleCount * 4 * sizeof(uint32_t));
+      host_out_acc_classic = (uint32_t *)malloc(sampleCount * 4 * sizeof(uint32_t));
+      host_out_acc_classic_high = (uint32_t *)malloc(sampleCount * 4 * sizeof(uint32_t));
+      host_out_prod = (uint32_t *)malloc(sampleCount * 3 * sizeof(uint32_t));
+      host_out_prod_high = (uint32_t *)malloc(sampleCount * 3 * sizeof(uint32_t));
+      host_out_prod_classic = (uint32_t *)malloc(sampleCount * 3 * sizeof(uint32_t));
+      host_out_prod_classic_high = (uint32_t *)malloc(sampleCount * 3 * sizeof(uint32_t));
+      host_out_steps = (uint32_t *)malloc(sampleCount * 3 * sizeof(uint32_t));
+      host_out_steps_high = (uint32_t *)malloc(sampleCount * 3 * sizeof(uint32_t));
+      host_out_steps_classic = (uint32_t *)malloc(sampleCount * 3 * sizeof(uint32_t));
+      host_out_steps_classic_high = (uint32_t *)malloc(sampleCount * 3 * sizeof(uint32_t));
+
+      const unsigned threads3 = 128;
+      const unsigned blocks3 = (sampleCount + threads3 - 1) / threads3;
+
+      // unrolled tracer (with acc outputs)
+      montgomeryTraceKernel<<<blocks3, threads3>>>(d_numbers, d_sample_indices, d_out_inv, d_out_final, d_out_acc, d_out_acc_high, d_out_prod, d_out_prod_high, d_out_steps, d_out_steps_high, sampleCount);
+      CUDA_CHECK(cudaGetLastError());
+      // classic tracer
+      montgomeryClassicTraceKernel<<<blocks3, threads3>>>(d_numbers, d_sample_indices, d_out_inv_classic, d_out_final_classic, d_out_acc_classic, d_out_acc_classic_high, d_out_prod_classic, d_out_prod_classic_high, d_out_steps_classic, d_out_steps_classic_high, sampleCount);
+      CUDA_CHECK(cudaGetLastError());
+      CUDA_CHECK(cudaDeviceSynchronize());
+  CUDA_CHECK(cudaMemcpy(host_out_steps, d_out_steps, sampleCount * 3 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(host_out_steps_high, d_out_steps_high, sampleCount * 3 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(host_out_steps_classic, d_out_steps_classic, sampleCount * 3 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(host_out_steps_classic_high, d_out_steps_classic_high, sampleCount * 3 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+
+      CUDA_CHECK(cudaMemcpy(host_out_inv, d_out_inv, sampleCount * kOperandSize * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+      CUDA_CHECK(cudaMemcpy(host_out_final, d_out_final, sampleCount * kOperandSize * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+      CUDA_CHECK(cudaMemcpy(host_out_inv_classic, d_out_inv_classic, sampleCount * kOperandSize * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+      CUDA_CHECK(cudaMemcpy(host_out_final_classic, d_out_final_classic, sampleCount * kOperandSize * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+      CUDA_CHECK(cudaMemcpy(host_out_acc, d_out_acc, sampleCount * 4 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+      CUDA_CHECK(cudaMemcpy(host_out_acc_high, d_out_acc_high, sampleCount * 4 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+      CUDA_CHECK(cudaMemcpy(host_out_acc_classic, d_out_acc_classic, sampleCount * 4 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+      CUDA_CHECK(cudaMemcpy(host_out_acc_classic_high, d_out_acc_classic_high, sampleCount * 4 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+      CUDA_CHECK(cudaMemcpy(host_out_prod, d_out_prod, sampleCount * 3 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+      CUDA_CHECK(cudaMemcpy(host_out_prod_high, d_out_prod_high, sampleCount * 3 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+      CUDA_CHECK(cudaMemcpy(host_out_prod_classic, d_out_prod_classic, sampleCount * 3 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+      CUDA_CHECK(cudaMemcpy(host_out_prod_classic_high, d_out_prod_classic_high, sampleCount * 3 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+
+      for (unsigned s = 0; s < sampleCount; ++s) {
+        printf("[TRACE] sample %u idx=%u\n", s, sample_indices[s]);
+        printf("[TRACE] unrolled invValue: ");
+        for (int l = 0; l < kOperandSize; ++l)
+          printf("%08x ", host_out_inv[s * kOperandSize + l]);
+        printf("\n");
+        printf("[TRACE] unrolled final op1: ");
+        for (int l = 0; l < kOperandSize; ++l)
+          printf("%08x ", host_out_final[s * kOperandSize + l]);
+        printf("\n");
+        printf("[ACC] unrolled accBefore (blk0..3): ");
+        for (int b = 0; b < 4; ++b) {
+          uint32_t low = host_out_acc[s * 4 + b];
+          uint32_t high = host_out_acc_high[s * 4 + b];
+          printf("%08x%08x ", high, low);
+        }
+        printf("\n");
+        printf("[PROD] unrolled block1 products (p0,p1,p2): ");
+        for (int p = 0; p < 3; ++p) {
+          uint32_t low = host_out_prod[s * 3 + p];
+          uint32_t high = host_out_prod_high[s * 3 + p];
+          printf("%08x%08x ", high, low);
+        }
+        printf("\n");
+        printf("[STEPS] unrolled block1 steps (after prod0, after prod1, after prod2): ");
+        for (int p = 0; p < 3; ++p) {
+          uint32_t low = host_out_steps[s * 3 + p];
+          uint32_t high = host_out_steps_high[s * 3 + p];
+          printf("%08x%08x ", high, low);
+        }
+        printf("\n");
+        printf("[TRACE] classic invValue:   ");
+        for (int l = 0; l < kOperandSize; ++l)
+          printf("%08x ", host_out_inv_classic[s * kOperandSize + l]);
+        printf("\n");
+        printf("[TRACE] classic final op1:   ");
+        for (int l = 0; l < kOperandSize; ++l)
+          printf("%08x ", host_out_final_classic[s * kOperandSize + l]);
+        printf("\n");
+        printf("[ACC] classic accBefore (blk0..3): ");
+        for (int b = 0; b < 4; ++b) {
+          uint32_t low = host_out_acc_classic[s * 4 + b];
+          uint32_t high = host_out_acc_classic_high[s * 4 + b];
+          printf("%08x%08x ", high, low);
+        }
+        printf("\n");
+        printf("[PROD] classic block1 products (p0,p1,p2): ");
+        for (int p = 0; p < 3; ++p) {
+          uint32_t low = host_out_prod_classic[s * 3 + p];
+          uint32_t high = host_out_prod_classic_high[s * 3 + p];
+          printf("%08x%08x ", high, low);
+        }
+        printf("\n");
+        printf("[STEPS] classic block1 steps (after prod0, after prod1, after prod2): ");
+        for (int p = 0; p < 3; ++p) {
+          uint32_t low = host_out_steps_classic[s * 3 + p];
+          uint32_t high = host_out_steps_classic_high[s * 3 + p];
+          printf("%08x%08x ", high, low);
+        }
+        printf("\n");
+      }
+
+      free(host_out_inv);
+      free(host_out_final);
+      free(host_out_inv_classic);
+      free(host_out_final_classic);
+      free(host_out_steps);
+      free(host_out_steps_high);
+      free(host_out_steps_classic);
+      free(host_out_steps_classic_high);
+      CUDA_CHECK(cudaFree(d_out_inv));
+      CUDA_CHECK(cudaFree(d_out_final));
+      CUDA_CHECK(cudaFree(d_out_inv_classic));
+      CUDA_CHECK(cudaFree(d_out_final_classic));
+      CUDA_CHECK(cudaFree(d_out_steps));
+      CUDA_CHECK(cudaFree(d_out_steps_high));
+      CUDA_CHECK(cudaFree(d_out_steps_classic));
+      CUDA_CHECK(cudaFree(d_out_steps_classic_high));
+      CUDA_CHECK(cudaFree(d_numbers));
+      CUDA_CHECK(cudaFree(d_sample_indices));
+    }
+  }
 }
 
 #endif /* USE_CUDA_BACKEND */

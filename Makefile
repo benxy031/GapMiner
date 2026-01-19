@@ -10,12 +10,19 @@ CXXFLAGS  = -Wall -Wextra -c -Winline -Wformat -Wformat-security \
 CUDA_HOME ?= /usr/local/cuda
 CUDA_INC   = $(CUDA_HOME)/include
 CUDA_LIB   = $(CUDA_HOME)/lib64
-CUDA_ARCH ?= sm_70
+CUDA_ARCH ?= sm_86
 NVCCFLAGS ?= -std=c++14 -O3 -arch=$(CUDA_ARCH) -Xcompiler "-fPIC -pthread" -I$(CUDA_INC)
 LDFLAGS   = -lm -lcrypto -lmpfr -lgmp -pthread -lcurl -ljansson \
 					  -L/usr/lib/x86_64-linux-gnu -lOpenCL
 CUDA_LDFLAGS = -L$(CUDA_LIB) -lcudart
 OTFLAGS   = -O3 -march=skylake -mtune=skylake -mavx2 -mfma -ffast-math -fPIC -pipe
+
+
+# Ensure C++ compilation units see the CUDA backend macro when building the
+# CUDA binary target so host/result types match the device kernels.
+ifneq ($(filter gapminer-cuda,$(MAKECMDGOALS)),)
+CXXFLAGS += -DUSE_CUDA_BACKEND -I$(CUDA_INC)
+endif
 
 
 

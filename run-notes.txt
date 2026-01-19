@@ -1,0 +1,76 @@
+2026-01-14 GPU sieve notes
+--------------------------
+Run configuration: `-w 10240 -s 110000000 --cuda-sieve-proto`
+- Large work queue (10,240 items) keeps up to ~5.2M candidate offsets staged
+  when `--num-gpu-tests` stays at 8.
+- Sieve size 110M means each `SieveItem` window covers 110 million offsets;
+  copying that bitmap to CUDA per window costs ~14 MB per transfer, so overall
+  PCIe traffic increases. Expect a trade-off: larger windows produce more
+  candidates per kernel launch but take longer for the CPU sieve thread to
+  prepare and copy.
+- If `GPU queue depth` logs still drop near zero, consider bumping
+  `--num-gpu-tests` or `--queue-size` so the GPU isn’t starved while the CPU
+  finishes the next window.
+
+2026-01-15 Fixed GPU batch sizing
+---------------------------------
+Removed the adaptive controller (`GPUWorkList::adjust_active_tests`) because it
+oscillated between 750/1000 tests and starved the queue. `GPU queue depth X/Y
+items using Z tests` now always reports the fixed batch size set by
+`-w/--work-items` (or the compiled default). Adjust `-w` directly when tuning;
+`-n/--num-gpu-tests` remains the count of Fermat iterations per offset bundle.
+If the queue still drains, raise `-w` or lighten sieve filtering instead of
+expecting the runtime to resize batches.
+
+2026-01-15 Batch prefilling
+---------------------------
+`GPUWorkList::create_candidates()` now waits up to ~5 ms for the queue to reach
+roughly 1/6 of its capacity before launching the next kernel. This avoids the
+"queue depth 1/XXXX" partial batches that used to leave the GPU idle and keeps
+each launch closer to the configured `-w` value. If the queue can’t reach that
+threshold (e.g. while draining during a block change), the wait expires and the
+GPU still processes whatever is available, so overall latency stays bounded.
+
+2026-01-15 GPU queue instrumentation
+------------------------------------
+`GPU-Items: XXX MB  avg: YYY tests  min: ZZZ tests` now reflects the queue just
+before each Fermat launch instead of the empty queue afterward. Stats ignore
+drained `GPUWorkItem`s, so `avg/min` only describe items with remaining tests.
+Expect these lines to pause briefly whenever batch prefilling waits for more
+work; that simply means the queue is being topped up so the GPU launches at the
+requested `-w/--work-items` size.
+
+2026-01-15 Adaptive CUDA sieve windows
+-------------------------------------
+- `gpu_work_thread` now groups multiple `SieveItem`s into a single CUDA launch
+  whenever the GPU queue is under ~60% full. The heuristic tops out at four
+  windows per launch so bitmap copies stay bounded while still amortizing PCIe
+  traffic.
+- `GPUFermat::prototype_sieve_batch()` reuses one bitmap/output buffer across
+  the group and records prefix offsets so each window’s Fermat offsets remain
+  identifiable downstream.
+- Windows that carry residue snapshots still run solo; mixing snapshot and
+  bitmap builds in the same kernel complicated synchronization and didn’t help
+  throughput in testing.
+- Extra verbose logs will emit `CUDA sieve prototype batched N windows; ...`
+  whenever batching occurs. If you never see batched windows, raise
+  `--work-items` or `--queue-size` so the heuristic has headroom to pull a few
+  extra items off the sieve queue before launching.
+
+2026-01-15 Bitmap-only CUDA batches
+-----------------------------------
+- After instrumenting the GPU prototype we now restrict CUDA batching to
+  windows that already exported a bitmap. Residue-snapshot windows bypass the
+  prototype code entirely and stick with the legacy CPU scan, which keeps each
+  CUDA launch homogeneous and prevents the compact-scan fallbacks that happened
+  when mixed window types rode the same batch.
+- Because the worker tracks which batch entry maps back to each `SieveItem`,
+  the host can deterministically log `CUDA sieve prototype batched N windows;`
+  or `CUDA sieve prototype compact scan fallback ...` for every bitmap-backed
+  launch. Snapshot windows still enqueue candidates; they just do so outside
+  the prototype path, so Fermat throughput is unchanged.
+- `--num-gpu-tests` continues to define how many sieve offsets the GPU results
+  thread drains before each `fermat_gpu()` call. Pair it with a larger
+  `--work-items` value when you want deeper queues and higher launch occupancy;
+  when the queue dips under roughly 3k items the prefilling stage will wait up
+  to ~50 ms before running a partial batch.

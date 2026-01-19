@@ -1,0 +1,42 @@
+GPU sieve window transfers: diagnosing throttling
+==================================================
+
+When `--cuda-sieve-proto` is enabled, each sieve window copies the CPU bitmap to
+CUDA memory before the kernel runs. With large `-s/--sieve-size`, these copies
+can dominate runtime. The adaptive batcher can now stuff multiple windows into a
+single CUDA launch, but the total data volume stays the same—so if transfers are
+the bottleneck, batching mostly hides latency, it doesn’t remove it. To see if
+transfers are the bottleneck:
+
+1. **Enable extra-verbose logs (`-e`).** After every window you’ll see:
+     - `CUDA sieve prototype window ... candidates=...`
+     - `GPU queue depth ...` lines from `create_candidates()`
+   If there’s a long delay between these logs, or if `GPU queue depth` keeps
+   reporting `0/len` immediately after a window finishes, the GPU is idling
+   waiting for the next copy/launch cycle.
+
+2. **Measure copy time with CUDA events.** Temporarily wrap
+   `sievePrototypeBitmap.copyToDevice()` and `sievePrototypeOutput.copyToHost()`
+   with `cudaEventRecord`/`cudaEventElapsedTime` to log exact transfer durations.
+   If these approach or exceed the GPU kernel execution time, the PCIe link is
+   throttling the pipeline.
+
+3. **Watch PCIe utilization via `nvidia-smi dmon` or Nsight Systems.** High
+   `pcie_tx/rx` coupled with low SM utilization indicates the GPU is mostly
+   handling transfers.
+
+4. **Reduce `-s` or chunk windows.** If lowering the sieve size results in smoother
+   queue depth graphs (no long zeros) and higher tests/sec, the previous window
+   copies were too large. Even with batching, once a single window copy takes
+   longer than the GPU kernel itself, throughput tanks.
+
+5. **Overlap copies with compute.** Using two CUDA streams (already present) can
+   overlap bitmap copies for window N+1 with kernel execution for window N. The
+   batch mode front-loads all bitmap copies for the group, so you’ll effectively
+   overlap “batch N” transfers with “batch N-1” compute. If overlap doesn’t
+   increase throughput, the copies are the limiting factor.
+
+Collecting these signals will confirm whether the bitmap transfers are gating
+performance. If they are, consider either shrinking the sieve window, using
+pinned host memory, or moving more of the sieve construction to the GPU to avoid
+per-window copies altogether.
