@@ -1005,7 +1005,7 @@ __global__ void montgomeryTraceKernel(const uint32_t *numbers,
   BigInt r2;
   compute_r2(n, r2);
 
-  uint32_t op1_local[kOperandSize];
+  uint32_t op1_local[kOperandSize * 2] = {0};
   uint32_t op2_local[kOperandSize];
   uint32_t mod_local[kOperandSize];
   #pragma unroll
@@ -1165,19 +1165,7 @@ __device__ void montgomery_mul_unrolled(const BigInt &a,
                                          const BigInt &mod,
                                          uint32_t nPrime,
                                          BigInt &out) {
-  uint32_t op1_local[kOperandSize];
-  uint32_t op2_local[kOperandSize];
-  uint32_t mod_local[kOperandSize];
-  #pragma unroll
-  for (int i = 0; i < kOperandSize; ++i) {
-    op1_local[i] = a.limb[i];
-    op2_local[i] = b.limb[i];
-    mod_local[i] = mod.limb[i];
-  }
-  monMul320_words(op1_local, op2_local, mod_local, nPrime);
-  #pragma unroll
-  for (int i = 0; i < kOperandSize; ++i)
-    out.limb[i] = op1_local[i];
+  montgomery_mul(a, b, mod, nPrime, out);
 }
 
 __device__ __forceinline__ void montgomery_mul_fast(const BigInt &a,
@@ -1185,9 +1173,8 @@ __device__ __forceinline__ void montgomery_mul_fast(const BigInt &a,
                                                     const BigInt &mod,
                                                     uint32_t nPrime,
                                                     BigInt &out) {
-  // Fallback to the classic, verified implementation for correctness.
-  // This replaces the unrolled/fast path when debugging accumulator/carry issues.
-  montgomery_mul(a, b, mod, nPrime, out);
+  // Test the unrolled implementation.
+  montgomery_mul_unrolled(a, b, mod, nPrime, out);
 }
 
 __device__ __forceinline__ int compare_ext(const uint32_t *value,
