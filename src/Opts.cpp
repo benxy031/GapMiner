@@ -146,6 +146,7 @@ bitmap_pool_buffers(NULL, "--bitmap-pool-buffers", "override bitmap buffer pool 
 snapshot_pool_buffers(NULL, "--snapshot-pool-buffers", "override CUDA residue snapshot pool size", true),
 gpu_launch_divisor(NULL, "--gpu-launch-divisor", "override GPU launch divisor (default 6, lower = faster launches)", true),
 gpu_launch_wait_ms(NULL, "--gpu-launch-wait-ms", "maximum wait in ms before forcing a partial GPU batch (default 50)", true),
+  min_gap(NULL, "--min-gap", "minimum prime gap length to accept (overrides auto calculation)", true),
 #endif
 calc_ctr(  NULL, "--calc-ctr",       "calculate a chinese remainder theorem file",    false),
 ctr_strength(NULL, "--ctr-strength", "more = longer time and mybe better result",     true),
@@ -271,6 +272,9 @@ license(   "-v", "--license",        "show license of this program",            
   if (gpu_launch_wait_ms.active)
     gpu_launch_wait_ms.arg = get_arg(gpu_launch_wait_ms.short_opt,
                                      gpu_launch_wait_ms.long_opt);
+  min_gap.active = has_arg(min_gap.short_opt, min_gap.long_opt);
+  if (min_gap.active)
+    min_gap.arg = get_arg(min_gap.short_opt, min_gap.long_opt);
 #endif    
 
   calc_ctr.active = has_arg(calc_ctr.short_opt, calc_ctr.long_opt);
@@ -425,6 +429,9 @@ string Opts::get_help()  {
 
   ss << "      " << left << setw(18);
   ss << gpu_launch_wait_ms.long_opt << "  " << gpu_launch_wait_ms.description << "\n\n";
+
+  ss << "      " << left << setw(18);
+  ss << min_gap.long_opt << "  " << min_gap.description << "\n\n";
 #endif  
 
   ss << "      " << left << setw(18);

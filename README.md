@@ -105,11 +105,12 @@ Both miners expose the same CLI surface; simply run the binary you built (`bin/g
 
  - `-w  --work-items [NUM]` GPU batch size (candidates launched per Fermat
    cycle). Higher values keep the CUDA queue deeper at the cost of more device
-   memory per batch.
+   memory per batch. For RTX 3060: start with 4096-8192.
 
  - `-n  --num-gpu-tests [NUM]` number of sieve offsets drained from the queue
    before each GPU kernel launch. Raise this alongside `-w` when the logs show
-   repeated “queue depth ... using 110 tests (partial batch)” messages.
+   repeated "queue depth ... using 110 tests (partial batch)" messages.
+   For RTX 3060: start with 32-64.
 
  - `-z  --queue-size [NUM]` override for the `GPUWorkList` capacity. Leaving it
    unset keeps the auto-sized depth of `work-items * GPU_group_size /
@@ -204,6 +205,13 @@ These changes are primarily diagnostic and ordering fixes to make the CUDA
 prototype easier to compare against the OpenCL path and to reduce CLI noise
 while keeping full trace logs available in the `tests` extra-verbose file.
 
+- Recent kernel optimizations (Jan 2026):
+  - `locate_window()` function optimized with binary search (O(log n)) instead
+    of linear search (O(n)) for better performance with large window counts.
+  - `sievePrototypeScanKernel` reverted to atomicAdd-based implementation for
+    correctness and stability, avoiding shared memory layout bugs that caused
+    illegal memory access and reduced batching efficiency.
+
 See [sievePrototypeKernel.txt](sievePrototypeKernel.txt) and
 [run-notes.txt](run-notes.txt) for deeper dive notes, troubleshooting tips, and
 in-flight limitations.
@@ -256,6 +264,40 @@ For CUDA users, aligning the total candidates per launch to the kernel's block s
 - **Tuning notes**: Prefer to keep total candidates per launch aligned to the device block size and tune the trio `--work-items`, `--num-gpu-tests`, and `--queue-size` together. Use `--gpu-launch-divisor` and `--gpu-launch-wait-ms` to control batching latency vs. queue depth.
 
 These details reflect the current CUDA sources (`src/CUDAFermat.cu`, `src/HybridSieve.cpp`) and aim to help with tuning and debugging the CUDA backend.
+
+### GPU-Specific Tuning Guide
+
+#### NVIDIA RTX 3060 Optimization
+The RTX 3060 (3584 CUDA cores, 28 SMs, 12GB GDDR6) works best with these parameter ranges:
+
+- **--work-items (-w)**: 4096-8192 (start at 6144)
+- **--num-gpu-tests (-n)**: 32-64 (start at 48)  
+- **--queue-size (-z)**: 16384-32768 (start at 24576)
+- **--bitmap-pool-buffers**: 2048-4096 (start at 3072)
+
+**Example RTX 3060 configuration:**
+```bash
+./bin/gapminer-cuda -o pool.url -p port -u user -x pass -g -a nvidia \
+  -w 6144 -n 48 --cuda-sieve-proto \
+  --sieve-size 12000000 --sieve-primes 2000000 \
+  --queue-size 24576 --bitmap-pool-buffers 3072 \
+  --snapshot-pool-buffers 64 --gpu-launch-divisor 16 \
+  --gpu-launch-wait-ms 25 -e
+```
+
+**Tuning methodology:**
+1. Start with conservative values (-w 4096, -n 32)
+2. Increase -w by 1024 until performance drops or memory usage exceeds 10GB
+3. Adjust -n to maintain 60-80% queue depth
+4. Increase --queue-size if you see "waiting to batch" messages
+5. Monitor with `nvidia-smi dmon` for PCIe utilization
+6. **Troubleshooting queue starvation**: If you see frequent "waiting to batch" messages, the GPU is consuming work faster than CPU can produce it:
+   - Increase `--gpu-launch-divisor` (higher values = lower launch threshold, e.g., 24-32)
+   - Increase `--gpu-launch-wait-ms` (longer wait for batches, e.g., 100-200ms)
+   - Reduce `-w` (fewer work items per GPU launch)
+   - Increase `--sieve-size` and `--sieve-primes` (faster CPU sieve generation)
+
+**Expected performance:** 200k-400k tests/second, 80-95% GPU utilization, 6-10GB memory usage.
 
 ### OpenCL Backend Details
 

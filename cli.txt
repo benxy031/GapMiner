@@ -4,3 +4,21 @@
 -o 127.0.0.1 -p 31397 -u benxy031 -x xx --use-gpu -a nvidia -w 2048 -t 1 -f 45 --num-gpu-tests 21 --extra-verbose --cuda-sieve-proto --sieve-size 13000000 --sieve-primes 2000000 --share-log --bitmap-pool-buffers 2200 --snapshot-pool-buffers 68 --gpu-launch-divisor 12 --gpu-launch-wait-ms 3 --queue-size 54000
 
 ./gapminer-cuda -o 127.0.0.1 -p 31397 -u benxy031 -x xx --use-gpu -a nvidia -w 8096 -t 1 -f 45 --num-gpu-tests 64 --extra-verbose --bitmap-pool-buffers 1024 --sieve-size 14000000 --sieve-primes 1000000 --queue-size 22000 --share-log
+
+ ./gapminer-cuda -o 127.0.0.1 -p 31397 -u benxy031 -x xx --use-gpu -a nvidia -w 3072 -t 1 -f 45 --num-gpu-tests 38 --cuda-sieve-proto --sieve-size 13000000 --sieve-primes 3000000 --share-log --bitmap-pool-buffers 3072 --snapshot-pool-buffers 64  --gpu-launch-wait-ms 50 --queue-size 28000 --gpu-launch-divisor 32 -e
+ 
+ ./bin/gapminer-cuda -o 127.0.0.1 -p 31397 -u benxy031 -x xx \
+  -g -a nvidia -w 6144 -n 48 --cuda-sieve-proto \
+  --sieve-size 12000000 --sieve-primes 2000000 \
+  --queue-size 24576 --bitmap-pool-buffers 3072 \
+  --snapshot-pool-buffers 64 --gpu-launch-divisor 16 \
+  --gpu-launch-wait-ms 25 -e
+  
+  ./gapminer-cuda -o 127.0.0.1 -p 31397 -u benxy031 -x xx \
+  -g -a nvidia -w 6144 -n 96 --cuda-sieve-proto \
+  --sieve-size 18000000 --sieve-primes 2500000 \
+  --gpu-launch-divisor 32 --gpu-launch-wait-ms 200 -e
+  
+  
+  ./gapminer-cuda -o 127.0.0.1 -p 31397 -u benxy031 -x xx --use-gpu -a nvidia -w 13216 -t 1 -f 45 --num-gpu-tests 48 --cuda-sieve-proto --sieve-size 16000000 --sieve-primes 5400000 --share-log --bitmap-pool-buffers 3072 --snapshot-pool-buffers 64  --gpu-launch-wait-ms 50 --queue-size 28000 --gpu-launch-divisor 32 -e
+

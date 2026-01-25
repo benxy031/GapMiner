@@ -33,6 +33,8 @@ Kernel Behavior (`src/CUDAFermat.cu`)
   removes the previous 32-bit overflow limit on large searches.
 - The host side compacts these offsets into a tightly packed vector before
   enqueuing them.
+- `locate_window()` function optimized with binary search (O(log n)) instead
+  of linear search (O(n)) for better performance with large window counts.
 
 Current Scope
 -------------
@@ -102,6 +104,44 @@ Determinism, diagnostics and recent edits (Jan 2026)
   provided `prime_base`, `target` and list of offsets. Use this to determinis-
   tically compare difficulties between CPU/OpenCL/CUDA for identical offsets.
 
+- Kernel optimizations (Jan 2026): `locate_window()` function optimized with
+  binary search (O(log n)) instead of linear search (O(n)) for better performance
+  with large window counts. `sievePrototypeScanKernel` reverted to atomicAdd-based
+  implementation for correctness and stability, avoiding shared memory layout
+  bugs that caused illegal memory access and reduced batching efficiency.
+
 These updates are diagnostic and ordering fixes only – they do not change the
 core PoW arithmetic. They make debugging and parity testing between backends
 much easier while keeping normal miner output uncluttered.
+
+Runtime / stream model changes (Jan 2026)
+-----------------------------------------
+- Dynamic CUDA streams: `GPUFermat` now allocates a configurable number of
+  CUDA streams instead of a fixed two-element array. The constructor and
+  `get_instance()` gained an optional `streamCount` parameter (default 2)
+  so callers can request more or fewer streams at creation time.
+- `GPUFermat::get_stream_count()` was added to read the active stream count
+  at runtime (useful for diagnostics and telemetry).
+- Extra-verbose stream handles: when extra-verbose logging (`-e`) is enabled,
+  the CUDA initializer prints the number of streams and their opaque handles
+  (e.g. `CUDA streams count=2 handles: [0]=0x5d815dead740 [1]=0x5d815dff5b10`).
+  Those hex values are internal `cudaStream_t` identifiers (opaque handles)
+  and confirm successful stream creation — they are not addresses you should
+  dereference or perform arithmetic on.
+- Impact on the pipeline: `run_cuda()` round-robins chunks across the active
+  streams (`streams[chunkIndex % streamCount]`) so increasing `streamCount`
+  can increase host→device / kernel concurrency and the effective GPU queue
+  depth. Conversely, a lower `streamCount` reduces outstanding async ops and
+  memory pressure.
+
+How to use / adjust
+--------------------
+- To request a different stream count, modify the callsite that creates the
+  singleton (normally `GPUFermat::get_instance(...)` in `src/main.cpp`) and
+  pass the desired `streamCount`. The constructor default remains 2 for
+  backward compatibility.
+- Alternatively, read `get_stream_count()` to log or assert runtime
+  configuration without altering construction callsites.
+
+These changes are low-risk and focused on orchestration (streams and logging)
+— they do not change kernel logic or candidate semantics.

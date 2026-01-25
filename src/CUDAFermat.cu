@@ -30,7 +30,8 @@ unsigned GPUFermat::get_block_size() {
 namespace {
 constexpr int kOperandSize = 10;
 constexpr unsigned kCudaBlockSize = 512u;
-constexpr int kSmallPrimeCount = 16;
+// Increase small-prime quick-filter count to improve cheap composite rejection on device
+constexpr int kSmallPrimeCount = 64;
 constexpr int kMontgomeryShiftBits = 2 * kOperandSize * 32;  // 640
 
 template <typename T>
@@ -45,10 +46,15 @@ const T *buffer_cast(const uint8_t *ptr) {
 
 using ResultWord = GPUFermat::ResultWord;
 
-constexpr uint32_t kSmallPrimesHost[kSmallPrimeCount] = {3u,  5u,  7u,  11u,
-                                                         13u, 17u, 19u, 23u,
-                                                         29u, 31u, 37u, 41u,
-                                                         43u, 47u, 53u, 59u};
+constexpr uint32_t kSmallPrimesHost[kSmallPrimeCount] = {
+  3u, 5u, 7u, 11u, 13u, 17u, 19u, 23u,
+  29u, 31u, 37u, 41u, 43u, 47u, 53u, 59u,
+  61u, 67u, 71u, 73u, 79u, 83u, 89u, 97u,
+  101u, 103u, 107u, 109u, 113u, 127u, 131u, 137u,
+  139u, 149u, 151u, 157u, 163u, 167u, 173u, 179u,
+  181u, 191u, 193u, 197u, 199u, 211u, 223u, 227u,
+  229u, 233u, 239u, 241u, 251u, 257u, 263u, 269u,
+  271u, 277u, 281u, 283u, 293u, 307u, 311u, 313u};
 
 struct PrototypeWindowDesc {
   uint32_t word_start;
@@ -59,13 +65,17 @@ struct PrototypeWindowDesc {
 };
 
 __device__ __constant__ uint32_t kSmallPrimesDevice[kSmallPrimeCount] = {
-    3u,  5u,  7u,  11u, 13u, 17u, 19u, 23u,
-    29u, 31u, 37u, 41u, 43u, 47u, 53u, 59u};
-__device__ __constant__ uint32_t kPrimeReciprocalsDevice[kSmallPrimeCount] = {
-    0x55555556u, 0x33333334u, 0x24924925u, 0x1745D175u,
-    0x13B13B14u, 0x0F0F0F10u, 0x0D79435Fu, 0x0B21642Du,
-    0x08D3DCB1u, 0x08421085u, 0x06EB3E46u, 0x063E7064u,
-    0x05F417D1u, 0x0572620Bu, 0x04D4873Fu, 0x0456C798u};
+  3u, 5u, 7u, 11u, 13u, 17u, 19u, 23u,
+  29u, 31u, 37u, 41u, 43u, 47u, 53u, 59u,
+  61u, 67u, 71u, 73u, 79u, 83u, 89u, 97u,
+  101u, 103u, 107u, 109u, 113u, 127u, 131u, 137u,
+  139u, 149u, 151u, 157u, 163u, 167u, 173u, 179u,
+  181u, 191u, 193u, 197u, 199u, 211u, 223u, 227u,
+  229u, 233u, 239u, 241u, 251u, 257u, 263u, 269u,
+  271u, 277u, 281u, 283u, 293u, 307u, 311u, 313u};
+// Reciprocals are filled at runtime in uploadPrimeBaseConstants to keep values
+// computed correctly for the prime list size and to avoid manual hex constants.
+__device__ __constant__ uint32_t kPrimeReciprocalsDevice[kSmallPrimeCount];
 __device__ __constant__ uint32_t kPrimeBaseConst[kOperandSize];
 __device__ __constant__ uint32_t kHighResiduesConst[kSmallPrimeCount];
 
@@ -1350,11 +1360,18 @@ __global__ void sievePrototypeKernel(const uint32_t *bitmap,
 __device__ __forceinline__ uint32_t locate_window(uint32_t idx,
                                                   const uint32_t *prefix,
                                                   uint32_t window_count) {
-  for (uint32_t w = 0; w < window_count; ++w) {
-    const uint32_t start = prefix[w];
-    const uint32_t end = prefix[w + 1];
-    if (idx >= start && idx < end)
-      return w;
+  // Binary search for better performance with many windows
+  uint32_t left = 0;
+  uint32_t right = window_count;
+  while (left < right) {
+    uint32_t mid = (left + right) / 2;
+    if (idx < prefix[mid]) {
+      right = mid;
+    } else if (idx >= prefix[mid + 1]) {
+      left = mid + 1;
+    } else {
+      return mid;
+    }
   }
   return window_count;
 }
@@ -1701,12 +1718,13 @@ void GPUFermat::CudaBuffer::copyToHost(cudaStream_t stream,
 
 GPUFermat::GPUFermat(unsigned device_id,
                      const char *platformId,
-                     unsigned workItems)
+                     unsigned workItems,
+                     unsigned streamCount)
     : workItems(workItems),
       elementsNum(0),
       numberLimbsNum(0),
       groupsNum(0),
-      streams{nullptr, nullptr},
+      streams(),
       computeUnits(0),
       smallPrimeResidues{},
       prototypeOffsets(),
@@ -1718,6 +1736,12 @@ GPUFermat::GPUFermat(unsigned device_id,
   log_str("Creating CUDA GPUFermat", LOG_D);
   if (workItems == 0)
     throw std::runtime_error("workItems must be greater than zero");
+  // prepare requested number of streams before CUDA init so init_cuda
+  // can create them
+  if (streamCount == 0)
+    streamCount = 1;
+  streams.resize(static_cast<size_t>(streamCount));
+
   if (!init_cuda(device_id, platformId))
     throw std::runtime_error("Failed to initialize CUDA backend");
 
@@ -1778,6 +1802,14 @@ bool GPUFermat::init_cuda(unsigned device_id, const char *platformId) {
   for (cudaStream_t &s : streams)
     CUDA_CHECK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
 
+  if (Opts::get_instance() && Opts::get_instance()->has_extra_vb()) {
+    std::ostringstream ss;
+    ss << get_time() << " CUDA streams count=" << streams.size() << " handles:";
+    for (size_t i = 0; i < streams.size(); ++i)
+      ss << " [" << i << "]=" << streams[i];
+    extra_verbose_log(ss.str());
+  }
+
   pthread_mutex_lock(&io_mutex);
   cout << get_time() << "Using CUDA GPU " << device_id << " [" << props.name
        << "] with " << computeUnits << " SMs" << endl;
@@ -1804,13 +1836,26 @@ void GPUFermat::uploadPrimeBaseConstants() {
                                 operandSize * sizeof(uint32_t),
                                 0,
                                 cudaMemcpyHostToDevice));
+  // ensure host-side residue vector matches prime count
+  smallPrimeResidues.assign(kSmallPrimeCount, 0u);
+  std::vector<uint32_t> prime_reciprocals;
+  prime_reciprocals.resize(kSmallPrimeCount);
 
-  for (int i = 0; i < kSmallPrimeCount; ++i)
+  for (int i = 0; i < kSmallPrimeCount; ++i) {
     smallPrimeResidues[i] =
         mod_high_part_host(prime_base_words, kSmallPrimesHost[i]);
+    // recip = floor(2^32 / p) + 1 for use with __umulhi fast division
+    const uint32_t p = kSmallPrimesHost[i];
+    prime_reciprocals[i] = static_cast<uint32_t>(((uint64_t(1) << 32) / p) + 1ull);
+  }
 
   CUDA_CHECK(cudaMemcpyToSymbol(kHighResiduesConst,
                                 smallPrimeResidues.data(),
+                                kSmallPrimeCount * sizeof(uint32_t),
+                                0,
+                                cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpyToSymbol(kPrimeReciprocalsDevice,
+                                prime_reciprocals.data(),
                                 kSmallPrimeCount * sizeof(uint32_t),
                                 0,
                                 cudaMemcpyHostToDevice));
@@ -1952,11 +1997,12 @@ bool GPUFermat::run_compact_scan(uint32_t window_count,
 
 GPUFermat *GPUFermat::get_instance(unsigned device_id,
                                    const char *platformId,
-                                   unsigned workItems) {
+                                   unsigned workItems,
+                                   unsigned streamCount) {
   pthread_mutex_lock(&creation_mutex);
   if (!initialized && device_id != static_cast<unsigned>(-1) &&
       platformId != nullptr && workItems != 0) {
-    only_instance = new GPUFermat(device_id, platformId, workItems);
+    only_instance = new GPUFermat(device_id, platformId, workItems, streamCount);
     initialized = true;
   }
   pthread_mutex_unlock(&creation_mutex);
@@ -2526,6 +2572,10 @@ const uint32_t *GPUFermat::prototype_window_offsets() const {
 
 uint32_t GPUFermat::prototype_window_count() const {
   return lastPrototypeWindowCount;
+}
+
+unsigned GPUFermat::get_stream_count() const {
+  return static_cast<unsigned>(streams.size());
 }
 
 void GPUFermat::benchmark_montgomery_mul() {

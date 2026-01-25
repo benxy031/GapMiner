@@ -160,6 +160,25 @@ void GPUFermat::initializeBuffers() {
   numbers.init(elementsNum, CL_MEM_READ_WRITE);
   gpuResults.init(numberLimbsNum, CL_MEM_READ_WRITE);
   primeBase.init(operandSize, CL_MEM_READ_WRITE);
+  // Initialize small primes and reciprocals used by the OpenCL kernels
+  const unsigned HOST_SMALL_PRIME_COUNT = 4;
+  smallPrimes.init(HOST_SMALL_PRIME_COUNT, CL_MEM_READ_WRITE);
+  primeReciprocals.init(HOST_SMALL_PRIME_COUNT, CL_MEM_READ_WRITE);
+
+  // default small primes (skip 2)
+  uint32_t defaultPrimes[HOST_SMALL_PRIME_COUNT] = {3u, 5u, 7u, 11u};
+  for (unsigned i = 0; i < HOST_SMALL_PRIME_COUNT; ++i)
+    smallPrimes.HostData[i] = defaultPrimes[i];
+
+  // recip = floor(2^32 / p) + 1
+  for (unsigned i = 0; i < HOST_SMALL_PRIME_COUNT; ++i) {
+    uint32_t p = smallPrimes.HostData[i];
+    primeReciprocals.HostData[i] = static_cast<uint32_t>(((uint64_t(1) << 32) / p) + 1ull);
+  }
+
+  // copy small-prime buffers to device
+  smallPrimes.copyToDevice(queue);
+  primeReciprocals.copyToDevice(queue);
 }
 
 GPUFermat::ResultWord *GPUFermat::get_results_buffer() {
@@ -564,10 +583,16 @@ void GPUFermat::run_fermat(cl_command_queue queue,
   gpuResults.copyToDevice(queue);
   primeBase.copyToDevice(queue);
 
+  // ensure small-prime buffers are on device
+  smallPrimes.copyToDevice(queue);
+  primeReciprocals.copyToDevice(queue);
+
   OCL(clSetKernelArg(kernel, 0, sizeof(cl_mem), &numbers.DeviceData));
   OCL(clSetKernelArg(kernel, 1, sizeof(cl_mem), &gpuResults.DeviceData));
   OCL(clSetKernelArg(kernel, 2, sizeof(cl_mem), &primeBase.DeviceData));
   OCL(clSetKernelArg(kernel, 3, sizeof(elementsNum), &elementsNum));
+  OCL(clSetKernelArg(kernel, 4, sizeof(cl_mem), &smallPrimes.DeviceData));
+  OCL(clSetKernelArg(kernel, 5, sizeof(cl_mem), &primeReciprocals.DeviceData));
   
   size_t globalThreads[1] = { groupsNum*GroupSize };
   size_t localThreads[1] = { GroupSize };

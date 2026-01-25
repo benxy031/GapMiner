@@ -88,6 +88,10 @@ class GPUFermat {
     
     /* the prime base */
     clBuffer primeBase;
+    /* small primes for quick filtering */
+    clBuffer smallPrimes;
+    /* reciprocals for fast_mod_u32 quick division */
+    clBuffer primeReciprocals;
 
     /* the opencl program */
     cl_program gProgram;

@@ -100,6 +100,7 @@ class Opts {
     SingleOpt snapshot_pool_buffers;
   SingleOpt gpu_launch_divisor;
   SingleOpt gpu_launch_wait_ms;
+  SingleOpt min_gap;
 #endif    
     SingleOpt calc_ctr;
     SingleOpt ctr_strength;
@@ -209,6 +210,9 @@ class Opts {
 
     bool has_gpu_launch_wait_ms()   { return gpu_launch_wait_ms.active; }
     string get_gpu_launch_wait_ms() { return gpu_launch_wait_ms.arg;    }
+    
+    bool has_min_gap()              { return min_gap.active;          }
+    string get_min_gap()            { return min_gap.arg;             }
 #endif    
 
     bool has_calc_ctr()         { return calc_ctr.active;       }

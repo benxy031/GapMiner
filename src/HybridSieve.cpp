@@ -915,9 +915,13 @@ void *HybridSieve::gpu_work_thread(void *args) {
         params.sieve_round = static_cast<uint32_t>(
             std::min<sieve_t>(item->sieve_round,
                               static_cast<sieve_t>(numeric_limits<uint32_t>::max())));
-        params.min_gap = static_cast<uint32_t>(
-            std::min<sieve_t>(min_len,
-                              static_cast<sieve_t>(numeric_limits<uint32_t>::max())));
+        if (opts->has_min_gap()) {
+          params.min_gap = static_cast<uint32_t>(atoi(opts->get_min_gap().c_str()));
+        } else {
+          params.min_gap = static_cast<uint32_t>(
+              std::min<sieve_t>(min_len,
+                                static_cast<sieve_t>(numeric_limits<uint32_t>::max())));
+        }
         if (params.window_size == 0)
           continue;
         batch_params.push_back(params);

@@ -162,13 +162,6 @@ __kernel void multiplyBenchmark352(__global uint32_t *m1,
 }
 
 #define SMALL_PRIME_COUNT 4
-__constant uint kSmallPrimes[SMALL_PRIME_COUNT] = {3, 5, 7, 11};
-__constant uint kPrimeReciprocals[SMALL_PRIME_COUNT] = {
-  0x55555556u, // ceil(2^32 / 3)
-  0x33333334u, // ceil(2^32 / 5)
-  0x24924925u, // ceil(2^32 / 7)
-  0x1745D175u  // ceil(2^32 / 11)
-};
 
 inline uint mod_high_part(__global uint32_t *prime_base, uint prime) {
   ulong acc = 0;
@@ -186,7 +179,9 @@ inline uint fast_mod_u32(uint value, uint prime, uint recip) {
 __kernel void fermatTest320(__global uint32_t *restrict numbers,
                             __global uint32_t *restrict out,
                             __global uint32_t *restrict prime_base,
-                            unsigned elementsNum)
+                            unsigned elementsNum,
+                            __global const uint *kSmallPrimes,
+                            __global const uint *kPrimeReciprocals)
 {
 #define OperandSize 10  
   unsigned globalSize = get_global_size(0);

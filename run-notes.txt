@@ -1,3 +1,16 @@
+2026-01-22 CUDA Sieve Kernel Optimizations
+---------------------------------------
+- `locate_window()` function in `src/CUDAFermat.cu` optimized with binary search
+  (O(log n)) instead of linear search (O(n)) for better performance with large
+  window counts. This improves efficiency when processing many sieve windows.
+- `sievePrototypeScanKernel` reverted to atomicAdd-based implementation for
+  correctness and stability. The previous shared memory parallel scan version
+  introduced illegal memory access bugs and reduced batching efficiency. The
+  atomic implementation maintains thread safety while avoiding complex shared
+  memory layout issues.
+- These changes prioritize correctness and performance over experimental
+  optimizations that introduced instability.
+
 2026-01-14 GPU sieve notes
 --------------------------
 Run configuration: `-w 10240 -s 110000000 --cuda-sieve-proto`

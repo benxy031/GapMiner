@@ -179,9 +179,7 @@ void *getwork_thread(void *arg) {
     const bool same_height = header->equal_block_height(new_header);
     const bool same_template = header->equal(new_header);
 
-    if (longpoll ||
-        !same_height ||
-        !same_template ||
+    if (!same_height ||
         time(NULL) >= work_time + 180) {
 
       miner->update_header(new_header);

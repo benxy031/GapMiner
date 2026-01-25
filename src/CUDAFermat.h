@@ -81,15 +81,15 @@ class GPUFermat {
   bool sievePrimesConfigured;
   uint32_t configuredPrimeCount;
 
-  std::array<cudaStream_t, 2> streams;
+  std::vector<cudaStream_t> streams;
   uint32_t computeUnits;
-  std::array<uint32_t, 16> smallPrimeResidues;
+  std::vector<uint32_t> smallPrimeResidues;
   std::vector<uint32_t> prototypeOffsets;
   std::vector<uint32_t> prototypeWindowOffsets;
   uint32_t lastPrototypeCount;
   uint32_t lastPrototypeWindowCount;
 
-  GPUFermat(unsigned device_id, const char *platformId, unsigned workItems);
+  GPUFermat(unsigned device_id, const char *platformId, unsigned workItems, unsigned streamCount = 2);
   ~GPUFermat();
 
   bool init_cuda(unsigned device_id, const char *platformId);
@@ -114,7 +114,8 @@ class GPUFermat {
  public:
   static GPUFermat *get_instance(unsigned device_id = static_cast<unsigned>(-1),
                                  const char *platformId = nullptr,
-                                 unsigned workItems = 0);
+                                 unsigned workItems = 0,
+                                 unsigned streamCount = 2);
   static unsigned get_group_size();
   static void destroy_instance();
 
@@ -139,6 +140,7 @@ class GPUFermat {
   uint32_t prototype_window_count() const;
   void benchmark();
   void test_gpu();
+  unsigned get_stream_count() const;
 };
 
 #endif /* GAPMINER_CUDA_FERMAT_H */
