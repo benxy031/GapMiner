@@ -142,7 +142,7 @@ void *getwork_thread(void *arg) {
   header->shift  = shift;
 
 #ifndef CPU_ONLY
-  if (opts->has_use_gpu())
+  if (opts->has_use_gpu() && !opts->has_shift())
     shift = 45;
 #endif    
   

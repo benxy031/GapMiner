@@ -101,7 +101,7 @@ Both miners expose the same CLI surface; simply run the binary you built (`bin/g
 
  - `-r  --sieve-primes [NUM]` number of primes to sieve
 
- - `-f  --shift [NUM]` the adder shift
+ - `-f  --shift [NUM]` the adder shift (default 20 for CPU, 45 for GPU)
 
  - `-w  --work-items [NUM]` GPU batch size (candidates launched per Fermat
    cycle). Higher values keep the CUDA queue deeper at the cost of more device
@@ -260,6 +260,7 @@ For CUDA users, aligning the total candidates per launch to the kernel's block s
 - **Operand / modulus size**: Montgomery arithmetic is implemented for a 320-bit operand (10 x 32-bit words). This corresponds to `gpu_op_size` / `kOperandSize = 10` in the CUDA code (320-bit montgomery operations).
 - **Device capacity (elementsNum)**: The GPU code queries the device per-launch capacity (internal `elementsNum`) and packs candidate offsets to fill the device rather than relying on a small hard-coded cap. This yields better throughput on modern cards.
 - **Experimental CUDA sieve prototype**: When `--cuda-sieve-proto` is enabled the miner batches up to several sieve windows per launch, supports residue-snapshot fallbacks, and requires proper sizing of the `--bitmap-pool-buffers` and `--snapshot-pool-buffers` settings to avoid falling back to CPU scans.
+- **Memory optimizations**: GPU buffers use pinned memory for faster PCIe transfers, with fallback to pageable memory. The prototype outputs candidates as sparse offset lists for efficient processing.
 - **Diagnostics & benchmarks**: The CUDA implementation includes diagnostic kernels and benchmark helpers (montgomery traces, candidate dumps, and `GPUFermat::benchmark_montgomery_mul()` / `GPUFermat::test_gpu()`) useful when investigating correctness or performance regressions. Enable extra-verbose logs (`-e`) to see prototype batching and related messages.
 - **Tuning notes**: Prefer to keep total candidates per launch aligned to the device block size and tune the trio `--work-items`, `--num-gpu-tests`, and `--queue-size` together. Use `--gpu-launch-divisor` and `--gpu-launch-wait-ms` to control batching latency vs. queue depth.
 
@@ -278,11 +279,11 @@ The RTX 3060 (3584 CUDA cores, 28 SMs, 12GB GDDR6) works best with these paramet
 **Example RTX 3060 configuration:**
 ```bash
 ./bin/gapminer-cuda -o pool.url -p port -u user -x pass -g -a nvidia \
-  -w 6144 -n 48 --cuda-sieve-proto \
-  --sieve-size 12000000 --sieve-primes 2000000 \
-  --queue-size 24576 --bitmap-pool-buffers 3072 \
-  --snapshot-pool-buffers 64 --gpu-launch-divisor 16 \
-  --gpu-launch-wait-ms 25 -e
+  -w 8192 -n 96 --cuda-sieve-proto \
+  --sieve-size 20000000 --sieve-primes 5000000 \
+  --queue-size 65536 --bitmap-pool-buffers 2048 \
+  --snapshot-pool-buffers 64 --gpu-launch-divisor 24 \
+  --gpu-launch-wait-ms 100 --min-gap 1000 -e
 ```
 
 **Tuning methodology:**

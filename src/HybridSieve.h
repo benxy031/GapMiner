@@ -298,6 +298,8 @@ class HybridSieve : public Sieve {
 
         /* use extra verbose ? */
         bool extra_verbose;
+        /* shift value for PoW */
+        uint16_t shift;
                                 uint32_t preferred_launch_divisor;
                                 uint32_t preferred_launch_max_wait_ms;
 
@@ -358,6 +360,9 @@ class HybridSieve : public Sieve {
 
         /* submits a given offset */
         bool submit(uint32_t offset);
+
+        /* sets the shift value */
+        void set_shift(uint16_t shift) { this->shift = shift; }
 
         /* clears the list */
         void clear();

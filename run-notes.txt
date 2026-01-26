@@ -11,6 +11,37 @@
 - These changes prioritize correctness and performance over experimental
   optimizations that introduced instability.
 
+2026-01-26 Memory and Transfer Optimizations
+--------------------------------------------
+- Pinned memory implemented for all GPU buffers in `CudaBuffer::init()` with
+  `prefer_pinned = true`. This enables faster PCIe transfers by using
+  `cudaHostAlloc` for host data, falling back to pageable memory if allocation
+  fails. Applied to sieve bitmaps, candidate outputs, and Fermat operands.
+- Sparse candidate representation: GPU sieve prototype outputs candidate offsets
+  as a compact list of uint32_t indices instead of a full bitmap, reducing
+  downstream processing overhead and enabling efficient batching.
+- These optimizations reduce RAM usage (e.g., RTX 3060 from 25GB to 7GB) and
+  improve transfer performance for the experimental CUDA sieve prototype.
+
+2026-01-26 RTX 3060 Optimized Config
+------------------------------------
+Tuned configuration for NVIDIA RTX 3060 with --cuda-sieve-proto:
+- Command: `./gapminer-cuda -o 127.0.0.1 -p 31397 -u user -x pass --use-gpu -a nvidia -w 8192 -n 96 --cuda-sieve-proto --sieve-size 20000000 --sieve-primes 5000000 --queue-size 65536 --bitmap-pool-buffers 2048 --snapshot-pool-buffers 64 --gpu-launch-divisor 24 --gpu-launch-wait-ms 100 --min-gap 1000 -e`
+- Performance: ~1.1M pps, ~4.8M tests/s, stable GPU batches (avg 96 tests), ~7GB RAM usage.
+- Key changes: Increased sieve params for faster CPU production, scaled buffer pools to reduce RAM from 25GB to 7GB, adjusted launch params for better batching.
+- Note: Standard CUDA (without --cuda-sieve-proto) may offer higher throughput (~2.2M pps), but proto provides experimental GPU sieve offloading with optimized tuning.
+
+2026-01-26 Configurable GPU Shift and Miller-Rabin Optimization
+---------------------------------------------------------------
+- GPU shift made configurable via `-f/--shift` option. Defaults to 45 for GPU
+  (20 for CPU) if not specified, allowing experimentation with different shift
+  values for performance tuning.
+- Miller-Rabin primality test rounds reduced from 45 to 25 in verification and
+  logging code. Provides ~44% faster checks with negligible false positive risk
+  (< 2^-50 error probability).
+- Tested with `-f 50`: Successfully found share with ratio 1.132816, confirming
+  configurable shift works correctly for custom values.
+
 2026-01-14 GPU sieve notes
 --------------------------
 Run configuration: `-w 10240 -s 110000000 --cuda-sieve-proto`

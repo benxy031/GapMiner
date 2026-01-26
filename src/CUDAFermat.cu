@@ -2774,7 +2774,7 @@ void GPUFermat::test_gpu() {
     mpz_add_ui(check, check, primes[i]);
     // mpz_probab_prime_p returns 0 for composite, >0 for (probable) prime.
     // Device `results` uses 1 => prime, 0 => composite. Map accordingly.
-    const uint8_t is_prime = (mpz_probab_prime_p(check, 45) != 0);
+    const uint8_t is_prime = (mpz_probab_prime_p(check, 25) != 0);
     // Device kernel writes 1 for probable prime, 0 for composite.
     expected[i] = is_prime ? 1u : 0u;
     mpz_clear(check);
@@ -2791,7 +2791,7 @@ void GPUFermat::test_gpu() {
         mpz_init(check2);
         mpz_import(check2, kOperandSize, -1, 4, 0, 0, prime_base);
         mpz_add_ui(check2, check2, primes[i]);
-        int cpu_res = mpz_probab_prime_p(check2, 45);
+        int cpu_res = mpz_probab_prime_p(check2, 25);
         char *num_hex = mpz_get_str(NULL, 16, check2);
         printf("[CUDA TEST] CPU mpz_probab_prime_p=%d num_hex=%s\n", cpu_res, num_hex);
         free(num_hex);

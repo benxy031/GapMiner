@@ -450,8 +450,15 @@ void HybridSieve::run_sieve(PoW *pow,
   running = true;
   sieve_queue->clear();
   
-  /* just to be sure */
-  pow->set_shift(45);
+  /* set shift, default to 45 for GPU */
+  if (Opts::get_instance()->has_shift()) {
+    pow->set_shift(atoi(Opts::get_instance()->get_shift().c_str()));
+  } else {
+    pow->set_shift(45);
+  }
+
+  if (gpu_list)
+    gpu_list->set_shift(pow->get_shift());
 
   mpz_t mpz_offset;
   mpz_init_set_ui64(mpz_offset, 0);
@@ -1435,7 +1442,7 @@ void HybridSieve::GPUWorkItem::set_prime(int16_t i, uint32_t prime_base[10]) {
           mpz_import(mpz, 10, -1, 4, 0, 0, prime_base);
           mpz_add_ui(mpz, mpz, next->offsets[0] - 2);
          
-          for (uint32_t n = 0; !mpz_probab_prime_p(mpz, 45) && n < 1000; n++)
+          for (uint32_t n = 0; !mpz_probab_prime_p(mpz, 25) && n < 1000; n++)
             mpz_sub_ui(mpz, mpz, 2);
          
           uint32_t real_start = mpz_get_ui(mpz) & 0xFFFFFFFF;
@@ -1454,7 +1461,7 @@ void HybridSieve::GPUWorkItem::set_prime(int16_t i, uint32_t prime_base[10]) {
             mpz_import(mpz, 10, -1, 4, 0, 0, prime_base);
             mpz_add_ui(mpz, mpz, offsets[len - 1]);
            
-            while (!mpz_probab_prime_p(mpz, 45))
+            while (!mpz_probab_prime_p(mpz, 25))
               mpz_sub_ui(mpz, mpz, 2);
            
             uint32_t real_end = mpz_get_ui(mpz) & 0xFFFFFFFF;
@@ -1605,7 +1612,7 @@ HybridSieve::GPUWorkList::GPUWorkList(uint32_t len,
   this->end           = NULL;
   this->running       = true;
   Opts *opts_local = Opts::get_instance();
-  this->extra_verbose = opts_local && opts_local->has_extra_vb();
+  this->shift = 45; // default
   auto parse_u32_option = [&](const char *flag,
                               const std::string &value,
                               uint32_t min_allowed,
@@ -2227,10 +2234,10 @@ void HybridSieve::GPUWorkList::parse_results(
           /* optional CPU verification of GPU-positive (limited samples) */
           if (extra_verbose && verify_checked < 8) {
             mpz_import(mpz_hash, 10, -1, 4, 0, 0, prime_base);
-            mpz_div_2exp(mpz_hash, mpz_hash, 45);
+            mpz_div_2exp(mpz_hash, mpz_hash, this->shift);
             mpz_set_ui(mpz_adder, candidates[i + n]);
             mpz_add(mpz_hash, mpz_hash, mpz_adder);
-            int cpu_res = mpz_probab_prime_p(mpz_hash, 45);
+            int cpu_res = mpz_probab_prime_p(mpz_hash, 25);
             std::ostringstream vss;
             vss << get_time() << " GPU-pos verify: idx=" << (i + n)
                 << " candidate=" << candidates[i + n]
@@ -2254,7 +2261,7 @@ void HybridSieve::GPUWorkList::parse_results(
 #ifdef DEBUG_SLOW
           mpz_import(mpz_hash, 10, -1, 4, 0, 0, prime_base);
           mpz_add_ui(mpz_hash, mpz_hash, cur->get_prime(this_count - n));
-          if (!mpz_probab_prime_p(mpz_hash, 45)) {
+          if (!mpz_probab_prime_p(mpz_hash, 25)) {
             cout << "[DD] in parse_results: prime test failed!!! i: " << i;
             cout << " n: " << n << " n_tests: " << this_count << endl;
           }
@@ -2264,7 +2271,7 @@ void HybridSieve::GPUWorkList::parse_results(
         else {
           mpz_import(mpz_hash, 10, -1, 4, 0, 0, prime_base);
           mpz_add_ui(mpz_hash, mpz_hash, cur->get_prime(this_count - n));
-          if (mpz_probab_prime_p(mpz_hash, 45)) {
+          if (mpz_probab_prime_p(mpz_hash, 25)) {
             cout << "[DD] in parse_results: composite test failed!!! i: ";
             cout << i << " n: " << n << " n_tests: " << this_count << endl;
           }
@@ -2296,10 +2303,10 @@ void HybridSieve::GPUWorkList::parse_results(
 #ifdef USE_CUDA_BACKEND
          if (extra_verbose) {
            mpz_import(mpz_hash, 10, -1, 4, 0, 0, prime_base);
-           mpz_div_2exp(mpz_hash, mpz_hash, 45);
+           mpz_div_2exp(mpz_hash, mpz_hash, this->shift);
            mpz_set_ui(mpz_adder, cur->get_start());
            mpz_add(mpz_hash, mpz_hash, mpz_adder);
-           int cpu_res = mpz_probab_prime_p(mpz_hash, 45);
+           int cpu_res = mpz_probab_prime_p(mpz_hash, 25);
            std::ostringstream ss_verify;
            ss_verify << get_time() << " submit-cpu-verify (extra-verbose, CUDA): offset=" << cur->get_start()
                      << " cpu_probab_prime_p=" << cpu_res;
@@ -2419,7 +2426,7 @@ void HybridSieve::calc_muls() {
 bool HybridSieve::GPUWorkList::submit(uint32_t offset) {
   
   mpz_import(mpz_hash, 10, -1, 4, 0, 0, prime_base);
-  mpz_div_2exp(mpz_hash, mpz_hash, 45);
+  mpz_div_2exp(mpz_hash, mpz_hash, this->shift);
   mpz_set_ui(mpz_adder, offset);
 
   static uint64_t submit_attempts = 0;
@@ -2446,7 +2453,7 @@ bool HybridSieve::GPUWorkList::submit(uint32_t offset) {
   mpz_nextprime(next, mpz);
   mpz_sub(next, next, mpz);
 
-  if (!mpz_probab_prime_p(mpz, 45)) {
+  if (!mpz_probab_prime_p(mpz, 25)) {
     cout << "[DD] submit: prime test failed!!!\n";
   } else
     cout << "[DD] submit: prime test OK len: " << mpz_get_ui64(next) << endl;
@@ -2457,10 +2464,10 @@ bool HybridSieve::GPUWorkList::submit(uint32_t offset) {
   mpz_clear(next);
 #endif
 
-  PoW pow(mpz_hash, 45, mpz_adder, target, nonce);
+  PoW share_pow(mpz_hash, this->shift, mpz_adder, target, nonce);
 
   if (extra_verbose) {
-    uint64_t share_diff = pow.difficulty();
+    uint64_t share_diff = share_pow.difficulty();
     std::ostringstream ss_submit;
     double ratio = 0.0;
     if (target != 0) ratio = ((double) share_diff) / ((double) target);
@@ -2480,14 +2487,14 @@ bool HybridSieve::GPUWorkList::submit(uint32_t offset) {
     extra_verbose_log(ss_submit.str());
   }
 
-  if (pow.valid()) {
+  if (share_pow.valid()) {
 #ifdef DEBUG_FAST
     valid++;
     cout << "[DD] PoW valid (" << valid << ")\n";
 #endif 
 
     /* stop calculating if processor said so */
-    if (pprocessor->process(&pow)) {
+    if (pprocessor->process(&share_pow)) {
       if (extra_verbose) {
         std::ostringstream ss;
         ss << get_time() << " submit accepted: offset=" << offset;
@@ -2593,7 +2600,7 @@ void HybridSieve::GPUWorkItem::print(uint32_t prime_base[10]) {
             mpz_import(mpz, 10, -1, 4, 0, 0, prime_base);
   mpz_add_ui(mpz, mpz, offsets[0] - 2);
 
-  while (!mpz_probab_prime_p(mpz, 45))
+  while (!mpz_probab_prime_p(mpz, 25))
     mpz_sub_ui(mpz, mpz, 2);
 
   cout << "            real_start:   " << (mpz_get_ui(mpz) & 0xFFFFFFFF) << endl;
