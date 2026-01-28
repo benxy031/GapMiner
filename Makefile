@@ -108,3 +108,9 @@ clean:
 	rm -f $(ALL_OBJ) $(CUDA_OBJ)
 	$(MAKE) -C $(SRC)/Evolution clean
 
+# Build and run focused CRT micro-bench
+.PHONY: test-crt
+test-crt:
+	$(CC) $(OTFLAGS) -std=c++11 -I./src -I./src/PoWCore test/crt_harness.cpp src/ChineseRemainder.cpp src/utils.cpp $(LDFLAGS) -o test/crt_harness
+	./test/crt_harness
+
