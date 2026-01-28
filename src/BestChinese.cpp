@@ -394,5 +394,7 @@ sieve_t BestChinese::calc_best_residues(bool save) {
   if (save)
     best_set->save(Opts::get_instance()->get_ctr_file().c_str());
 
+  free(residues);
+
   return max;
 }

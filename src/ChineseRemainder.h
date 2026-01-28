@@ -45,4 +45,7 @@ class ChineseRemainder {
     ChineseRemainder(const sieve_t *numbers, 
                      const sieve_t *reminders, 
                      const sieve_t len);
+
+    /* cleanup */
+    ~ChineseRemainder();
 };

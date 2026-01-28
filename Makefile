@@ -15,7 +15,7 @@ NVCCFLAGS ?= -std=c++14 -O3 -arch=$(CUDA_ARCH) -Xcompiler "-fPIC -pthread" -I$(C
 LDFLAGS   = -lm -lcrypto -lmpfr -lgmp -pthread -lcurl -ljansson \
 					  -L/usr/lib/x86_64-linux-gnu -lOpenCL
 CUDA_LDFLAGS = -L$(CUDA_LIB) -lcudart
-OTFLAGS   = -O3 -march=native -mtune=native -mavx -mfma -ffast-math -fPIC -pipe
+OTFLAGS   = -O3 -march=native
 
 
 # Ensure C++ compilation units see the CUDA backend macro when building the
