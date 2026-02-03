@@ -88,6 +88,9 @@ class GPUFermat {
   std::vector<uint32_t> prototypeWindowOffsets;
   uint32_t lastPrototypeCount;
   uint32_t lastPrototypeWindowCount;
+  bool primeReciprocalsUploaded;
+  bool primeBaseConstantsUploaded;
+  uint64_t primeBaseFingerprint;
 
   GPUFermat(unsigned device_id, const char *platformId, unsigned workItems, unsigned streamCount = 2);
   ~GPUFermat();

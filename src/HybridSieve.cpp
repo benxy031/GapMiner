@@ -425,6 +425,17 @@ HybridSieve::~HybridSieve() {
   free(candidates_template);
 }
 
+void HybridSieve::increment_gap_counters(uint64_t count) {
+  n_gaps += count;
+  cur_n_gaps += count;
+  if (Opts::get_instance() && Opts::get_instance()->has_extra_vb()) {
+    std::ostringstream ss;
+    ss << get_time() << " gap_counter += " << count
+       << " (n_gaps=" << n_gaps << ", cur_n_gaps=" << cur_n_gaps << ")";
+    extra_verbose_log(ss.str());
+  }
+}
+
 /** 
  * sieve for the given header hash 
  *
@@ -2297,6 +2308,9 @@ void HybridSieve::GPUWorkList::parse_results(
            prev->print(prime_base);   
          cur->print(prime_base);     
 #endif
+         /* Count accepted gaps for GPU stats so gaps/s is non-zero on CUDA. */
+         if (sieve)
+           sieve->increment_gap_counters(1);
          /* For CUDA builds, optionally perform an extra-verbose CPU check to avoid
             submitting obvious non-primes caused by device/host mismatches. This
             runs only when extra_verbose is enabled and only on CUDA backend. */

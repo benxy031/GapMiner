@@ -34,16 +34,28 @@
 
 using namespace std;
 
-/* compare function to sort by smalest */
+#define MAX_CANDIDATES 65536
+
+/* compare function to sort by highest score */
 static bool compare_gap_candidate(GapCandidate *a, GapCandidate *b) {
-  return a->n_candidates >= b->n_candidates;
+  return a->score >= b->score;
 }
 
 /* stores the found gaps in the form n * primorial, n_candidates */
 vector<GapCandidate *> ChineseSieve::gaps = vector<GapCandidate *>();
 
+/* simple free-list to reuse GapCandidate allocations */
+vector<GapCandidate *> ChineseSieve::gap_pool = vector<GapCandidate *>();
+uint32_t ChineseSieve::gap_pool_limit = 16384;
+
 /* syncronisation mutex */
 pthread_mutex_t ChineseSieve::mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* condition variable to wake Fermat workers when new gaps are available */
+pthread_cond_t ChineseSieve::gap_cv = PTHREAD_COND_INITIALIZER;
+
+/* configurable maximum queue size before backpressure kicks in */
+uint32_t ChineseSieve::gap_queue_limit = 8192;
 
 /* calculated gaps since the last share */
 sieve_t ChineseSieve::gaps_since_share = 0;
@@ -64,6 +76,7 @@ void ChineseSieve::reset() {
     gaps.pop_back();
     delete gap;
   }
+  pthread_cond_broadcast(&gap_cv);
   pthread_mutex_unlock(&mutex);
 }
 
@@ -200,6 +213,7 @@ ChineseSieve::ChineseSieve(PoWProcessor *processor,
   this->crt_status           = 0.000001;
   this->cur_merit            = 1.0;
   this->rand = new_rand128(time(NULL) ^ getpid() ^ n_primes ^ sievesize);
+  this->running              = false;
 
   mpz_init(this->mpz_e);
   mpz_init(this->mpz_r);
@@ -207,6 +221,17 @@ ChineseSieve::ChineseSieve(PoWProcessor *processor,
   calc_primorial_reminder();
 
   this->max_merit = sievesize / ((atoi(Opts::get_instance()->get_shift().c_str()) + 256) * log(2));
+
+  /* allow overriding the gap queue cap via CLI */
+  if (Opts::get_instance()->has_gap_queue_limit()) {
+    uint32_t limit = atoi(Opts::get_instance()->get_gap_queue_limit().c_str());
+    if (limit > 0)
+      gap_queue_limit = limit;
+  }
+
+  /* size the reuse pool relative to the queue cap to avoid unbounded growth */
+  gap_pool_limit = std::max<uint32_t>(gap_queue_limit * 2, gap_pool_limit);
+
 
   log_str("Creating ChineseSieve with" + itoa(cset->n_primes) + 
       " and a gap size of "  + itoa(cset->bit_size) + 
@@ -300,27 +325,73 @@ void ChineseSieve::run_sieve(PoW *pow, uint8_t hash[SHA256_DIGEST_LENGTH]) {
  
     /* sieve all small primes (skip all primes within the set) */
     for (sieve_t i = cset->n_primes; i < n_primes; i++) {
- 
-      /**
-       * sieve all odd multiplies of the current prime
-       */
-      for (sieve_t p = starts[i]; p < sievesize; p += primes2[i])
+
+      const sieve_t step = primes2[i];
+      sieve_t p = starts[i];
+
+      /* unroll marking to reduce branch/loop overhead */
+      while (p < sievesize) {
         set_composite(sieve, p);
+        p += step;
+        if (p >= sievesize) break;
+        set_composite(sieve, p);
+        p += step;
+        if (p >= sievesize) break;
+        set_composite(sieve, p);
+        p += step;
+        if (p >= sievesize) break;
+        set_composite(sieve, p);
+        p += step;
+      }
     }
 
     /* collect the prime candidates */
-    vector<uint32_t> candidates;
-    for (uint32_t i = 1; i < sievesize; i += 2)
+    uint32_t candidates[MAX_CANDIDATES];
+    uint32_t candidate_count = 0;
+    for (uint32_t i = 1; i < sievesize && candidate_count < MAX_CANDIDATES; i += 2)
       if (is_prime(sieve, i))
-        candidates.push_back(i);
+        candidates[candidate_count++] = i;
 
-    /* save the gap */
-    GapCandidate *gap = new GapCandidate(pow->get_nonce(), pow->get_target(), mpz_start, candidates);
+    /* optional backpressure: keep the gap queue bounded to avoid lock churn */
+    pthread_mutex_lock(&mutex);
+    while (running && gaps.size() >= gap_queue_limit)
+      pthread_cond_wait(&gap_cv, &mutex);
+    pthread_mutex_unlock(&mutex);
+
+    const double log_start = mpz_log(mpz_start);
+    const double denom = (log_start > 1.0 ? log_start : 1.0);
+    const double target_factor = ((double) pow->get_target()) / TWO_POW48;
+    const double score = (static_cast<double>(candidate_count) / denom) * target_factor;
+
+    /* save the gap, reusing a pooled node when available */
+    GapCandidate *gap = nullptr;
+    pthread_mutex_lock(&mutex);
+    if (!gap_pool.empty()) {
+      gap = gap_pool.back();
+      gap_pool.pop_back();
+    }
+    pthread_mutex_unlock(&mutex);
+
+    if (gap)
+      gap->reset(pow->get_nonce(), pow->get_target(), mpz_start, candidates, candidate_count, score);
+    else
+      gap = new GapCandidate(pow->get_nonce(), pow->get_target(), mpz_start, candidates, candidate_count, score);
+
     pthread_mutex_lock(&mutex);
 
     gaps.push_back(gap);
     push_heap(gaps.begin(), gaps.end(), compare_gap_candidate);
+    const size_t queue_size = gaps.size();
+    pthread_cond_signal(&gap_cv);
     pthread_mutex_unlock(&mutex);
+
+    if (Opts::get_instance()->has_extra_vb()) {
+      string msg = "gap push cand=" + itoa(candidate_count) +
+                   " score=" + dtoa(score, 4) +
+                   " queue=" + itoa((uint64_t) queue_size) +
+                   "/" + itoa((uint64_t) gap_queue_limit);
+      extra_verbose_log(msg);
+    }
 
     mpz_add(mpz_start, mpz_start, cset->mpz_primorial);
 
@@ -340,6 +411,7 @@ void ChineseSieve::run_fermat() {
     calc_avg_prime_candidates();
   
   log_str("run_fermat", LOG_D);
+  running = true;
   mpz_t mpz_p, mpz_hash;
   mpz_init(mpz_p);
   mpz_init(mpz_hash);
@@ -352,20 +424,23 @@ void ChineseSieve::run_fermat() {
   sieve_t speed_factor = 0;
   uint64_t time = PoWUtils::gettime_usec();
 
-  for (;;) {
+  while (running) {
     index++;
 
     /* get the next best GapCandidate */
     pthread_mutex_lock(&mutex);
 
-    if (gaps.empty()) {
+    while (gaps.empty() && running)
+      pthread_cond_wait(&gap_cv, &mutex);
+
+    if (!running) {
       pthread_mutex_unlock(&mutex);
-      pthread_yield();
-      continue;
+      break;
     }
     GapCandidate *gap = gaps.front();
     pop_heap(gaps.begin(), gaps.end(), compare_gap_candidate);
     gaps.pop_back();
+    pthread_cond_signal(&gap_cv);
 
     cur_merit  = ((double) gap->target) / TWO_POW48;
     gaps_since_share += 1 * speed_factor;
@@ -429,7 +504,16 @@ void ChineseSieve::run_fermat() {
       time = PoWUtils::gettime_usec();
     }
 
-    delete gap;
+    bool recycled = false;
+    pthread_mutex_lock(&mutex);
+    if (gap_pool.size() < gap_pool_limit) {
+      gap_pool.push_back(gap);
+      recycled = true;
+    }
+    pthread_mutex_unlock(&mutex);
+
+    if (!recycled)
+      delete gap;
   }
 }
 
@@ -488,7 +572,15 @@ void ChineseSieve::mpz_previous_prime(mpz_t mpz_dst, mpz_t mpz_src) {
 
 
 ChineseSieve::~ChineseSieve() {
-  
+  /* free pooled gaps to avoid leaking mpz state at shutdown */
+  pthread_mutex_lock(&mutex);
+  while (!gap_pool.empty()) {
+    GapCandidate *g = gap_pool.back();
+    gap_pool.pop_back();
+    delete g;
+  }
+  pthread_mutex_unlock(&mutex);
+
   free(primorial_reminder);
   free(start_reminder);
   free(sieve);
@@ -502,7 +594,10 @@ ChineseSieve::~ChineseSieve() {
 void ChineseSieve::stop() {
   
   log_str("stopping ChineseSieve", LOG_D);
+  pthread_mutex_lock(&mutex);
   running = false;
+  pthread_cond_broadcast(&gap_cv);
+  pthread_mutex_unlock(&mutex);
 }
 
 /* get gap list count */

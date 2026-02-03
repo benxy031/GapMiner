@@ -17,21 +17,38 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 #include "GapCandidate.h"
+#include <cstring>
 
 /* creat a new GapCandidate */
 GapCandidate::GapCandidate(uint32_t nonce,
                            uint64_t target,
                            mpz_t mpz_gap_start, 
-                           vector<uint32_t> candidates) {
+                           uint32_t* candidates,
+                           uint32_t n_candidates,
+                           double score) {
 
   this->nonce        = nonce;
   this->target       = target;
-  this->n_candidates = candidates.size();
-  this->candidates   = vector<uint32_t>(candidates);
+  this->n_candidates = n_candidates;
+  this->score        = score;
+  memcpy(this->candidates, candidates, n_candidates * sizeof(uint32_t));
   mpz_init_set(this->mpz_gap_start, mpz_gap_start);
 }
 
+void GapCandidate::reset(uint32_t nonce,
+                         uint64_t target,
+                         mpz_t mpz_gap_start,
+                         uint32_t* candidates,
+                         uint32_t n_candidates,
+                         double score) {
+  this->nonce        = nonce;
+  this->target       = target;
+  this->n_candidates = n_candidates;
+  this->score        = score;
+  memcpy(this->candidates, candidates, n_candidates * sizeof(uint32_t));
+  mpz_set(this->mpz_gap_start, mpz_gap_start);
+}
+
 GapCandidate::~GapCandidate() {
-  candidates.clear();
   mpz_clear(mpz_gap_start);
 }

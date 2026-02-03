@@ -96,7 +96,10 @@ void ChineseSet::init() {
 
   /* calculate the speed increase */
   sieve_t avg_count = 0;
-  sieve = (sieve_t *) malloc(byte_size);
+  void *sieve_buf = nullptr;
+  if (posix_memalign(&sieve_buf, 64, byte_size) != 0)
+    sieve_buf = malloc(byte_size);
+  sieve = (sieve_t *) sieve_buf;
   this->rand = new_rand128(time(NULL) ^ getpid() ^ n_primes ^ size ^ n_candidates);
 
   /** calculate the average candidates per sieve */

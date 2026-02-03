@@ -300,549 +300,50 @@ __device__ void monMul320_words(uint32_t *op1,
                                 const uint32_t *op2,
                                 const uint32_t *mod,
                                 uint32_t invm) {
-  uint32_t invValue[10];
-  uint64_t accLow = 0, accHi = 0;
-  union {
-    uint2 v32;
-    unsigned long long v64;
-  } Int;
-  {
-    accLow += static_cast<uint64_t>(op1[0]) * op2[0];
-    accHi += mul_hi_u32(op1[0], op2[0]);
-    invValue[0] = invm * static_cast<uint32_t>(accLow);
-    accLow += static_cast<uint64_t>(invValue[0]) * mod[0];
-    accHi += mul_hi_u32(invValue[0], mod[0]);
-    uint32_t high32 = static_cast<uint32_t>(accLow >> 32);
-    accHi += static_cast<uint64_t>(high32);
-    accLow = accHi;
-    accHi = 0;
+  const int totalLimbs = kOperandSize * 2;
+  uint64_t t[20];
+#pragma unroll
+  for (int i = 0; i < totalLimbs; ++i) t[i] = 0ull;
+
+  for (int i = 0; i < kOperandSize; ++i) {
+    uint64_t carry = 0ull;
+    for (int j = 0; j < kOperandSize; ++j) {
+      const int idx = i + j;
+      uint64_t sum = t[idx] + static_cast<uint64_t>(op1[j]) * static_cast<uint64_t>(op2[i]) + carry;
+      t[idx] = static_cast<uint32_t>(sum);
+      carry = sum >> 32;
+    }
+    t[i + kOperandSize] += carry;
+
+    uint32_t m = static_cast<uint32_t>(t[i]) * invm;
+    carry = 0ull;
+    for (int j = 0; j < kOperandSize; ++j) {
+      const int idx = i + j;
+      uint64_t sum = t[idx] + static_cast<uint64_t>(m) * static_cast<uint64_t>(mod[j]) + carry;
+      t[idx] = static_cast<uint32_t>(sum);
+      carry = sum >> 32;
+    }
+    t[i + kOperandSize] += carry;
   }
-  {
-    accLow += static_cast<uint64_t>(op1[1]) * op2[0];
-    accHi += mul_hi_u32(op1[1], op2[0]);
-    accLow += static_cast<uint64_t>(op1[0]) * op2[1];
-    accHi += mul_hi_u32(op1[0], op2[1]);
-    accLow += static_cast<uint64_t>(invValue[0]) * mod[1];
-    accHi += mul_hi_u32(invValue[0], mod[1]);
-    invValue[1] = invm * static_cast<uint32_t>(accLow);
-    accLow += static_cast<uint64_t>(invValue[1]) * mod[0];
-    accHi += mul_hi_u32(invValue[1], mod[0]);
-    uint32_t high32 = static_cast<uint32_t>(accLow >> 32);
-    accHi += static_cast<uint64_t>(high32);
-    accLow = accHi;
-    accHi = 0;
-  }
-  {
-    accLow += static_cast<uint64_t>(op1[2]) * op2[0];
-    accHi += mul_hi_u32(op1[2], op2[0]);
-    accLow += static_cast<uint64_t>(op1[1]) * op2[1];
-    accHi += mul_hi_u32(op1[1], op2[1]);
-    accLow += static_cast<uint64_t>(op1[0]) * op2[2];
-    accHi += mul_hi_u32(op1[0], op2[2]);
-    accLow += static_cast<uint64_t>(invValue[0]) * mod[2];
-    accHi += mul_hi_u32(invValue[0], mod[2]);
-    accLow += static_cast<uint64_t>(invValue[1]) * mod[1];
-    accHi += mul_hi_u32(invValue[1], mod[1]);
-    invValue[2] = invm * static_cast<uint32_t>(accLow);
-    accLow += static_cast<uint64_t>(invValue[2]) * mod[0];
-    accHi += mul_hi_u32(invValue[2], mod[0]);
-    uint32_t high32 = static_cast<uint32_t>(accLow >> 32);
-    accHi += static_cast<uint64_t>(high32);
-    accLow = accHi;
-    accHi = 0;
-  }
-  {
-    accLow += static_cast<uint64_t>(op1[3]) * op2[0];
-    accHi += mul_hi_u32(op1[3], op2[0]);
-    accLow += static_cast<uint64_t>(op1[2]) * op2[1];
-    accHi += mul_hi_u32(op1[2], op2[1]);
-    accLow += static_cast<uint64_t>(op1[1]) * op2[2];
-    accHi += mul_hi_u32(op1[1], op2[2]);
-    accLow += static_cast<uint64_t>(op1[0]) * op2[3];
-    accHi += mul_hi_u32(op1[0], op2[3]);
-    accLow += static_cast<uint64_t>(invValue[0]) * mod[3];
-    accHi += mul_hi_u32(invValue[0], mod[3]);
-    accLow += static_cast<uint64_t>(invValue[1]) * mod[2];
-    accHi += mul_hi_u32(invValue[1], mod[2]);
-    accLow += static_cast<uint64_t>(invValue[2]) * mod[1];
-    accHi += mul_hi_u32(invValue[2], mod[1]);
-    invValue[3] = invm * static_cast<uint32_t>(accLow);
-    accLow += static_cast<uint64_t>(invValue[3]) * mod[0];
-    accHi += mul_hi_u32(invValue[3], mod[0]);
-    uint32_t high32 = static_cast<uint32_t>(accLow >> 32);
-    accHi += static_cast<uint64_t>(high32);
-    accLow = accHi;
-    accHi = 0;
-  }
-  {
-    accLow += static_cast<uint64_t>(op1[4]) * op2[0];
-    accHi += mul_hi_u32(op1[4], op2[0]);
-    accLow += static_cast<uint64_t>(op1[3]) * op2[1];
-    accHi += mul_hi_u32(op1[3], op2[1]);
-    accLow += static_cast<uint64_t>(op1[2]) * op2[2];
-    accHi += mul_hi_u32(op1[2], op2[2]);
-    accLow += static_cast<uint64_t>(op1[1]) * op2[3];
-    accHi += mul_hi_u32(op1[1], op2[3]);
-    accLow += static_cast<uint64_t>(op1[0]) * op2[4];
-    accHi += mul_hi_u32(op1[0], op2[4]);
-    accLow += static_cast<uint64_t>(invValue[0]) * mod[4];
-    accHi += mul_hi_u32(invValue[0], mod[4]);
-    accLow += static_cast<uint64_t>(invValue[1]) * mod[3];
-    accHi += mul_hi_u32(invValue[1], mod[3]);
-    accLow += static_cast<uint64_t>(invValue[2]) * mod[2];
-    accHi += mul_hi_u32(invValue[2], mod[2]);
-    accLow += static_cast<uint64_t>(invValue[3]) * mod[1];
-    accHi += mul_hi_u32(invValue[3], mod[1]);
-    invValue[4] = invm * static_cast<uint32_t>(accLow);
-    accLow += static_cast<uint64_t>(invValue[4]) * mod[0];
-    accHi += mul_hi_u32(invValue[4], mod[0]);
-    uint32_t high32 = static_cast<uint32_t>(accLow >> 32);
-    accHi += static_cast<uint64_t>(high32);
-    accLow = accHi;
-    accHi = 0;
-  }
-  {
-    accLow += static_cast<uint64_t>(op1[5]) * op2[0];
-    accHi += mul_hi_u32(op1[5], op2[0]);
-    accLow += static_cast<uint64_t>(op1[4]) * op2[1];
-    accHi += mul_hi_u32(op1[4], op2[1]);
-    accLow += static_cast<uint64_t>(op1[3]) * op2[2];
-    accHi += mul_hi_u32(op1[3], op2[2]);
-    accLow += static_cast<uint64_t>(op1[2]) * op2[3];
-    accHi += mul_hi_u32(op1[2], op2[3]);
-    accLow += static_cast<uint64_t>(op1[1]) * op2[4];
-    accHi += mul_hi_u32(op1[1], op2[4]);
-    accLow += static_cast<uint64_t>(op1[0]) * op2[5];
-    accHi += mul_hi_u32(op1[0], op2[5]);
-    accLow += static_cast<uint64_t>(invValue[0]) * mod[5];
-    accHi += mul_hi_u32(invValue[0], mod[5]);
-    accLow += static_cast<uint64_t>(invValue[1]) * mod[4];
-    accHi += mul_hi_u32(invValue[1], mod[4]);
-    accLow += static_cast<uint64_t>(invValue[2]) * mod[3];
-    accHi += mul_hi_u32(invValue[2], mod[3]);
-    accLow += static_cast<uint64_t>(invValue[3]) * mod[2];
-    accHi += mul_hi_u32(invValue[3], mod[2]);
-    accLow += static_cast<uint64_t>(invValue[4]) * mod[1];
-    accHi += mul_hi_u32(invValue[4], mod[1]);
-    invValue[5] = invm * static_cast<uint32_t>(accLow);
-    accLow += static_cast<uint64_t>(invValue[5]) * mod[0];
-    accHi += mul_hi_u32(invValue[5], mod[0]);
-    uint32_t high32 = static_cast<uint32_t>(accLow >> 32);
-    accHi += static_cast<uint64_t>(high32);
-    accLow = accHi;
-    accHi = 0;
-  }
-  {
-    accLow += static_cast<uint64_t>(op1[6]) * op2[0];
-    accHi += mul_hi_u32(op1[6], op2[0]);
-    accLow += static_cast<uint64_t>(op1[5]) * op2[1];
-    accHi += mul_hi_u32(op1[5], op2[1]);
-    accLow += static_cast<uint64_t>(op1[4]) * op2[2];
-    accHi += mul_hi_u32(op1[4], op2[2]);
-    accLow += static_cast<uint64_t>(op1[3]) * op2[3];
-    accHi += mul_hi_u32(op1[3], op2[3]);
-    accLow += static_cast<uint64_t>(op1[2]) * op2[4];
-    accHi += mul_hi_u32(op1[2], op2[4]);
-    accLow += static_cast<uint64_t>(op1[1]) * op2[5];
-    accHi += mul_hi_u32(op1[1], op2[5]);
-    accLow += static_cast<uint64_t>(op1[0]) * op2[6];
-    accHi += mul_hi_u32(op1[0], op2[6]);
-    accLow += static_cast<uint64_t>(invValue[0]) * mod[6];
-    accHi += mul_hi_u32(invValue[0], mod[6]);
-    accLow += static_cast<uint64_t>(invValue[1]) * mod[5];
-    accHi += mul_hi_u32(invValue[1], mod[5]);
-    accLow += static_cast<uint64_t>(invValue[2]) * mod[4];
-    accHi += mul_hi_u32(invValue[2], mod[4]);
-    accLow += static_cast<uint64_t>(invValue[3]) * mod[3];
-    accHi += mul_hi_u32(invValue[3], mod[3]);
-    accLow += static_cast<uint64_t>(invValue[4]) * mod[2];
-    accHi += mul_hi_u32(invValue[4], mod[2]);
-    accLow += static_cast<uint64_t>(invValue[5]) * mod[1];
-    accHi += mul_hi_u32(invValue[5], mod[1]);
-    invValue[6] = invm * static_cast<uint32_t>(accLow);
-    accLow += static_cast<uint64_t>(invValue[6]) * mod[0];
-    accHi += mul_hi_u32(invValue[6], mod[0]);
-    uint32_t high32 = static_cast<uint32_t>(accLow >> 32);
-    accHi += static_cast<uint64_t>(high32);
-    accLow = accHi;
-    accHi = 0;
-  }
-  {
-    accLow += static_cast<uint64_t>(op1[7]) * op2[0];
-    accHi += mul_hi_u32(op1[7], op2[0]);
-    accLow += static_cast<uint64_t>(op1[6]) * op2[1];
-    accHi += mul_hi_u32(op1[6], op2[1]);
-    accLow += static_cast<uint64_t>(op1[5]) * op2[2];
-    accHi += mul_hi_u32(op1[5], op2[2]);
-    accLow += static_cast<uint64_t>(op1[4]) * op2[3];
-    accHi += mul_hi_u32(op1[4], op2[3]);
-    accLow += static_cast<uint64_t>(op1[3]) * op2[4];
-    accHi += mul_hi_u32(op1[3], op2[4]);
-    accLow += static_cast<uint64_t>(op1[2]) * op2[5];
-    accHi += mul_hi_u32(op1[2], op2[5]);
-    accLow += static_cast<uint64_t>(op1[1]) * op2[6];
-    accHi += mul_hi_u32(op1[1], op2[6]);
-    accLow += static_cast<uint64_t>(op1[0]) * op2[7];
-    accHi += mul_hi_u32(op1[0], op2[7]);
-    accLow += static_cast<uint64_t>(invValue[0]) * mod[7];
-    accHi += mul_hi_u32(invValue[0], mod[7]);
-    accLow += static_cast<uint64_t>(invValue[1]) * mod[6];
-    accHi += mul_hi_u32(invValue[1], mod[6]);
-    accLow += static_cast<uint64_t>(invValue[2]) * mod[5];
-    accHi += mul_hi_u32(invValue[2], mod[5]);
-    accLow += static_cast<uint64_t>(invValue[3]) * mod[4];
-    accHi += mul_hi_u32(invValue[3], mod[4]);
-    accLow += static_cast<uint64_t>(invValue[4]) * mod[3];
-    accHi += mul_hi_u32(invValue[4], mod[3]);
-    accLow += static_cast<uint64_t>(invValue[5]) * mod[2];
-    accHi += mul_hi_u32(invValue[5], mod[2]);
-    accLow += static_cast<uint64_t>(invValue[6]) * mod[1];
-    accHi += mul_hi_u32(invValue[6], mod[1]);
-    invValue[7] = invm * static_cast<uint32_t>(accLow);
-    accLow += static_cast<uint64_t>(invValue[7]) * mod[0];
-    accHi += mul_hi_u32(invValue[7], mod[0]);
-    uint32_t high32 = static_cast<uint32_t>(accLow >> 32);
-    accHi += static_cast<uint64_t>(high32);
-    accLow = accHi;
-    accHi = 0;
-  }
-  {
-    accLow += static_cast<uint64_t>(op1[8]) * op2[0];
-    accHi += mul_hi_u32(op1[8], op2[0]);
-    accLow += static_cast<uint64_t>(op1[7]) * op2[1];
-    accHi += mul_hi_u32(op1[7], op2[1]);
-    accLow += static_cast<uint64_t>(op1[6]) * op2[2];
-    accHi += mul_hi_u32(op1[6], op2[2]);
-    accLow += static_cast<uint64_t>(op1[5]) * op2[3];
-    accHi += mul_hi_u32(op1[5], op2[3]);
-    accLow += static_cast<uint64_t>(op1[4]) * op2[4];
-    accHi += mul_hi_u32(op1[4], op2[4]);
-    accLow += static_cast<uint64_t>(op1[3]) * op2[5];
-    accHi += mul_hi_u32(op1[3], op2[5]);
-    accLow += static_cast<uint64_t>(op1[2]) * op2[6];
-    accHi += mul_hi_u32(op1[2], op2[6]);
-    accLow += static_cast<uint64_t>(op1[1]) * op2[7];
-    accHi += mul_hi_u32(op1[1], op2[7]);
-    accLow += static_cast<uint64_t>(op1[0]) * op2[8];
-    accHi += mul_hi_u32(op1[0], op2[8]);
-    accLow += static_cast<uint64_t>(invValue[0]) * mod[8];
-    accHi += mul_hi_u32(invValue[0], mod[8]);
-    accLow += static_cast<uint64_t>(invValue[1]) * mod[7];
-    accHi += mul_hi_u32(invValue[1], mod[7]);
-    accLow += static_cast<uint64_t>(invValue[2]) * mod[6];
-    accHi += mul_hi_u32(invValue[2], mod[6]);
-    accLow += static_cast<uint64_t>(invValue[3]) * mod[5];
-    accHi += mul_hi_u32(invValue[3], mod[5]);
-    accLow += static_cast<uint64_t>(invValue[4]) * mod[4];
-    accHi += mul_hi_u32(invValue[4], mod[4]);
-    accLow += static_cast<uint64_t>(invValue[5]) * mod[3];
-    accHi += mul_hi_u32(invValue[5], mod[3]);
-    accLow += static_cast<uint64_t>(invValue[6]) * mod[2];
-    accHi += mul_hi_u32(invValue[6], mod[2]);
-    accLow += static_cast<uint64_t>(invValue[7]) * mod[1];
-    accHi += mul_hi_u32(invValue[7], mod[1]);
-    invValue[8] = invm * static_cast<uint32_t>(accLow);
-    accLow += static_cast<uint64_t>(invValue[8]) * mod[0];
-    accHi += mul_hi_u32(invValue[8], mod[0]);
-    uint32_t high32 = static_cast<uint32_t>(accLow >> 32);
-    accHi += static_cast<uint64_t>(high32);
-    accLow = accHi;
-    accHi = 0;
-  }
-  {
-    accLow += static_cast<uint64_t>(op1[9]) * op2[0];
-    accHi += mul_hi_u32(op1[9], op2[0]);
-    accLow += static_cast<uint64_t>(op1[8]) * op2[1];
-    accHi += mul_hi_u32(op1[8], op2[1]);
-    accLow += static_cast<uint64_t>(op1[7]) * op2[2];
-    accHi += mul_hi_u32(op1[7], op2[2]);
-    accLow += static_cast<uint64_t>(op1[6]) * op2[3];
-    accHi += mul_hi_u32(op1[6], op2[3]);
-    accLow += static_cast<uint64_t>(op1[5]) * op2[4];
-    accHi += mul_hi_u32(op1[5], op2[4]);
-    accLow += static_cast<uint64_t>(op1[4]) * op2[5];
-    accHi += mul_hi_u32(op1[4], op2[5]);
-    accLow += static_cast<uint64_t>(op1[3]) * op2[6];
-    accHi += mul_hi_u32(op1[3], op2[6]);
-    accLow += static_cast<uint64_t>(op1[2]) * op2[7];
-    accHi += mul_hi_u32(op1[2], op2[7]);
-    accLow += static_cast<uint64_t>(op1[1]) * op2[8];
-    accHi += mul_hi_u32(op1[1], op2[8]);
-    accLow += static_cast<uint64_t>(op1[0]) * op2[9];
-    accHi += mul_hi_u32(op1[0], op2[9]);
-    accLow += static_cast<uint64_t>(invValue[0]) * mod[9];
-    accHi += mul_hi_u32(invValue[0], mod[9]);
-    accLow += static_cast<uint64_t>(invValue[1]) * mod[8];
-    accHi += mul_hi_u32(invValue[1], mod[8]);
-    accLow += static_cast<uint64_t>(invValue[2]) * mod[7];
-    accHi += mul_hi_u32(invValue[2], mod[7]);
-    accLow += static_cast<uint64_t>(invValue[3]) * mod[6];
-    accHi += mul_hi_u32(invValue[3], mod[6]);
-    accLow += static_cast<uint64_t>(invValue[4]) * mod[5];
-    accHi += mul_hi_u32(invValue[4], mod[5]);
-    accLow += static_cast<uint64_t>(invValue[5]) * mod[4];
-    accHi += mul_hi_u32(invValue[5], mod[4]);
-    accLow += static_cast<uint64_t>(invValue[6]) * mod[3];
-    accHi += mul_hi_u32(invValue[6], mod[3]);
-    accLow += static_cast<uint64_t>(invValue[7]) * mod[2];
-    accHi += mul_hi_u32(invValue[7], mod[2]);
-    accLow += static_cast<uint64_t>(invValue[8]) * mod[1];
-    accHi += mul_hi_u32(invValue[8], mod[1]);
-    invValue[9] = invm * static_cast<uint32_t>(accLow);
-    accLow += static_cast<uint64_t>(invValue[9]) * mod[0];
-    accHi += mul_hi_u32(invValue[9], mod[0]);
-    uint32_t high32 = static_cast<uint32_t>(accLow >> 32);
-    accHi += static_cast<uint64_t>(high32);
-    accLow = accHi;
-    accHi = 0;
-  }
-  {
-    accLow += static_cast<uint64_t>(op1[1]) * op2[9];
-    accHi += mul_hi_u32(op1[1], op2[9]);
-    accLow += static_cast<uint64_t>(op1[2]) * op2[8];
-    accHi += mul_hi_u32(op1[2], op2[8]);
-    accLow += static_cast<uint64_t>(op1[3]) * op2[7];
-    accHi += mul_hi_u32(op1[3], op2[7]);
-    accLow += static_cast<uint64_t>(op1[4]) * op2[6];
-    accHi += mul_hi_u32(op1[4], op2[6]);
-    accLow += static_cast<uint64_t>(op1[5]) * op2[5];
-    accHi += mul_hi_u32(op1[5], op2[5]);
-    accLow += static_cast<uint64_t>(op1[6]) * op2[4];
-    accHi += mul_hi_u32(op1[6], op2[4]);
-    accLow += static_cast<uint64_t>(op1[7]) * op2[3];
-    accHi += mul_hi_u32(op1[7], op2[3]);
-    accLow += static_cast<uint64_t>(op1[8]) * op2[2];
-    accHi += mul_hi_u32(op1[8], op2[2]);
-    accLow += static_cast<uint64_t>(op1[9]) * op2[1];
-    accHi += mul_hi_u32(op1[9], op2[1]);
-    accLow += static_cast<uint64_t>(invValue[1]) * mod[9];
-    accHi += mul_hi_u32(invValue[1], mod[9]);
-    accLow += static_cast<uint64_t>(invValue[2]) * mod[8];
-    accHi += mul_hi_u32(invValue[2], mod[8]);
-    accLow += static_cast<uint64_t>(invValue[3]) * mod[7];
-    accHi += mul_hi_u32(invValue[3], mod[7]);
-    accLow += static_cast<uint64_t>(invValue[4]) * mod[6];
-    accHi += mul_hi_u32(invValue[4], mod[6]);
-    accLow += static_cast<uint64_t>(invValue[5]) * mod[5];
-    accHi += mul_hi_u32(invValue[5], mod[5]);
-    accLow += static_cast<uint64_t>(invValue[6]) * mod[4];
-    accHi += mul_hi_u32(invValue[6], mod[4]);
-    accLow += static_cast<uint64_t>(invValue[7]) * mod[3];
-    accHi += mul_hi_u32(invValue[7], mod[3]);
-    accLow += static_cast<uint64_t>(invValue[8]) * mod[2];
-    accHi += mul_hi_u32(invValue[8], mod[2]);
-    accLow += static_cast<uint64_t>(invValue[9]) * mod[1];
-    accHi += mul_hi_u32(invValue[9], mod[1]);
-    op1[0] = static_cast<uint32_t>(accLow);
-    uint32_t high32 = static_cast<uint32_t>(accLow >> 32);
-    accHi += static_cast<uint64_t>(high32);
-    accLow = accHi;
-    accHi = 0;
-  }
-  {
-    accLow += static_cast<uint64_t>(op1[2]) * op2[9];
-    accHi += mul_hi_u32(op1[2], op2[9]);
-    accLow += static_cast<uint64_t>(op1[3]) * op2[8];
-    accHi += mul_hi_u32(op1[3], op2[8]);
-    accLow += static_cast<uint64_t>(op1[4]) * op2[7];
-    accHi += mul_hi_u32(op1[4], op2[7]);
-    accLow += static_cast<uint64_t>(op1[5]) * op2[6];
-    accHi += mul_hi_u32(op1[5], op2[6]);
-    accLow += static_cast<uint64_t>(op1[6]) * op2[5];
-    accHi += mul_hi_u32(op1[6], op2[5]);
-    accLow += static_cast<uint64_t>(op1[7]) * op2[4];
-    accHi += mul_hi_u32(op1[7], op2[4]);
-    accLow += static_cast<uint64_t>(op1[8]) * op2[3];
-    accHi += mul_hi_u32(op1[8], op2[3]);
-    accLow += static_cast<uint64_t>(op1[9]) * op2[2];
-    accHi += mul_hi_u32(op1[9], op2[2]);
-    accLow += static_cast<uint64_t>(invValue[2]) * mod[9];
-    accHi += mul_hi_u32(invValue[2], mod[9]);
-    accLow += static_cast<uint64_t>(invValue[3]) * mod[8];
-    accHi += mul_hi_u32(invValue[3], mod[8]);
-    accLow += static_cast<uint64_t>(invValue[4]) * mod[7];
-    accHi += mul_hi_u32(invValue[4], mod[7]);
-    accLow += static_cast<uint64_t>(invValue[5]) * mod[6];
-    accHi += mul_hi_u32(invValue[5], mod[6]);
-    accLow += static_cast<uint64_t>(invValue[6]) * mod[5];
-    accHi += mul_hi_u32(invValue[6], mod[5]);
-    accLow += static_cast<uint64_t>(invValue[7]) * mod[4];
-    accHi += mul_hi_u32(invValue[7], mod[4]);
-    accLow += static_cast<uint64_t>(invValue[8]) * mod[3];
-    accHi += mul_hi_u32(invValue[8], mod[3]);
-    accLow += static_cast<uint64_t>(invValue[9]) * mod[2];
-    accHi += mul_hi_u32(invValue[9], mod[2]);
-    op1[1] = static_cast<uint32_t>(accLow);
-    uint32_t high32 = static_cast<uint32_t>(accLow >> 32);
-    accHi += static_cast<uint64_t>(high32);
-    accLow = accHi;
-    accHi = 0;
-  }
-  {
-    accLow += static_cast<uint64_t>(op1[3]) * op2[9];
-    accHi += mul_hi_u32(op1[3], op2[9]);
-    accLow += static_cast<uint64_t>(op1[4]) * op2[8];
-    accHi += mul_hi_u32(op1[4], op2[8]);
-    accLow += static_cast<uint64_t>(op1[5]) * op2[7];
-    accHi += mul_hi_u32(op1[5], op2[7]);
-    accLow += static_cast<uint64_t>(op1[6]) * op2[6];
-    accHi += mul_hi_u32(op1[6], op2[6]);
-    accLow += static_cast<uint64_t>(op1[7]) * op2[5];
-    accHi += mul_hi_u32(op1[7], op2[5]);
-    accLow += static_cast<uint64_t>(op1[8]) * op2[4];
-    accHi += mul_hi_u32(op1[8], op2[4]);
-    accLow += static_cast<uint64_t>(op1[9]) * op2[3];
-    accHi += mul_hi_u32(op1[9], op2[3]);
-    accLow += static_cast<uint64_t>(invValue[3]) * mod[9];
-    accHi += mul_hi_u32(invValue[3], mod[9]);
-    accLow += static_cast<uint64_t>(invValue[4]) * mod[8];
-    accHi += mul_hi_u32(invValue[4], mod[8]);
-    accLow += static_cast<uint64_t>(invValue[5]) * mod[7];
-    accHi += mul_hi_u32(invValue[5], mod[7]);
-    accLow += static_cast<uint64_t>(invValue[6]) * mod[6];
-    accHi += mul_hi_u32(invValue[6], mod[6]);
-    accLow += static_cast<uint64_t>(invValue[7]) * mod[5];
-    accHi += mul_hi_u32(invValue[7], mod[5]);
-    accLow += static_cast<uint64_t>(invValue[8]) * mod[4];
-    accHi += mul_hi_u32(invValue[8], mod[4]);
-    accLow += static_cast<uint64_t>(invValue[9]) * mod[3];
-    accHi += mul_hi_u32(invValue[9], mod[3]);
-    op1[2] = static_cast<uint32_t>(accLow);
-    uint32_t high32 = static_cast<uint32_t>(accLow >> 32);
-    accHi += static_cast<uint64_t>(high32);
-    accLow = accHi;
-    accHi = 0;
-  }
-  {
-    accLow += static_cast<uint64_t>(op1[4]) * op2[9];
-    accHi += mul_hi_u32(op1[4], op2[9]);
-    accLow += static_cast<uint64_t>(op1[5]) * op2[8];
-    accHi += mul_hi_u32(op1[5], op2[8]);
-    accLow += static_cast<uint64_t>(op1[6]) * op2[7];
-    accHi += mul_hi_u32(op1[6], op2[7]);
-    accLow += static_cast<uint64_t>(op1[7]) * op2[6];
-    accHi += mul_hi_u32(op1[7], op2[6]);
-    accLow += static_cast<uint64_t>(op1[8]) * op2[5];
-    accHi += mul_hi_u32(op1[8], op2[5]);
-    accLow += static_cast<uint64_t>(op1[9]) * op2[4];
-    accHi += mul_hi_u32(op1[9], op2[4]);
-    accLow += static_cast<uint64_t>(invValue[4]) * mod[9];
-    accHi += mul_hi_u32(invValue[4], mod[9]);
-    accLow += static_cast<uint64_t>(invValue[5]) * mod[8];
-    accHi += mul_hi_u32(invValue[5], mod[8]);
-    accLow += static_cast<uint64_t>(invValue[6]) * mod[7];
-    accHi += mul_hi_u32(invValue[6], mod[7]);
-    accLow += static_cast<uint64_t>(invValue[7]) * mod[6];
-    accHi += mul_hi_u32(invValue[7], mod[6]);
-    accLow += static_cast<uint64_t>(invValue[8]) * mod[5];
-    accHi += mul_hi_u32(invValue[8], mod[5]);
-    accLow += static_cast<uint64_t>(invValue[9]) * mod[4];
-    accHi += mul_hi_u32(invValue[9], mod[4]);
-    op1[3] = static_cast<uint32_t>(accLow);
-    Int.v64 = accLow;
-    accHi += Int.v32.y;
-    accLow = accHi;
-    accHi = 0;
-  }
-  {
-    accLow += static_cast<uint64_t>(op1[5]) * op2[9];
-    accHi += mul_hi_u32(op1[5], op2[9]);
-    accLow += static_cast<uint64_t>(op1[6]) * op2[8];
-    accHi += mul_hi_u32(op1[6], op2[8]);
-    accLow += static_cast<uint64_t>(op1[7]) * op2[7];
-    accHi += mul_hi_u32(op1[7], op2[7]);
-    accLow += static_cast<uint64_t>(op1[8]) * op2[6];
-    accHi += mul_hi_u32(op1[8], op2[6]);
-    accLow += static_cast<uint64_t>(op1[9]) * op2[5];
-    accHi += mul_hi_u32(op1[9], op2[5]);
-    accLow += static_cast<uint64_t>(invValue[5]) * mod[9];
-    accHi += mul_hi_u32(invValue[5], mod[9]);
-    accLow += static_cast<uint64_t>(invValue[6]) * mod[8];
-    accHi += mul_hi_u32(invValue[6], mod[8]);
-    accLow += static_cast<uint64_t>(invValue[7]) * mod[7];
-    accHi += mul_hi_u32(invValue[7], mod[7]);
-    accLow += static_cast<uint64_t>(invValue[8]) * mod[6];
-    accHi += mul_hi_u32(invValue[8], mod[6]);
-    accLow += static_cast<uint64_t>(invValue[9]) * mod[5];
-    accHi += mul_hi_u32(invValue[9], mod[5]);
-    op1[4] = static_cast<uint32_t>(accLow);
-    Int.v64 = accLow;
-    accHi += Int.v32.y;
-    accLow = accHi;
-    accHi = 0;
-  }
-  {
-    accLow += static_cast<uint64_t>(op1[6]) * op2[9];
-    accHi += mul_hi_u32(op1[6], op2[9]);
-    accLow += static_cast<uint64_t>(op1[7]) * op2[8];
-    accHi += mul_hi_u32(op1[7], op2[8]);
-    accLow += static_cast<uint64_t>(op1[8]) * op2[7];
-    accHi += mul_hi_u32(op1[8], op2[7]);
-    accLow += static_cast<uint64_t>(op1[9]) * op2[6];
-    accHi += mul_hi_u32(op1[9], op2[6]);
-    accLow += static_cast<uint64_t>(invValue[6]) * mod[9];
-    accHi += mul_hi_u32(invValue[6], mod[9]);
-    accLow += static_cast<uint64_t>(invValue[7]) * mod[8];
-    accHi += mul_hi_u32(invValue[7], mod[8]);
-    accLow += static_cast<uint64_t>(invValue[8]) * mod[7];
-    accHi += mul_hi_u32(invValue[8], mod[7]);
-    accLow += static_cast<uint64_t>(invValue[9]) * mod[6];
-    accHi += mul_hi_u32(invValue[9], mod[6]);
-    op1[5] = static_cast<uint32_t>(accLow);
-    Int.v64 = accLow;
-    accHi += Int.v32.y;
-    accLow = accHi;
-    accHi = 0;
-  }
-  {
-    accLow += static_cast<uint64_t>(op1[7]) * op2[9];
-    accHi += mul_hi_u32(op1[7], op2[9]);
-    accLow += static_cast<uint64_t>(op1[8]) * op2[8];
-    accHi += mul_hi_u32(op1[8], op2[8]);
-    accLow += static_cast<uint64_t>(op1[9]) * op2[7];
-    accHi += mul_hi_u32(op1[9], op2[7]);
-    accLow += static_cast<uint64_t>(invValue[7]) * mod[9];
-    accHi += mul_hi_u32(invValue[7], mod[9]);
-    accLow += static_cast<uint64_t>(invValue[8]) * mod[8];
-    accHi += mul_hi_u32(invValue[8], mod[8]);
-    accLow += static_cast<uint64_t>(invValue[9]) * mod[7];
-    accHi += mul_hi_u32(invValue[9], mod[7]);
-    op1[6] = static_cast<uint32_t>(accLow);
-    Int.v64 = accLow;
-    accHi += Int.v32.y;
-    accLow = accHi;
-    accHi = 0;
-  }
-  {
-    accLow += static_cast<uint64_t>(op1[8]) * op2[9];
-    accHi += mul_hi_u32(op1[8], op2[9]);
-    accLow += static_cast<uint64_t>(op1[9]) * op2[8];
-    accHi += mul_hi_u32(op1[9], op2[8]);
-    accLow += static_cast<uint64_t>(invValue[8]) * mod[9];
-    accHi += mul_hi_u32(invValue[8], mod[9]);
-    accLow += static_cast<uint64_t>(invValue[9]) * mod[8];
-    accHi += mul_hi_u32(invValue[9], mod[8]);
-    op1[7] = static_cast<uint32_t>(accLow);
-    Int.v64 = accLow;
-    accHi += Int.v32.y;
-    accLow = accHi;
-    accHi = 0;
-  }
-  {
-    accLow += static_cast<uint64_t>(op1[9]) * op2[9];
-    accHi += mul_hi_u32(op1[9], op2[9]);
-    accLow += static_cast<uint64_t>(invValue[9]) * mod[9];
-    accHi += mul_hi_u32(invValue[9], mod[9]);
-    op1[8] = static_cast<uint32_t>(accLow);
-    Int.v64 = accLow;
-    accHi += Int.v32.y;
-    accLow = accHi;
-    accHi = 0;
-  }
-  op1[9] = static_cast<uint32_t>(accLow);
-  Int.v64 = accLow;
-  if (Int.v32.y)
-    mon_sub_320(op1, mod, 10);
+
+  uint32_t tmp[kOperandSize];
+  for (int i = 0; i < kOperandSize; ++i)
+    tmp[i] = static_cast<uint32_t>(t[i + kOperandSize]);
+
+  BigInt tmpBig;
+  #pragma unroll
+  for (int i = 0; i < kOperandSize; ++i)
+    tmpBig.limb[i] = tmp[i];
+  BigInt modBig;
+  #pragma unroll
+  for (int i = 0; i < kOperandSize; ++i)
+    modBig.limb[i] = mod[i];
+  if (big_compare(tmpBig, modBig) >= 0)
+    big_sub(tmpBig, modBig);
+
+  #pragma unroll
+  for (int i = 0; i < kOperandSize; ++i)
+    op1[i] = tmpBig.limb[i];
 }
 
 // Forward declarations used by trace helper (defined later in file)
@@ -1718,6 +1219,9 @@ GPUFermat::GPUFermat(unsigned device_id,
       prototypeWindowOffsets(),
       lastPrototypeCount(0),
       lastPrototypeWindowCount(0),
+      primeReciprocalsUploaded(false),
+      primeBaseConstantsUploaded(false),
+      primeBaseFingerprint(0ull),
       sievePrimesConfigured(false),
       configuredPrimeCount(0) {
   log_str("Creating CUDA GPUFermat", LOG_D);
@@ -1816,6 +1320,15 @@ void GPUFermat::uploadPrimeBaseConstants() {
   const uint32_t *prime_base_words =
       buffer_cast<const uint32_t>(primeBase.HostData);
 
+  /* fingerprint prime base to avoid redundant constant uploads */
+  uint64_t fp = 1469598103934665603ull; // FNV offset basis
+  for (unsigned i = 0; i < operandSize; ++i) {
+    fp ^= static_cast<uint64_t>(prime_base_words[i]);
+    fp *= 1099511628211ull; // FNV prime
+  }
+  if (primeBaseConstantsUploaded && fp == primeBaseFingerprint)
+    return;
+
   // (extra-verbose host buffer print removed)
 
   CUDA_CHECK(cudaMemcpyToSymbol(kPrimeBaseConst,
@@ -1823,29 +1336,37 @@ void GPUFermat::uploadPrimeBaseConstants() {
                                 operandSize * sizeof(uint32_t),
                                 0,
                                 cudaMemcpyHostToDevice));
-  // ensure host-side residue vector matches prime count
-  smallPrimeResidues.assign(kSmallPrimeCount, 0u);
-  std::vector<uint32_t> prime_reciprocals;
-  prime_reciprocals.resize(kSmallPrimeCount);
 
-  for (int i = 0; i < kSmallPrimeCount; ++i) {
+  // Residues depend on the current prime base, so refresh every batch.
+  smallPrimeResidues.assign(kSmallPrimeCount, 0u);
+  for (int i = 0; i < kSmallPrimeCount; ++i)
     smallPrimeResidues[i] =
         mod_high_part_host(prime_base_words, kSmallPrimesHost[i]);
-    // recip = floor(2^32 / p) + 1 for use with __umulhi fast division
-    const uint32_t p = kSmallPrimesHost[i];
-    prime_reciprocals[i] = static_cast<uint32_t>(((uint64_t(1) << 32) / p) + 1ull);
-  }
 
   CUDA_CHECK(cudaMemcpyToSymbol(kHighResiduesConst,
                                 smallPrimeResidues.data(),
                                 kSmallPrimeCount * sizeof(uint32_t),
                                 0,
                                 cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpyToSymbol(kPrimeReciprocalsDevice,
-                                prime_reciprocals.data(),
-                                kSmallPrimeCount * sizeof(uint32_t),
-                                0,
-                                cudaMemcpyHostToDevice));
+
+  // Reciprocals depend only on the fixed small-prime table; upload once.
+  if (!primeReciprocalsUploaded) {
+    std::vector<uint32_t> prime_reciprocals(kSmallPrimeCount);
+    for (int i = 0; i < kSmallPrimeCount; ++i) {
+      const uint32_t p = kSmallPrimesHost[i];
+      prime_reciprocals[i] = static_cast<uint32_t>(((uint64_t(1) << 32) / p) + 1ull);
+    }
+
+    CUDA_CHECK(cudaMemcpyToSymbol(kPrimeReciprocalsDevice,
+                                  prime_reciprocals.data(),
+                                  kSmallPrimeCount * sizeof(uint32_t),
+                                  0,
+                                  cudaMemcpyHostToDevice));
+    primeReciprocalsUploaded = true;
+  }
+
+  primeBaseConstantsUploaded = true;
+  primeBaseFingerprint = fp;
 }
 
 void GPUFermat::ensurePrototypeOutputCapacity(size_t required) {
@@ -2041,24 +1562,45 @@ void GPUFermat::run_cuda(uint32_t batchElements) {
   const uint32_t work = std::min(batchElements, elementsNum);
   log_str("running " + std::to_string(work) + " fermat tests on the gpu", LOG_D);
 
+  /* Upload constants once per batch; they rarely change and can serialize work
+   * if sent every chunk. */
+  uploadPrimeBaseConstants();
+
   const uint32_t threads = GroupSize;
-  const uint32_t maxBlocks = std::max(1u, groupsNum * 4u);
+    /* Allow deeper launch to improve occupancy on GA106-class GPUs. */
+    const uint32_t maxBlocks = std::max(1u, groupsNum * 8u);
   const uint32_t streamCount = static_cast<uint32_t>(streams.size());
-  const uint32_t chunkSize =
-      std::max<uint32_t>(threads, (work + streamCount - 1u) / streamCount);
+    /* Let smaller chunks launch more blocks when work is uneven. */
+    const uint32_t chunkSize = std::max<uint32_t>(threads / 2u,
+      (work + streamCount - 1u) / streamCount);
+
+  /* Events to chain H2D -> kernel -> D2H while alternating streams to overlap
+   * the stages. Reuse a small ring of events to limit allocations. */
+  std::vector<cudaEvent_t> h2d_events(streamCount);
+  std::vector<cudaEvent_t> kernel_events(streamCount);
+  for (uint32_t i = 0; i < streamCount; ++i) {
+    CUDA_CHECK(cudaEventCreateWithFlags(&h2d_events[i], cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreateWithFlags(&kernel_events[i], cudaEventDisableTiming));
+  }
 
   uint32_t processed = 0;
   uint32_t chunkIndex = 0;
   while (processed < work) {
     const uint32_t chunk = std::min(chunkSize, work - processed);
-    cudaStream_t chunkStream = streams[chunkIndex % streamCount];
 
-    numbers.copyToDevice(chunkStream, chunk, processed);
+    /* pipeline: copy on stream A, kernel on stream B after copy, D2H on stream C
+     * after kernel. This overlaps N, N+1, N-1 across streams. */
+    const uint32_t slot = chunkIndex % streamCount;
+    const uint32_t kernel_slot = (slot + 1) % streamCount;
+    const uint32_t d2h_slot = (slot + 2) % streamCount;
+    cudaStream_t h2dStream = streams[slot];
+    cudaStream_t kernelStream = streams[kernel_slot];
+    cudaStream_t d2hStream = streams[d2h_slot];
 
-    /* Ensure the device constant prime base matches the host buffer for this
-     * chunk. Upload before the kernel launch to avoid races where the host
-     * updates `primeBase.HostData` between batches. */
-    uploadPrimeBaseConstants();
+    numbers.copyToDevice(h2dStream, chunk, processed);
+    CUDA_CHECK(cudaEventRecord(h2d_events[slot], h2dStream));
+
+    CUDA_CHECK(cudaStreamWaitEvent(kernelStream, h2d_events[slot], 0));
 
     const uint32_t requiredBlocks = (chunk + threads - 1u) / threads;
     const uint32_t blocks = std::max(1u, std::min(requiredBlocks, maxBlocks));
@@ -2068,13 +1610,15 @@ void GPUFermat::run_cuda(uint32_t batchElements) {
     ResultWord *results_device =
       buffer_cast<ResultWord>(gpuResults.DeviceData) + processed;
 
-    fermatTest320Kernel<<<blocks, threads, 0, chunkStream>>>(
+    fermatTest320Kernel<<<blocks, threads, 0, kernelStream>>>(
       number_device,
       results_device,
       chunk);
     CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaEventRecord(kernel_events[kernel_slot], kernelStream));
 
-    gpuResults.copyToHost(chunkStream, chunk, processed);
+    CUDA_CHECK(cudaStreamWaitEvent(d2hStream, kernel_events[kernel_slot], 0));
+    gpuResults.copyToHost(d2hStream, chunk, processed);
 
     processed += chunk;
     ++chunkIndex;
@@ -2082,6 +1626,11 @@ void GPUFermat::run_cuda(uint32_t batchElements) {
 
   for (cudaStream_t s : streams)
     CUDA_CHECK(cudaStreamSynchronize(s));
+
+  for (uint32_t i = 0; i < streamCount; ++i) {
+    CUDA_CHECK(cudaEventDestroy(h2d_events[i]));
+    CUDA_CHECK(cudaEventDestroy(kernel_events[i]));
+  }
 }
 
 void GPUFermat::dump_device_samples(const uint32_t *sample_indices, unsigned sampleCount) {

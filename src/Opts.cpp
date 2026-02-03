@@ -133,6 +133,7 @@ primes(    "-i", "--sieve-primes",   "number of primes for sieving",            
 shift(     "-f", "--shift",          "the adder shift",                               true),
 cset(      "-r", "--crt",            "use the given Chinese Remainder Theorem file",  true),
 fermat_threads("-d", "--fermat-threads", "number of fermat threads wen using the crt",    true),
+gap_queue_limit(NULL, "--gap-queue-limit", "max queued gaps before sieving pauses (default 8192)", true),
 #ifndef CPU_ONLY
 benchmark( "-b", "--benchmark",      "run a gpu benchmark",                           false),
 use_gpu(   "-g", "--use-gpu",        "use the gpu for Fermat testing",                false),
@@ -219,6 +220,10 @@ license(   "-v", "--license",        "show license of this program",            
   fermat_threads.active = has_arg(fermat_threads.short_opt,  fermat_threads.long_opt);
   if (fermat_threads.active)
     fermat_threads.arg = get_arg(fermat_threads.short_opt,  fermat_threads.long_opt);
+
+  gap_queue_limit.active = has_arg(gap_queue_limit.short_opt, gap_queue_limit.long_opt);
+  if (gap_queue_limit.active)
+    gap_queue_limit.arg = get_arg(gap_queue_limit.short_opt, gap_queue_limit.long_opt);
 
 
 #ifndef CPU_ONLY
@@ -392,6 +397,9 @@ string Opts::get_help()  {
 
   ss << "  " << fermat_threads.short_opt  << "  " << left << setw(18);
   ss << fermat_threads.long_opt << "  " << fermat_threads.description << "\n\n";
+
+  ss << "      " << left << setw(18);
+  ss << gap_queue_limit.long_opt << "  " << gap_queue_limit.description << "\n\n";
 
 #ifndef CPU_ONLY
   ss << "  " << benchmark.short_opt  << "  " << left << setw(18);

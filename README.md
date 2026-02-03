@@ -195,6 +195,15 @@ When `--cuda-sieve-proto` is supplied (on the CUDA binary), the miner routes the
     semantics. This makes side-by-side comparisons and parity testing
     straightforward.
 
+- CRT (Chinese sieve) quality-of-life:
+  - Added backpressure to the CRT gap queue to prevent runaway heap growth; Fermat
+    consumers wake producers as they drain the queue.
+  - Priority scoring now prefers gaps with higher candidate density and higher
+    current target, so Fermat threads focus on stronger gaps first.
+  - New option `--gap-queue-limit <N>` lets you tune the queue cap at runtime
+    (default `8192`). Lower it to conserve RAM/locking when `--sieve-primes` is
+    large; raise it if Fermat throughput is high and you want a deeper backlog.
+
 - Other developer tooling:
   - Added `tools/offset_difficulty` — a small deterministic utility that
     computes `PoW::difficulty()` for given `prime_base`, `target` and a list

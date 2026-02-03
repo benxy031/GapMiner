@@ -397,12 +397,15 @@ int main(int argc, char *argv[]) {
         }
 #else
         cout << get_time();
-        cout << "pps: "      << (uint64_t) miner->primes_per_sec();
-        cout << " / "        << (uint64_t) miner->avg_primes_per_sec();
-        cout << "  tests/s " << (uint64_t) miner->tests_per_second();
-        cout << " / "        << (uint64_t) miner->avg_tests_per_second();
-        cout << "  gaps/s " << (uint64_t) miner->gaps_per_second();
-        cout << " / "        << (uint64_t) miner->avg_gaps_per_second();
+        cout << fixed << setprecision(2);
+        cout << "pps: "      << miner->primes_per_sec();
+        cout << " / "        << miner->avg_primes_per_sec();
+        cout << "  tests/s " << miner->tests_per_second();
+        cout << " / "        << miner->avg_tests_per_second();
+        cout << "  gaps/s " << miner->gaps_per_second();
+        cout << " / "        << miner->avg_gaps_per_second();
+        cout.unsetf(ios::floatfield);
+        cout << setprecision(6);
         if (opts->has_cset()) {
           cout << "  gaplist " << ChineseSieve::gaplist_size();
           cout << "  block [" << setprecision(3);

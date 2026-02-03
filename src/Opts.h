@@ -87,6 +87,7 @@ class Opts {
     SingleOpt shift;
     SingleOpt cset;
     SingleOpt fermat_threads;
+    SingleOpt gap_queue_limit;
 #ifndef CPU_ONLY
     SingleOpt benchmark;
     SingleOpt use_gpu;
@@ -176,6 +177,9 @@ class Opts {
 
     bool has_fermat_threads()   { return fermat_threads.active; }
     string get_fermat_threads() { return fermat_threads.arg;    }
+
+    bool has_gap_queue_limit()   { return gap_queue_limit.active; }
+    string get_gap_queue_limit() { return gap_queue_limit.arg;    }
                                                         
 #ifndef CPU_ONLY                                                        
     bool has_benchmark()        { return benchmark.active;      }

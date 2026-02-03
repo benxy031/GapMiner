@@ -17,6 +17,7 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 #include <gmp.h>
+#include <pthread.h>
 #include "ChineseSet.h"
 #include "GapCandidate.h"
 #include "PoWCore/src/PoW.h"
@@ -65,12 +66,22 @@ class ChineseSieve : public Sieve {
 
     /* stores the found gaps in an shared heap */
     static vector<GapCandidate *> gaps;
+
+    /* pooled GapCandidates to avoid repeated alloc/free */
+    static vector<GapCandidate *> gap_pool;
+    static uint32_t gap_pool_limit;
     
     /* calculated gaps since the last share */
     static sieve_t gaps_since_share;
 
     /* sync mutex */
     static pthread_mutex_t mutex;
+
+    /* condition variable to signal gap availability */
+    static pthread_cond_t gap_cv;
+
+    /* maximum queued gaps before sieving pauses */
+    static uint32_t gap_queue_limit;
 
     /* the maximum possible merit with the crt */
     double max_merit;

@@ -58,6 +58,9 @@ class HybridSieve : public Sieve {
                 uint64_t n_tests    = 8,
                 uint64_t queue_size = 10);
 
+        /* increment GPU gap counters for stats */
+        void increment_gap_counters(uint64_t count = 1);
+
     ~HybridSieve();
 
     /** 

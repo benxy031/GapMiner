@@ -72,13 +72,25 @@ void *new_chinese(void *opts) {
                                     (uint32_t) (PoWUtils::gettime_usec() >> 32) ^
                                     rand());
 
-  sieve_t max_rand    = copt->n_primes * copt->range;
-  if (max_rand) 
-    chinese->n_primes = (copt->n_primes + (rand128(chinese->rand) % (max_rand * 2))) - max_rand;
-  else
-    chinese->n_primes = copt->n_primes;
+  /* interpret range as percentage deviation from n_primes */
+  const double range_pct = copt->range;
+  const sieve_t max_rand = (range_pct > 0.0) ? (sieve_t) (copt->n_primes * (range_pct / 100.0)) : 0;
+  const sieve_t min_primes = (copt->fixed_len > 1 ? copt->fixed_len : 1);
+  const sieve_t max_primes = copt->n_primes + max_rand;
 
-  for (sieve_t i = 0; i < copt->n_primes + max_rand; i++)
+  if (max_rand) {
+    int64_t delta = (int64_t)(rand128(chinese->rand) % (max_rand * 2 + 1)) - (int64_t) max_rand;
+    int64_t candidate = (int64_t) copt->n_primes + delta;
+    if (candidate < (int64_t) min_primes)
+      candidate = min_primes;
+    if (candidate > (int64_t) max_primes)
+      candidate = max_primes;
+    chinese->n_primes = (sieve_t) candidate;
+  } else {
+    chinese->n_primes = copt->n_primes;
+  }
+
+  for (sieve_t i = 0; i < max_primes; i++)
     mpz_mul_ui(chinese->mpz_primorial, chinese->mpz_primorial, first_primes[i]);
 
   sieve_t max_sievesize = copt->merit * (mpz_log(chinese->mpz_primorial) + log(2) * copt->bits);
@@ -96,11 +108,12 @@ void *new_chinese(void *opts) {
   chinese->sieve     = (sieve_t *) malloc(max_sievesize / 8 + 64);
   chinese->fixed_len = copt->fixed_len;
 
-  chinese->primes    = (sieve_t *) malloc(sizeof(sieve_t) * (copt->n_primes + max_rand + 10));
-  chinese->offsets   = (sieve_t *) malloc(sizeof(sieve_t) * (copt->n_primes + max_rand + 10));
+  const sieve_t alloc_primes = max_primes + 10;
+  chinese->primes    = (sieve_t *) malloc(sizeof(sieve_t) * alloc_primes);
+  chinese->offsets   = (sieve_t *) malloc(sizeof(sieve_t) * alloc_primes);
 
-  memcpy(chinese->primes,  first_primes, sizeof(sieve_t) * (copt->n_primes + max_rand + 10));
-  memset(chinese->offsets, 0, sizeof(sieve_t) * (copt->n_primes + max_rand + 10));
+  memcpy(chinese->primes,  first_primes, sizeof(sieve_t) * alloc_primes);
+  memset(chinese->offsets, 0, sizeof(sieve_t) * alloc_primes);
   set_sieve_optimal(chinese);
 
   return (void *) chinese;
