@@ -28,6 +28,8 @@
 #include <signal.h>
 #include <string.h>
 #include <iomanip>
+#include <algorithm>
+#include <deque>
 #include "BlockHeader.h"
 #include "Miner.h"
 #include "PoWCore/src/PoWUtils.h"
@@ -355,9 +357,60 @@ int main(int argc, char *argv[]) {
     string platfrom  = (opts->has_platform() ? string(opts->get_platform()) : "amd", "nvidia");
     unsigned workItems = (opts->has_work_items() ? atoi(opts->get_work_items().c_str()) : 2048);
 
-    GPUFermat::get_instance(dev_id, platfrom.c_str(), workItems);
+    GPUFermat *fermat = GPUFermat::get_instance(dev_id, platfrom.c_str(), workItems);
+
+    if (opts->has_extra_vb() || opts->has_dump_config()) {
+      std::ostringstream cfg;
+      cfg << get_time() << "Config: threads=" << n_threads
+          << " stats=" << sec
+          << " shift=" << shift
+          << " sieve_size=" << sieve_size
+          << " sieve_primes=" << primes
+          << " use_gpu=1"
+          << " platform=" << (opts->has_platform() ? opts->get_platform() : "amd")
+          << " gpu_dev=" << dev_id
+          << " work_items=" << workItems
+          << " num_gpu_tests=" << (opts->has_n_tests() ? opts->get_n_tests() : "")
+          << " queue_size=" << (opts->has_queue_size() ? opts->get_queue_size() : "")
+          << " cuda_sieve_proto=" << (opts->use_cuda_sieve_proto() ? "on" : "off")
+          << " bitmap_pool_buffers=" << (opts->has_bitmap_pool_buffers() ? opts->get_bitmap_pool_buffers() : "")
+          << " snapshot_pool_buffers=" << (opts->has_snapshot_pool_buffers() ? opts->get_snapshot_pool_buffers() : "")
+          << " gpu_launch_divisor=" << (opts->has_gpu_launch_divisor() ? opts->get_gpu_launch_divisor() : "")
+          << " gpu_launch_wait_ms=" << (opts->has_gpu_launch_wait_ms() ? opts->get_gpu_launch_wait_ms() : "");
+#ifdef USE_CUDA_BACKEND
+      if (fermat) {
+        cfg << " cuda_block=" << fermat->get_block_size()
+            << " cuda_streams=" << fermat->get_stream_count()
+            << " cuda_elements=" << fermat->get_elements_num();
+      }
+#endif
+      if (opts->has_extra_vb()) {
+        extra_verbose_log(cfg.str());
+      } else {
+        pthread_mutex_lock(&io_mutex);
+        cout << cfg.str() << endl;
+        pthread_mutex_unlock(&io_mutex);
+      }
+    }
   }
 #endif
+
+  if ((opts->has_extra_vb() || opts->has_dump_config()) && !opts->has_use_gpu()) {
+    std::ostringstream cfg;
+    cfg << get_time() << "Config: threads=" << n_threads
+        << " stats=" << sec
+        << " shift=" << shift
+        << " sieve_size=" << sieve_size
+        << " sieve_primes=" << primes
+        << " use_gpu=0";
+    if (opts->has_extra_vb()) {
+      extra_verbose_log(cfg.str());
+    } else {
+      pthread_mutex_lock(&io_mutex);
+      cout << cfg.str() << endl;
+      pthread_mutex_unlock(&io_mutex);
+    }
+  }
  
 
   miner = new Miner(sieve_size, primes, n_threads);
@@ -371,6 +424,16 @@ int main(int argc, char *argv[]) {
 
   
   /* print status information while mining */
+    struct RateSample {
+      double pps;
+      double tests;
+      double gaps;
+    };
+    std::deque<RateSample> rate_samples;
+    const size_t max_samples = std::max<size_t>(1u, (300u + sec - 1u) / sec);
+    const size_t avg60_samples = std::max<size_t>(1u, (60u + sec - 1u) / sec);
+    const size_t avg300_samples = max_samples;
+
   while (running) {
     sleep(sec);
 
@@ -396,14 +459,48 @@ int main(int argc, char *argv[]) {
           cout << miner->next_share_percent() << " %]";
         }
 #else
+        const double pps = miner->primes_per_sec();
+        const double tests = miner->tests_per_second();
+        const double gaps = miner->gaps_per_second();
+
+        rate_samples.push_back({pps, tests, gaps});
+        while (rate_samples.size() > max_samples)
+          rate_samples.pop_front();
+
+        auto compute_avg = [&](size_t window, double &pps_avg, double &tests_avg, double &gaps_avg) {
+          const size_t count = std::min(window, rate_samples.size());
+          if (count == 0) {
+            pps_avg = tests_avg = gaps_avg = 0.0;
+            return;
+          }
+          double pps_sum = 0.0;
+          double tests_sum = 0.0;
+          double gaps_sum = 0.0;
+          for (size_t i = rate_samples.size() - count; i < rate_samples.size(); ++i) {
+            pps_sum += rate_samples[i].pps;
+            tests_sum += rate_samples[i].tests;
+            gaps_sum += rate_samples[i].gaps;
+          }
+          pps_avg = pps_sum / static_cast<double>(count);
+          tests_avg = tests_sum / static_cast<double>(count);
+          gaps_avg = gaps_sum / static_cast<double>(count);
+        };
+
+        double pps_avg_60 = 0.0, tests_avg_60 = 0.0, gaps_avg_60 = 0.0;
+        double pps_avg_300 = 0.0, tests_avg_300 = 0.0, gaps_avg_300 = 0.0;
+        compute_avg(avg60_samples, pps_avg_60, tests_avg_60, gaps_avg_60);
+        compute_avg(avg300_samples, pps_avg_300, tests_avg_300, gaps_avg_300);
+
         cout << get_time();
         cout << fixed << setprecision(2);
-        cout << "pps: "      << miner->primes_per_sec();
+        cout << "pps: "      << pps;
         cout << " / "        << miner->avg_primes_per_sec();
-        cout << "  tests/s " << miner->tests_per_second();
+        cout << "  tests/s " << tests;
         cout << " / "        << miner->avg_tests_per_second();
-        cout << "  gaps/s " << miner->gaps_per_second();
+        cout << "  gaps/s " << gaps;
         cout << " / "        << miner->avg_gaps_per_second();
+        cout << "  avg60s " << pps_avg_60 << "/" << tests_avg_60 << "/" << gaps_avg_60;
+        cout << "  avg300s " << pps_avg_300 << "/" << tests_avg_300 << "/" << gaps_avg_300;
         cout.unsetf(ios::floatfield);
         cout << setprecision(6);
         if (opts->has_cset()) {

@@ -127,6 +127,7 @@ stats(     "-j", "--stats-interval", "interval (sec) to print mining information
 threads(   "-t", "--threads",        "number of mining threads",                      true),
 pull(      "-l", "--pull-interval",  "seconds to wait between getwork request",       true),
 timeout(   "-m", "--timeout",        "seconds to wait for server to respond",         true),
+dump_config(NULL, "--dump-config",   "print effective runtime config",                false),
 stratum(   "-c", "--stratum",        "use stratum protocol for connection",           false),
 sievesize( "-s", "--sieve-size",     "the prime sieve size",                          true),
 primes(    "-i", "--sieve-primes",   "number of primes for sieving",                  true),
@@ -146,8 +147,7 @@ cuda_sieve_proto(NULL, "--cuda-sieve-proto", "run the experimental CUDA sieve pr
 bitmap_pool_buffers(NULL, "--bitmap-pool-buffers", "override bitmap buffer pool size (default queue-size+2)", true),
 snapshot_pool_buffers(NULL, "--snapshot-pool-buffers", "override CUDA residue snapshot pool size", true),
 gpu_launch_divisor(NULL, "--gpu-launch-divisor", "override GPU launch divisor (default 6, lower = faster launches)", true),
-gpu_launch_wait_ms(NULL, "--gpu-launch-wait-ms", "maximum wait in ms before forcing a partial GPU batch (default 50)", true),
-  min_gap(NULL, "--min-gap", "minimum prime gap length to accept (overrides auto calculation)", true),
+  gpu_launch_wait_ms(NULL, "--gpu-launch-wait-ms", "maximum wait in ms before forcing a partial GPU batch (default 50)", true),
 #endif
 calc_ctr(  NULL, "--calc-ctr",       "calculate a chinese remainder theorem file",    false),
 ctr_strength(NULL, "--ctr-strength", "more = longer time and mybe better result",     true),
@@ -198,6 +198,8 @@ license(   "-v", "--license",        "show license of this program",            
   timeout.active = has_arg(timeout.short_opt,  timeout.long_opt);
   if (timeout.active)
     timeout.arg = get_arg(timeout.short_opt,  timeout.long_opt);
+
+  dump_config.active = has_arg(dump_config.short_opt, dump_config.long_opt);
 
   stratum.active = has_arg(stratum.short_opt,  stratum.long_opt);
                                           
@@ -277,9 +279,6 @@ license(   "-v", "--license",        "show license of this program",            
   if (gpu_launch_wait_ms.active)
     gpu_launch_wait_ms.arg = get_arg(gpu_launch_wait_ms.short_opt,
                                      gpu_launch_wait_ms.long_opt);
-  min_gap.active = has_arg(min_gap.short_opt, min_gap.long_opt);
-  if (min_gap.active)
-    min_gap.arg = get_arg(min_gap.short_opt, min_gap.long_opt);
 #endif    
 
   calc_ctr.active = has_arg(calc_ctr.short_opt, calc_ctr.long_opt);
@@ -380,6 +379,9 @@ string Opts::get_help()  {
   ss << "  " << timeout.short_opt  << "  " << left << setw(18);
   ss << timeout.long_opt << "  " << timeout.description << "\n\n";
 
+  ss << "      " << left << setw(18);
+  ss << dump_config.long_opt << "  " << dump_config.description << "\n\n";
+
   ss << "  " << stratum.short_opt  << "  " << left << setw(18);
   ss << stratum.long_opt << "  " << stratum.description << "\n\n";
 
@@ -437,9 +439,6 @@ string Opts::get_help()  {
 
   ss << "      " << left << setw(18);
   ss << gpu_launch_wait_ms.long_opt << "  " << gpu_launch_wait_ms.description << "\n\n";
-
-  ss << "      " << left << setw(18);
-  ss << min_gap.long_opt << "  " << min_gap.description << "\n\n";
 #endif  
 
   ss << "      " << left << setw(18);

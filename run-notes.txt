@@ -26,7 +26,7 @@
 2026-01-26 RTX 3060 Optimized Config
 ------------------------------------
 Tuned configuration for NVIDIA RTX 3060 with --cuda-sieve-proto:
-- Command: `./gapminer-cuda -o 127.0.0.1 -p 31397 -u user -x pass --use-gpu -a nvidia -w 8192 -n 96 --cuda-sieve-proto --sieve-size 20000000 --sieve-primes 5000000 --queue-size 65536 --bitmap-pool-buffers 2048 --snapshot-pool-buffers 64 --gpu-launch-divisor 24 --gpu-launch-wait-ms 100 --min-gap 1000 -e`
+- Command: `./gapminer-cuda -o 127.0.0.1 -p 31397 -u user -x pass --use-gpu -a nvidia -w 8192 -n 96 --cuda-sieve-proto --sieve-size 20000000 --sieve-primes 5000000 --queue-size 65536 --bitmap-pool-buffers 2048 --snapshot-pool-buffers 64 --gpu-launch-divisor 24 --gpu-launch-wait-ms 100 -e`
 - Performance: ~1.1M pps, ~4.8M tests/s, stable GPU batches (avg 96 tests), ~7GB RAM usage.
 - Key changes: Increased sieve params for faster CPU production, scaled buffer pools to reduce RAM from 25GB to 7GB, adjusted launch params for better batching.
 - Note: Standard CUDA (without --cuda-sieve-proto) may offer higher throughput (~2.2M pps), but proto provides experimental GPU sieve offloading with optimized tuning.

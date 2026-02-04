@@ -172,8 +172,9 @@ When `--cuda-sieve-proto` is supplied (on the CUDA binary), the miner routes the
   exact offsets that originated from each sieve round.
 - **Visibility & tuning** – Extra verbose logging (`-e`) will emit
   `CUDA sieve prototype batched N windows; candidates=...` lines so you can see
-  how often batching kicks in. Combine this with `--work-items`/`--queue-size`
-  to keep the GPU fed.
+  how often batching kicks in. It also logs a compact perf summary line:
+  `CUDA sieve perf: windows=... total_bits=... total_words=... residue_words=... compact_scan=yes|no`.
+  Combine this with `--work-items`/`--queue-size` to keep the GPU fed.
 
 ### Recent changes (Jan 2026)
 
@@ -220,6 +221,14 @@ while keeping full trace logs available in the `tests` extra-verbose file.
   - `sievePrototypeScanKernel` reverted to atomicAdd-based implementation for
     correctness and stability, avoiding shared memory layout bugs that caused
     illegal memory access and reduced batching efficiency.
+
+- CUDA sieve prototype improvements (Feb 2026):
+  - Residue snapshots are uploaded and expanded into bitmaps in a single batched
+    kernel launch across all windows, reducing per-window H2D copies and kernel
+    launch overhead.
+  - Compact-scan candidate emission reduces atomic contention by reserving
+    output slots per 32-bit word and writing multiple candidates per atomicAdd.
+  - Extra-verbose perf counters report batching size and compact-scan usage.
 
 See [sievePrototypeKernel.txt](sievePrototypeKernel.txt) and
 [run-notes.txt](run-notes.txt) for deeper dive notes, troubleshooting tips, and
@@ -292,7 +301,7 @@ The RTX 3060 (3584 CUDA cores, 28 SMs, 12GB GDDR6) works best with these paramet
   --sieve-size 20000000 --sieve-primes 5000000 \
   --queue-size 65536 --bitmap-pool-buffers 2048 \
   --snapshot-pool-buffers 64 --gpu-launch-divisor 24 \
-  --gpu-launch-wait-ms 100 --min-gap 1000 -e
+  --gpu-launch-wait-ms 100 -e
 ```
 
 **Tuning methodology:**

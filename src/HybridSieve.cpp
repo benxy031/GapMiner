@@ -901,28 +901,11 @@ void *HybridSieve::gpu_work_thread(void *args) {
                                : 2;
 
       sieve_t min_len = computed_min_len;
-      sieve_t override_len = 0;
-      bool has_override = false;
-      if (opts && opts->has_min_gap()) {
-        has_override = true;
-        unsigned long long parsed = strtoull(opts->get_min_gap().c_str(), NULL, 10);
-        if (parsed < 2ull)
-          parsed = 2ull;
-        if (parsed >= static_cast<unsigned long long>(item->sievesize)) {
-          parsed = (item->sievesize > 2)
-                       ? static_cast<unsigned long long>((item->sievesize & ~((sieve_t) 1)) - 2)
-                       : 2ull;
-        }
-        override_len = static_cast<sieve_t>(parsed & ~1ull);
-        min_len = override_len;
-      }
 
       if (Opts::get_instance() && Opts::get_instance()->has_extra_vb()) {
         std::ostringstream ss;
         ss << get_time() << " effective min_len=" << min_len
            << " computed=" << computed_min_len;
-        if (has_override)
-          ss << " override=" << override_len;
         ss << " sievesize=" << item->sievesize
            << " round=" << item->sieve_round;
         extra_verbose_log(ss.str());

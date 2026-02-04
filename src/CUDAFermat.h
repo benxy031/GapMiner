@@ -82,6 +82,8 @@ class GPUFermat {
   uint32_t configuredPrimeCount;
 
   std::vector<cudaStream_t> streams;
+  std::vector<cudaEvent_t> h2d_events;
+  std::vector<cudaEvent_t> kernel_events;
   uint32_t computeUnits;
   std::vector<uint32_t> smallPrimeResidues;
   std::vector<uint32_t> prototypeOffsets;

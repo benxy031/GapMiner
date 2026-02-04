@@ -62,6 +62,8 @@ struct PrototypeWindowDesc {
   uint32_t bit_length;
   uint32_t output_base;
   uint32_t base_parity;
+  uint32_t residue_offset;
+  uint32_t residue_count;
 };
 
 __device__ __constant__ uint32_t kSmallPrimesDevice[kSmallPrimeCount] = {
@@ -903,15 +905,22 @@ __global__ void sievePrototypeScanKernel(const uint32_t *bitmap_words,
 
     uint32_t candidate_mask = ~word & parity_mask;
     candidate_mask &= build_tail_mask(valid_bits);
+    const uint32_t bit_count = __popc(candidate_mask);
+    if (bit_count == 0u)
+      continue;
 
-    while (candidate_mask) {
+    const uint32_t base = atomicAdd(window_counts + window_idx, bit_count);
+    if (base >= desc.bit_length)
+      continue;
+    const uint32_t max_write = min(bit_count, desc.bit_length - base);
+
+    uint32_t written = 0u;
+    while (candidate_mask && written < max_write) {
       const uint32_t bit = __ffs(candidate_mask) - 1u;
       candidate_mask &= (candidate_mask - 1u);
       const uint32_t local_bit = local_bit_base + bit;
-
-      const uint32_t slot = atomicAdd(window_counts + window_idx, 1u);
-      if (slot < desc.bit_length)
-        out_offsets[desc.output_base + slot] = local_bit;
+      out_offsets[desc.output_base + base + written] = local_bit;
+      ++written;
     }
   }
 }
@@ -968,6 +977,42 @@ __global__ void sieveBuildBitmapKernel(const uint32_t *primes,
     uint32_t offset = prime_residues[idx];
     while (offset < window_size) {
       atomicOr(bitmap_words + (offset >> 5), 1u << (offset & 31));
+      offset += step;
+    }
+  }
+}
+
+__global__ void sieveBuildBitmapKernelBatch(const uint32_t *primes,
+                                            const uint32_t *prime_residues,
+                                            const PrototypeWindowDesc *descs,
+                                            uint32_t window_count,
+                                            uint32_t *bitmap_words) {
+  const uint32_t window_idx = blockIdx.y;
+  if (window_idx >= window_count)
+    return;
+
+  const PrototypeWindowDesc desc = descs[window_idx];
+  if (desc.word_count == 0 || desc.bit_length == 0 || desc.residue_count == 0)
+    return;
+
+  const uint32_t stride = blockDim.x * gridDim.x;
+  const uint32_t window_size = desc.bit_length;
+  uint32_t *window_bitmap = bitmap_words + desc.word_start;
+
+  for (uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+       idx < desc.residue_count;
+       idx += stride) {
+    const uint32_t prime = primes[idx];
+    if (prime <= 2u)
+      continue;
+    const uint32_t step = prime << 1;
+    if (step == 0u)
+      continue;
+
+    const uint32_t residue = prime_residues[desc.residue_offset + idx];
+    uint32_t offset = residue;
+    while (offset < window_size) {
+      atomicOr(window_bitmap + (offset >> 5), 1u << (offset & 31));
       offset += step;
     }
   }
@@ -1244,6 +1289,20 @@ GPUFermat::GPUFermat(unsigned device_id,
 }
 
 GPUFermat::~GPUFermat() {
+  for (cudaEvent_t &evt : h2d_events) {
+    if (evt) {
+      cudaEventDestroy(evt);
+      evt = nullptr;
+    }
+  }
+  for (cudaEvent_t &evt : kernel_events) {
+    if (evt) {
+      cudaEventDestroy(evt);
+      evt = nullptr;
+    }
+  }
+  h2d_events.clear();
+  kernel_events.clear();
   for (cudaStream_t &s : streams) {
     if (s) {
       cudaStreamDestroy(s);
@@ -1292,6 +1351,13 @@ bool GPUFermat::init_cuda(unsigned device_id, const char *platformId) {
   computeUnits = props.multiProcessorCount;
   for (cudaStream_t &s : streams)
     CUDA_CHECK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
+
+  h2d_events.resize(streams.size());
+  kernel_events.resize(streams.size());
+  for (size_t i = 0; i < streams.size(); ++i) {
+    CUDA_CHECK(cudaEventCreateWithFlags(&h2d_events[i], cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreateWithFlags(&kernel_events[i], cudaEventDisableTiming));
+  }
 
   if (Opts::get_instance() && Opts::get_instance()->has_extra_vb()) {
     std::ostringstream ss;
@@ -1575,13 +1641,7 @@ void GPUFermat::run_cuda(uint32_t batchElements) {
       (work + streamCount - 1u) / streamCount);
 
   /* Events to chain H2D -> kernel -> D2H while alternating streams to overlap
-   * the stages. Reuse a small ring of events to limit allocations. */
-  std::vector<cudaEvent_t> h2d_events(streamCount);
-  std::vector<cudaEvent_t> kernel_events(streamCount);
-  for (uint32_t i = 0; i < streamCount; ++i) {
-    CUDA_CHECK(cudaEventCreateWithFlags(&h2d_events[i], cudaEventDisableTiming));
-    CUDA_CHECK(cudaEventCreateWithFlags(&kernel_events[i], cudaEventDisableTiming));
-  }
+   * the stages. Events are created once during init and reused here. */
 
   uint32_t processed = 0;
   uint32_t chunkIndex = 0;
@@ -1627,10 +1687,6 @@ void GPUFermat::run_cuda(uint32_t batchElements) {
   for (cudaStream_t s : streams)
     CUDA_CHECK(cudaStreamSynchronize(s));
 
-  for (uint32_t i = 0; i < streamCount; ++i) {
-    CUDA_CHECK(cudaEventDestroy(h2d_events[i]));
-    CUDA_CHECK(cudaEventDestroy(kernel_events[i]));
-  }
 }
 
 void GPUFermat::dump_device_samples(const uint32_t *sample_indices, unsigned sampleCount) {
@@ -1715,8 +1771,10 @@ void GPUFermat::prototype_sieve_batch(const SievePrototypeParams *params,
   };
 
   std::vector<WindowAttributes> window_attrs(window_count);
-  std::vector<uint32_t> residue_indices;
-  residue_indices.reserve(window_count);
+  std::vector<uint32_t> residue_offsets(window_count, 0u);
+  std::vector<uint32_t> residue_counts(window_count, 0u);
+  std::vector<uint32_t> residue_buffer;
+  residue_buffer.reserve(window_count * 16u);
 
   bool requires_single = false;
   for (uint32_t idx = 0; idx < window_count; ++idx) {
@@ -1746,8 +1804,13 @@ void GPUFermat::prototype_sieve_batch(const SievePrototypeParams *params,
 
     window_attrs[idx].has_bitmap = has_host_bitmap;
     window_attrs[idx].has_residue = has_residue_snapshot;
-    if (has_residue_snapshot)
-      residue_indices.push_back(idx);
+    if (has_residue_snapshot && params[idx].prime_count > 0) {
+      residue_offsets[idx] = static_cast<uint32_t>(residue_buffer.size());
+      residue_counts[idx] = params[idx].prime_count;
+      residue_buffer.insert(residue_buffer.end(),
+                            params[idx].prime_starts,
+                            params[idx].prime_starts + params[idx].prime_count);
+    }
   }
 
   if (requires_single) {
@@ -1827,64 +1890,119 @@ void GPUFermat::prototype_sieve_batch(const SievePrototypeParams *params,
   sievePrototypeWindowBits.copyToDevice(stream, window_count + 1);
   sievePrototypeWindowBases.copyToDevice(stream, window_count);
 
-  if (!residue_indices.empty()) {
-    uint32_t *bitmap_device_base =
-        buffer_cast<uint32_t>(sievePrototypeBitmap.DeviceData);
-    for (uint32_t idx : residue_indices) {
-      if (!window_attrs[idx].has_residue)
-        continue;
-      const uint32_t prime_count = params[idx].prime_count;
-      if (prime_count == 0)
-        continue;
+  if (!residue_buffer.empty()) {
+    ensurePrototypeResidueCapacity(residue_buffer.size());
+    memcpy(buffer_cast<uint32_t>(sievePrototypeResidues.HostData),
+           residue_buffer.data(),
+           residue_buffer.size() * sizeof(uint32_t));
+    sievePrototypeResidues.copyToDevice(stream, residue_buffer.size());
+  }
 
-      ensurePrototypeResidueCapacity(prime_count);
-      memcpy(buffer_cast<uint32_t>(sievePrototypeResidues.HostData),
-             params[idx].prime_starts,
-             prime_count * sizeof(uint32_t));
-      sievePrototypeResidues.copyToDevice(stream, prime_count);
+  PrototypeWindowDesc *desc_host =
+      buffer_cast<PrototypeWindowDesc>(sievePrototypeWindowDescs.HostData);
+  for (uint32_t idx = 0; idx < window_count; ++idx) {
+    desc_host[idx].word_start = word_prefix[idx];
+    desc_host[idx].word_count = word_prefix[idx + 1] - word_prefix[idx];
+    desc_host[idx].bit_length = window_bit_lengths[idx];
+    desc_host[idx].output_base = bit_prefix[idx];
+    desc_host[idx].base_parity =
+        static_cast<uint32_t>(base_host[idx] & 1ull);
+    desc_host[idx].residue_offset = residue_offsets[idx];
+    desc_host[idx].residue_count = residue_counts[idx];
+  }
 
-      const uint32_t window_words = word_prefix[idx + 1] - word_prefix[idx];
-      if (window_words == 0)
-        continue;
-      uint32_t *window_bitmap_device = bitmap_device_base + word_prefix[idx];
-      const size_t window_bytes = static_cast<size_t>(window_words) * sizeof(uint32_t);
-      CUDA_CHECK(cudaMemsetAsync(window_bitmap_device, 0, window_bytes, stream));
+  sievePrototypeWindowDescs.copyToDevice(stream, window_count);
 
-      const uint32_t threads = GroupSize;
-      const uint32_t blocks =
-          std::max(1u, (prime_count + threads - 1u) / threads);
-      sieveBuildBitmapKernel<<<blocks, threads, 0, stream>>>(
+  if (!residue_buffer.empty()) {
+    const uint32_t threads = GroupSize;
+    uint32_t max_residue = 0u;
+    for (uint32_t idx = 0; idx < window_count; ++idx)
+      max_residue = std::max(max_residue, residue_counts[idx]);
+    if (max_residue > 0u) {
+      const uint32_t blocks_x =
+          std::max(1u, (max_residue + threads - 1u) / threads);
+      dim3 blocks(blocks_x, window_count, 1u);
+      sieveBuildBitmapKernelBatch<<<blocks, threads, 0, stream>>>(
           buffer_cast<const uint32_t>(sievePrototypePrimes.DeviceData),
           buffer_cast<const uint32_t>(sievePrototypeResidues.DeviceData),
-          prime_count,
-          params[idx].window_size,
-          window_bitmap_device);
+          buffer_cast<const PrototypeWindowDesc>(sievePrototypeWindowDescs.DeviceData),
+          window_count,
+          buffer_cast<uint32_t>(sievePrototypeBitmap.DeviceData));
       CUDA_CHECK(cudaGetLastError());
     }
   }
 
+  auto cpu_window_count = [&](uint32_t idx) -> uint32_t {
+    if (idx >= window_count)
+      return 0u;
+    if (!window_attrs[idx].has_bitmap)
+      return std::numeric_limits<uint32_t>::max();
+    const uint32_t word_start = word_prefix[idx];
+    const uint32_t word_count = word_prefix[idx + 1] - word_prefix[idx];
+    const uint32_t bit_length = window_bit_lengths[idx];
+    if (word_count == 0 || bit_length == 0)
+      return 0u;
+    const uint32_t parity_mask = (base_host[idx] & 1ull) ? 0x55555555u : 0xAAAAAAAAu;
+    const uint32_t *bitmap_words =
+        reinterpret_cast<const uint32_t *>(bitmap_host_bytes);
+    uint32_t total = 0u;
+    auto host_tail_mask = [](uint32_t bits) -> uint32_t {
+      if (bits >= 32u)
+        return 0xFFFFFFFFu;
+      if (bits == 0u)
+        return 0u;
+      return (1u << bits) - 1u;
+    };
+
+    for (uint32_t w = 0; w < word_count; ++w) {
+      const uint32_t local_bit_base = w * 32u;
+      if (local_bit_base >= bit_length)
+        break;
+      const uint32_t remaining_bits = bit_length - local_bit_base;
+      const uint32_t valid_bits = (remaining_bits >= 32u) ? 32u : remaining_bits;
+      uint32_t candidate_mask = ~bitmap_words[word_start + w] & parity_mask;
+      candidate_mask &= host_tail_mask(valid_bits);
+      total += static_cast<uint32_t>(__builtin_popcount(candidate_mask));
+    }
+    return total;
+  };
+
   const bool compact_scan_enabled = Opts::get_instance()->use_cuda_sieve_proto();
+  bool compact_scan_used = false;
   if (compact_scan_enabled &&
       total_bits <= static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
-    PrototypeWindowDesc *desc_host =
-        buffer_cast<PrototypeWindowDesc>(sievePrototypeWindowDescs.HostData);
-    for (uint32_t idx = 0; idx < window_count; ++idx) {
-      desc_host[idx].word_start = word_prefix[idx];
-      desc_host[idx].word_count = word_prefix[idx + 1] - word_prefix[idx];
-      desc_host[idx].bit_length = window_bit_lengths[idx];
-      desc_host[idx].output_base = bit_prefix[idx];
-      desc_host[idx].base_parity =
-          static_cast<uint32_t>(base_host[idx] & 1ull);
-    }
-
     if (run_compact_scan(window_count,
                          static_cast<uint32_t>(total_bits),
                          stream)) {
+      compact_scan_used = true;
       if (Opts::get_instance()->has_extra_vb()) {
         std::ostringstream ss;
         ss << get_time() << "CUDA sieve prototype batched " << window_count
            << " windows; candidates=" << lastPrototypeCount;
         extra_verbose_log(ss.str());
+
+        std::ostringstream perf;
+        perf << get_time() << "CUDA sieve perf: windows=" << window_count
+             << " total_bits=" << total_bits
+             << " total_words=" << total_words
+             << " residue_words=" << residue_buffer.size()
+             << " compact_scan=yes";
+        extra_verbose_log(perf.str());
+
+        if (window_count > 0 && prototypeWindowOffsets.size() > 1) {
+          const uint32_t cpu_count = cpu_window_count(0);
+          const uint32_t gpu_count = prototypeWindowOffsets[1] - prototypeWindowOffsets[0];
+          std::ostringstream chk;
+          if (cpu_count == std::numeric_limits<uint32_t>::max()) {
+            chk << get_time() << "CUDA sieve cpu-check: window=0 cpu=na(residue)"
+                << " gpu=" << gpu_count;
+          } else {
+            chk << get_time() << "CUDA sieve cpu-check: window=0 cpu=" << cpu_count
+                << " gpu=" << gpu_count
+                << " delta=" << static_cast<int64_t>(cpu_count) - static_cast<int64_t>(gpu_count);
+          }
+          extra_verbose_log(chk.str());
+        }
       }
       return;
     }
@@ -1950,6 +2068,29 @@ void GPUFermat::prototype_sieve_batch(const SievePrototypeParams *params,
     ss << get_time() << "CUDA sieve prototype batched " << window_count
        << " windows; candidates=" << lastPrototypeCount;
     extra_verbose_log(ss.str());
+
+    std::ostringstream perf;
+    perf << get_time() << "CUDA sieve perf: windows=" << window_count
+         << " total_bits=" << total_bits
+         << " total_words=" << total_words
+         << " residue_words=" << residue_buffer.size()
+         << " compact_scan=" << (compact_scan_used ? "yes" : "no");
+    extra_verbose_log(perf.str());
+
+    if (window_count > 0 && prototypeWindowOffsets.size() > 1) {
+      const uint32_t cpu_count = cpu_window_count(0);
+      const uint32_t gpu_count = prototypeWindowOffsets[1] - prototypeWindowOffsets[0];
+      std::ostringstream chk;
+      if (cpu_count == std::numeric_limits<uint32_t>::max()) {
+        chk << get_time() << "CUDA sieve cpu-check: window=0 cpu=na(residue)"
+            << " gpu=" << gpu_count;
+      } else {
+        chk << get_time() << "CUDA sieve cpu-check: window=0 cpu=" << cpu_count
+            << " gpu=" << gpu_count
+            << " delta=" << static_cast<int64_t>(cpu_count) - static_cast<int64_t>(gpu_count);
+      }
+      extra_verbose_log(chk.str());
+    }
   }
 }
 
@@ -2036,6 +2177,8 @@ void GPUFermat::prototype_sieve_single(const SievePrototypeParams &params) {
     desc_host[0].bit_length = params.window_size;
     desc_host[0].output_base = 0u;
     desc_host[0].base_parity = base_parity;
+    desc_host[0].residue_offset = 0u;
+    desc_host[0].residue_count = 0u;
 
     if (run_compact_scan(1u, params.window_size, stream)) {
       if (Opts::get_instance()->has_extra_vb()) {
