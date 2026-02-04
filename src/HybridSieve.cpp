@@ -891,14 +891,43 @@ void *HybridSieve::gpu_work_thread(void *args) {
 
       mpz_set(mpz_start, item->mpz_start);
       double d_difficulty = ((double) item->pow->get_target()) / TWO_POW48;
-      sieve_t min_len = log(mpz_get_d(mpz_start)) * d_difficulty;
-      min_len &= ~((sieve_t) 1);
-      if (min_len < 2)
-        min_len = 2;
-      if (min_len >= item->sievesize)
-        min_len = (item->sievesize > 2)
-                      ? ((item->sievesize & ~((sieve_t) 1)) - 2)
-                      : 2;
+      sieve_t computed_min_len = log(mpz_get_d(mpz_start)) * d_difficulty;
+      computed_min_len &= ~((sieve_t) 1);
+      if (computed_min_len < 2)
+        computed_min_len = 2;
+      if (computed_min_len >= item->sievesize)
+        computed_min_len = (item->sievesize > 2)
+                               ? ((item->sievesize & ~((sieve_t) 1)) - 2)
+                               : 2;
+
+      sieve_t min_len = computed_min_len;
+      sieve_t override_len = 0;
+      bool has_override = false;
+      if (opts && opts->has_min_gap()) {
+        has_override = true;
+        unsigned long long parsed = strtoull(opts->get_min_gap().c_str(), NULL, 10);
+        if (parsed < 2ull)
+          parsed = 2ull;
+        if (parsed >= static_cast<unsigned long long>(item->sievesize)) {
+          parsed = (item->sievesize > 2)
+                       ? static_cast<unsigned long long>((item->sievesize & ~((sieve_t) 1)) - 2)
+                       : 2ull;
+        }
+        override_len = static_cast<sieve_t>(parsed & ~1ull);
+        min_len = override_len;
+      }
+
+      if (Opts::get_instance() && Opts::get_instance()->has_extra_vb()) {
+        std::ostringstream ss;
+        ss << get_time() << " effective min_len=" << min_len
+           << " computed=" << computed_min_len;
+        if (has_override)
+          ss << " override=" << override_len;
+        ss << " sievesize=" << item->sievesize
+           << " round=" << item->sieve_round;
+        extra_verbose_log(ss.str());
+      }
+
       batch_min_len[idx] = min_len;
 
 #ifdef USE_CUDA_BACKEND
@@ -933,13 +962,9 @@ void *HybridSieve::gpu_work_thread(void *args) {
         params.sieve_round = static_cast<uint32_t>(
             std::min<sieve_t>(item->sieve_round,
                               static_cast<sieve_t>(numeric_limits<uint32_t>::max())));
-        if (opts->has_min_gap()) {
-          params.min_gap = static_cast<uint32_t>(atoi(opts->get_min_gap().c_str()));
-        } else {
-          params.min_gap = static_cast<uint32_t>(
-              std::min<sieve_t>(min_len,
-                                static_cast<sieve_t>(numeric_limits<uint32_t>::max())));
-        }
+        params.min_gap = static_cast<uint32_t>(
+            std::min<sieve_t>(min_len,
+                              static_cast<sieve_t>(numeric_limits<uint32_t>::max())));
         if (params.window_size == 0)
           continue;
         batch_params.push_back(params);
@@ -1735,6 +1760,12 @@ uint32_t HybridSieve::GPUWorkList::preferred_launch_items() const {
   uint32_t preferred = len / divisor;
   if (preferred == 0)
     preferred = 1u;
+  /* Cap the preferred depth so we don't stall waiting for very deep queues;
+   * launch once we have roughly 1/8th of capacity, but never less than 256. */
+  const uint32_t cap = std::max<uint32_t>(1u, len / 8u);
+  preferred = std::min(preferred, cap);
+  preferred = std::max<uint32_t>(256u, preferred);
+  preferred = std::min(preferred, len);
   return preferred;
 }
 
