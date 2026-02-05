@@ -2314,7 +2314,12 @@ void HybridSieve::GPUWorkList::parse_results(
 
     } /* end if selected item */
 
-    if (cur->skip() || cur->valid()) {
+    /* Check if item should be removed: skip/valid OR fully exhausted.
+     * Exhausted items (get_cur_len() == 0) with unset start field can't
+     * be removed via skip/valid checks, so we explicitly cleanup zombie items. */
+    const bool should_remove = cur->skip() || cur->valid() || cur->get_cur_len() == 0;
+
+    if (should_remove) {
        
        if (cur->valid()) {
 #ifdef DEBUG_FAST
