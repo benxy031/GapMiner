@@ -161,12 +161,13 @@ When `--cuda-sieve-proto` is supplied (on the CUDA binary), the miner routes the
 - **Bitmap ingestion** – Each `SieveItem` hands the ready bitmap to
   `GPUFermat::prototype_sieve_batch()`, which can pack up to four consecutive
   sieve windows into a single kernel launch when the GPU candidate queue is
-  running low. Windows that were built from residue snapshots continue to use
-  the legacy CPU scan so CUDA launches only ever mix bitmap-backed work.
+  running low. Windows built from residue snapshots run as single-window CUDA
+  prototype launches (no multi-window batching), so mixed launches only
+  include bitmap-backed work.
 - **Adaptive batching** – The GPU worker inspects `GPUWorkList` fill levels and
   opportunistically dequeues additional windows so the CUDA kernel amortizes
   transfers over more work without stalling the sieve thread. Windows that rely
-  on residue snapshots are still processed individually.
+  on residue snapshots are still processed individually (one window per launch).
 - **Per-window slices** – Even when launches are batched, the code preserves a
   window-offset index so downstream Fermat/chain validation logic receives the
   exact offsets that originated from each sieve round.
