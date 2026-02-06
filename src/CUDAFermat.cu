@@ -80,6 +80,7 @@ __device__ __constant__ uint32_t kSmallPrimesDevice[kSmallPrimeCount] = {
 __device__ __constant__ uint32_t kPrimeReciprocalsDevice[kSmallPrimeCount];
 __device__ __constant__ uint32_t kPrimeBaseConst[kOperandSize];
 __device__ __constant__ uint32_t kHighResiduesConst[kSmallPrimeCount];
+__device__ __constant__ uint32_t kUseCombaConst;
 
 struct BigInt {
   uint32_t limb[kOperandSize];
@@ -275,6 +276,57 @@ __device__ void montgomery_mul(const BigInt &a,
   #pragma unroll
   for (int i = 0; i < kOperandSize; ++i)
     tmp.limb[i] = static_cast<uint32_t>(t[i + kOperandSize]);
+  if (big_compare(tmp, mod) >= 0)
+    big_sub(tmp, mod);
+  big_copy(out, tmp);
+}
+
+// CIOS Montgomery multiply using t[N] + high carry (smaller temp footprint than t[2N]).
+__device__ void montgomery_mul_cios(const BigInt &a,
+                                    const BigInt &b,
+                                    const BigInt &mod,
+                                    uint32_t nPrime,
+                                    BigInt &out) {
+  uint32_t t[kOperandSize];
+  #pragma unroll
+  for (int i = 0; i < kOperandSize; ++i)
+    t[i] = 0u;
+  uint64_t t_high = 0ull;
+
+  #pragma unroll
+  for (int i = 0; i < kOperandSize; ++i) {
+    uint64_t carry = 0ull;
+    #pragma unroll
+    for (int j = 0; j < kOperandSize; ++j) {
+      uint64_t sum = static_cast<uint64_t>(t[j]) +
+                     static_cast<uint64_t>(a.limb[i]) * b.limb[j] + carry;
+      t[j] = static_cast<uint32_t>(sum);
+      carry = sum >> 32;
+    }
+    t_high += carry;
+
+    const uint32_t m = static_cast<uint32_t>(t[0]) * nPrime;
+    carry = 0ull;
+    #pragma unroll
+    for (int j = 0; j < kOperandSize; ++j) {
+      uint64_t sum = static_cast<uint64_t>(t[j]) +
+                     static_cast<uint64_t>(m) * mod.limb[j] + carry;
+      t[j] = static_cast<uint32_t>(sum);
+      carry = sum >> 32;
+    }
+    t_high += carry;
+
+    #pragma unroll
+    for (int j = 0; j < kOperandSize - 1; ++j)
+      t[j] = t[j + 1];
+    t[kOperandSize - 1] = static_cast<uint32_t>(t_high);
+    t_high >>= 32;
+  }
+
+  BigInt tmp;
+  #pragma unroll
+  for (int i = 0; i < kOperandSize; ++i)
+    tmp.limb[i] = t[i];
   if (big_compare(tmp, mod) >= 0)
     big_sub(tmp, mod);
   big_copy(out, tmp);
@@ -676,8 +728,10 @@ __device__ __forceinline__ void montgomery_mul_fast(const BigInt &a,
                                                     const BigInt &mod,
                                                     uint32_t nPrime,
                                                     BigInt &out) {
-  // Test the unrolled implementation.
-  montgomery_mul_unrolled(a, b, mod, nPrime, out);
+  if (kUseCombaConst)
+    montgomery_mul_cios(a, b, mod, nPrime, out);
+  else
+    montgomery_mul_unrolled(a, b, mod, nPrime, out);
 }
 
 __device__ __forceinline__ int compare_ext(const uint32_t *value,
@@ -1099,6 +1153,33 @@ __global__ void montgomeryMulUnrolledKernel(const BigInt *a,
   big_copy(out[idx], acc);
 }
 
+__global__ void montgomeryMulCombaKernel(const BigInt *a,
+                                         const BigInt *b,
+                                         const BigInt *mod,
+                                         const uint32_t *nPrime,
+                                         BigInt *out,
+                                         uint32_t count,
+                                         uint32_t rounds) {
+  const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= count)
+    return;
+
+  BigInt acc;
+  big_copy(acc, a[idx]);
+  BigInt base;
+  big_copy(base, b[idx]);
+  BigInt modulus;
+  big_copy(modulus, mod[idx]);
+  const uint32_t np = nPrime[idx];
+  BigInt tmp;
+
+  for (uint32_t r = 0; r < rounds; ++r) {
+    montgomery_mul_cios(acc, base, modulus, np, tmp);
+    big_copy(acc, tmp);
+  }
+  big_copy(out[idx], acc);
+}
+
 // Diagnostic kernel: compute montgomery multiplication of (one, r2) via
 // classic and unrolled paths for given samples and write results back.
 __global__ void montgomeryCompareKernel(const uint32_t *numbers,
@@ -1349,6 +1430,13 @@ bool GPUFermat::init_cuda(unsigned device_id, const char *platformId) {
   cudaDeviceProp props;
   CUDA_CHECK(cudaGetDeviceProperties(&props, static_cast<int>(device_id)));
   computeUnits = props.multiProcessorCount;
+  const uint32_t use_comba =
+      (Opts::get_instance() && Opts::get_instance()->use_cuda_comba()) ? 1u : 0u;
+  CUDA_CHECK(cudaMemcpyToSymbol(kUseCombaConst,
+                                &use_comba,
+                                sizeof(use_comba),
+                                0,
+                                cudaMemcpyHostToDevice));
   for (cudaStream_t &s : streams)
     CUDA_CHECK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
 
@@ -2264,6 +2352,8 @@ void GPUFermat::benchmark_montgomery_mul() {
   std::vector<BigInt> hostB(sample_count);
   std::vector<BigInt> hostMod(sample_count);
   std::vector<uint32_t> hostInv(sample_count);
+  std::vector<BigInt> hostClassicOut(sample_count);
+  std::vector<BigInt> hostCombaOut(sample_count);
 
   auto fill_random_bigint = [this](BigInt &n) {
     for (int i = 0; i < kOperandSize; ++i)
@@ -2287,6 +2377,7 @@ void GPUFermat::benchmark_montgomery_mul() {
   BigInt *dMod = nullptr;
   BigInt *dClassicOut = nullptr;
   BigInt *dUnrolledOut = nullptr;
+  BigInt *dCombaOut = nullptr;
   uint32_t *dInv = nullptr;
 
   CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&dA), bigIntBytes));
@@ -2294,6 +2385,7 @@ void GPUFermat::benchmark_montgomery_mul() {
   CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&dMod), bigIntBytes));
   CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&dClassicOut), bigIntBytes));
   CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&dUnrolledOut), bigIntBytes));
+  CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&dCombaOut), bigIntBytes));
   CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&dInv), invBytes));
 
   CUDA_CHECK(cudaMemcpy(dA,
@@ -2348,13 +2440,38 @@ void GPUFermat::benchmark_montgomery_mul() {
   CUDA_CHECK(cudaEventSynchronize(stop));
   CUDA_CHECK(cudaEventElapsedTime(&msUnrolled, start, stop));
 
+  float msComba = 0.0f;
+  CUDA_CHECK(cudaEventRecord(start));
+  montgomeryMulCombaKernel<<<blocks, threads>>>(dA,
+                                                dB,
+                                                dMod,
+                                                dInv,
+                                                dCombaOut,
+                                                sample_count,
+                                                rounds);
+  CUDA_CHECK(cudaGetLastError());
+  CUDA_CHECK(cudaEventRecord(stop));
+  CUDA_CHECK(cudaEventSynchronize(stop));
+  CUDA_CHECK(cudaEventElapsedTime(&msComba, start, stop));
+
   CUDA_CHECK(cudaEventDestroy(start));
   CUDA_CHECK(cudaEventDestroy(stop));
 
   cudaFuncAttributes attrClassic{};
   cudaFuncAttributes attrUnrolled{};
+  cudaFuncAttributes attrComba{};
   CUDA_CHECK(cudaFuncGetAttributes(&attrClassic, montgomeryMulClassicKernel));
   CUDA_CHECK(cudaFuncGetAttributes(&attrUnrolled, montgomeryMulUnrolledKernel));
+  CUDA_CHECK(cudaFuncGetAttributes(&attrComba, montgomeryMulCombaKernel));
+
+  CUDA_CHECK(cudaMemcpy(hostClassicOut.data(),
+                        dClassicOut,
+                        bigIntBytes,
+                        cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(hostCombaOut.data(),
+                        dCombaOut,
+                        bigIntBytes,
+                        cudaMemcpyDeviceToHost));
 
   const double totalOps = static_cast<double>(sample_count) * rounds;
   const double classicPerSec = (msClassic > 0.0f)
@@ -2363,6 +2480,9 @@ void GPUFermat::benchmark_montgomery_mul() {
   const double unrolledPerSec = (msUnrolled > 0.0f)
                                     ? (totalOps * 1000.0 / msUnrolled)
                                     : 0.0;
+  const double combaPerSec = (msComba > 0.0f)
+                                 ? (totalOps * 1000.0 / msComba)
+                                 : 0.0;
 
   pthread_mutex_lock(&io_mutex);
   cout << get_time() << "Montgomery classic: " << msClassic << " ms, "
@@ -2371,6 +2491,42 @@ void GPUFermat::benchmark_montgomery_mul() {
   cout << get_time() << "Montgomery unrolled: " << msUnrolled << " ms, "
        << unrolledPerSec / 1e6 << " Mmul/s, regs=" << attrUnrolled.numRegs
        << endl;
+    cout << get_time() << "Montgomery comba: " << msComba << " ms, "
+      << combaPerSec / 1e6 << " Mmul/s, regs=" << attrComba.numRegs
+      << endl;
+
+  unsigned mismatch = 0;
+  unsigned first_mismatch = sample_count;
+  const unsigned check_count = std::min(16u, sample_count);
+  for (unsigned i = 0; i < check_count; ++i) {
+    for (int limb = 0; limb < kOperandSize; ++limb) {
+      if (hostClassicOut[i].limb[limb] != hostCombaOut[i].limb[limb]) {
+        mismatch++;
+        if (first_mismatch == sample_count)
+          first_mismatch = i;
+        break;
+      }
+    }
+  }
+  if (mismatch == 0) {
+    cout << get_time() << "Montgomery comba check: OK (" << check_count
+         << " samples)" << endl;
+  } else {
+    cout << get_time() << "Montgomery comba check: " << mismatch
+         << " mismatches in " << check_count << " samples" << endl;
+    if (first_mismatch < sample_count) {
+      cout << get_time() << "Comba mismatch sample " << first_mismatch << " classic:";
+      for (int limb = 0; limb < kOperandSize; ++limb)
+        cout << " " << std::hex << std::setw(8) << std::setfill('0')
+             << hostClassicOut[first_mismatch].limb[limb];
+      cout << std::dec << endl;
+      cout << get_time() << "Comba mismatch sample " << first_mismatch << " comba:";
+      for (int limb = 0; limb < kOperandSize; ++limb)
+        cout << " " << std::hex << std::setw(8) << std::setfill('0')
+             << hostCombaOut[first_mismatch].limb[limb];
+      cout << std::dec << endl;
+    }
+  }
   pthread_mutex_unlock(&io_mutex);
 
   cudaFree(dA);
@@ -2378,6 +2534,7 @@ void GPUFermat::benchmark_montgomery_mul() {
   cudaFree(dMod);
   cudaFree(dClassicOut);
   cudaFree(dUnrolledOut);
+  cudaFree(dCombaOut);
   cudaFree(dInv);
 }
 

@@ -245,6 +245,11 @@ int main(int argc, char *argv[]) {
   }
 #endif
 
+#ifndef CPU_ONLY
+  if (opts->use_cuda_comba())
+    std::cout << "CUDA Comba: enabled" << std::endl;
+#endif
+
   if (opts->has_calc_ctr() && 
       opts->has_ctr_primes() &&
       opts->has_ctr_merit() &&
@@ -372,6 +377,7 @@ int main(int argc, char *argv[]) {
           << " work_items=" << workItems
           << " num_gpu_tests=" << (opts->has_n_tests() ? opts->get_n_tests() : "")
           << " queue_size=" << (opts->has_queue_size() ? opts->get_queue_size() : "")
+          << " cuda_comba=" << (opts->use_cuda_comba() ? "on" : "off")
           << " cuda_sieve_proto=" << (opts->use_cuda_sieve_proto() ? "on" : "off")
           << " bitmap_pool_buffers=" << (opts->has_bitmap_pool_buffers() ? opts->get_bitmap_pool_buffers() : "")
           << " snapshot_pool_buffers=" << (opts->has_snapshot_pool_buffers() ? opts->get_snapshot_pool_buffers() : "")

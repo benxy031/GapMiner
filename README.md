@@ -153,6 +153,12 @@ Both miners expose the same CLI surface; simply run the binary you built (`bin/g
    happen on the GPU with adaptive multi-window batching. Requires building
    `gapminer-cuda` and an NVIDIA GPU.
 
+ - `--cuda-comba` use the Comba/CIOS variant of Montgomery multiplication on
+   CUDA (both standard Fermat and experimental sieve prototype). Achieves
+   comparable throughput (~300 Mmul/s on RTX 3060) with reduced register
+   pressure (56 vs. 58 regs), improving GPU occupancy. Works independent of
+   `--cuda-sieve-proto` and is available in both benchmark and mining modes.
+
 ### Experimental CUDA sieve prototype
 
 When `--cuda-sieve-proto` is supplied (on the CUDA binary), the miner routes the
@@ -277,11 +283,14 @@ For CUDA users, aligning the total candidates per launch to the kernel's block s
 
 - **Block size**: The CUDA path exposes a device block-size constant used for launches; the implementation uses a 512-thread block (`kCudaBlockSize`) and provides `GPUFermat::get_block_size()` to query it.
 - **Operand / modulus size**: Montgomery arithmetic is implemented for a 320-bit operand (10 x 32-bit words). This corresponds to `gpu_op_size` / `kOperandSize = 10` in the CUDA code (320-bit montgomery operations).
+- **Montgomery multiplication variants**: The CUDA path supports two Montgomery implementations selectable at runtime:
+  - *Unrolled (default)*: Classic unrolled loop with full digit products (~295 Mmul/s on RTX 3060, 58 registers).
+  - *Comba/CIOS (via `--cuda-comba`)*: Minimizes register spilling via accumulator-based digit product collection (~300 Mmul/s, 56 registers). Improves occupancy on high-register-pressure kernels.
 - **Device capacity (elementsNum)**: The GPU code queries the device per-launch capacity (internal `elementsNum`) and packs candidate offsets to fill the device rather than relying on a small hard-coded cap. This yields better throughput on modern cards.
-- **Experimental CUDA sieve prototype**: When `--cuda-sieve-proto` is enabled the miner batches up to several sieve windows per launch, supports residue-snapshot fallbacks, and requires proper sizing of the `--bitmap-pool-buffers` and `--snapshot-pool-buffers` settings to avoid falling back to CPU scans.
+- **Experimental CUDA sieve prototype**: When `--cuda-sieve-proto` is enabled the miner batches up to several sieve windows per launch, supports residue-snapshot fallbacks, and requires proper sizing of the `--bitmap-pool-buffers` and `--snapshot-pool-buffers` settings to avoid falling back to CPU scans. Comba Montgomery works independently with or without the prototype.
 - **Memory optimizations**: GPU buffers use pinned memory for faster PCIe transfers, with fallback to pageable memory. The prototype outputs candidates as sparse offset lists for efficient processing.
-- **Diagnostics & benchmarks**: The CUDA implementation includes diagnostic kernels and benchmark helpers (montgomery traces, candidate dumps, and `GPUFermat::benchmark_montgomery_mul()` / `GPUFermat::test_gpu()`) useful when investigating correctness or performance regressions. Enable extra-verbose logs (`-e`) to see prototype batching and related messages.
-- **Tuning notes**: Prefer to keep total candidates per launch aligned to the device block size and tune the trio `--work-items`, `--num-gpu-tests`, and `--queue-size` together. Use `--gpu-launch-divisor` and `--gpu-launch-wait-ms` to control batching latency vs. queue depth.
+- **Diagnostics & benchmarks**: The CUDA implementation includes diagnostic kernels and benchmark helpers (montgomery traces, candidate dumps, and `GPUFermat::benchmark_montgomery_mul()` / `GPUFermat::test_gpu()`) useful when investigating correctness or performance regressions. Enable extra-verbose logs (`-e`) to see prototype batching and related messages. The `--benchmark` / `-b` flag displays timing and register count for all Montgomery variants.
+- **Tuning notes**: Prefer to keep total candidates per launch aligned to the device block size and tune the trio `--work-items`, `--num-gpu-tests`, and `--queue-size` together. Use `--gpu-launch-divisor` and `--gpu-launch-wait-ms` to control batching latency vs. queue depth. For reduced register pressure, try `--cuda-comba` which maintains comparable throughput while improving occupancy.
 
 These details reflect the current CUDA sources (`src/CUDAFermat.cu`, `src/HybridSieve.cpp`) and aim to help with tuning and debugging the CUDA backend.
 

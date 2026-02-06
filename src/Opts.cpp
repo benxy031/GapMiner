@@ -144,6 +144,7 @@ queue_size("-z", "--queue-size",     "the gpu waiting queue size (memory intensi
 platform(  "-a", "--platform",       "opencl platform (amd or nvidia)",               true),
 n_tests(   "-n", "--num-gpu-tests",  "the number of test per gap per gpu run",        true),
 cuda_sieve_proto(NULL, "--cuda-sieve-proto", "run the experimental CUDA sieve prototype", false),
+cuda_comba(NULL, "--cuda-comba", "use Comba Montgomery multiply on CUDA", false),
 bitmap_pool_buffers(NULL, "--bitmap-pool-buffers", "override bitmap buffer pool size (default queue-size+2)", true),
 snapshot_pool_buffers(NULL, "--snapshot-pool-buffers", "override CUDA residue snapshot pool size", true),
 gpu_launch_divisor(NULL, "--gpu-launch-divisor", "override GPU launch divisor (default 6, lower = faster launches)", true),
@@ -255,6 +256,8 @@ license(   "-v", "--license",        "show license of this program",            
 
   cuda_sieve_proto.active = has_arg(cuda_sieve_proto.short_opt,
                                     cuda_sieve_proto.long_opt);
+
+  cuda_comba.active = has_arg(cuda_comba.short_opt, cuda_comba.long_opt);
 
   bitmap_pool_buffers.active = has_arg(bitmap_pool_buffers.short_opt,
                                        bitmap_pool_buffers.long_opt);
@@ -427,6 +430,9 @@ string Opts::get_help()  {
 
   ss << "      " << left << setw(18);
   ss << cuda_sieve_proto.long_opt << "  " << cuda_sieve_proto.description << "\n\n";
+
+  ss << "      " << left << setw(18);
+  ss << cuda_comba.long_opt << "  " << cuda_comba.description << "\n\n";
 
   ss << "      " << left << setw(18);
   ss << bitmap_pool_buffers.long_opt << "  " << bitmap_pool_buffers.description << "\n\n";

@@ -118,3 +118,17 @@ requested `-w/--work-items` size.
   `--work-items` value when you want deeper queues and higher launch occupancy;
   when the queue dips under roughly 3k items the prefilling stage will wait up
   to ~50 ms before running a partial batch.
+2026-02-06 CUDA Comba Montgomery Multiplication
+-----------------------------------------------
+- Implemented Comba/CIOS Montgomery multiplication variant in `src/CUDAFermat.cu`
+  as an alternative to the classic unrolled implementation.
+- Comba variant achieves ~300 Mmul/s on RTX 3060 (vs. ~295 Mmul/s unrolled) with
+  reduced register pressure (56 vs. 58 regs), improving GPU occupancy.
+- Runtime flag `--cuda-comba` enables the Comba path in both GPU benchmark and
+  live CUDA mining (independent of `--cuda-sieve-proto`).
+- Configuration is passed to device via constant memory (`kUseCombaConst`) in
+  `GPUFermat::init_cuda()`. Startup config log displays `cuda_comba=on/off`.
+- Benchmark comparison: Classic (0.490 ms, 268 Mmul/s) < Unrolled (0.445 ms, 295 Mmul/s) ≤ Comba (0.436 ms, 300 Mmul/s).
+- Use `--cuda-comba` when targeting lower register pressure or testing higher
+  GPU occupancy; standard unrolled remains default for compatibility.
+- Example: `./gapminer-cuda -o host -p port -u user -x pass --use-gpu -a nvidia -f 43 -w 11264 -n 60 --cuda-comba [other options]`

@@ -98,6 +98,7 @@ class Opts {
     SingleOpt platform;
     SingleOpt n_tests;
     SingleOpt cuda_sieve_proto;
+    SingleOpt cuda_comba;
     SingleOpt bitmap_pool_buffers;
     SingleOpt snapshot_pool_buffers;
   SingleOpt gpu_launch_divisor;
@@ -204,6 +205,8 @@ class Opts {
     string get_n_tests()        { return n_tests.arg;           }
 
     bool use_cuda_sieve_proto() { return cuda_sieve_proto.active; }
+
+    bool use_cuda_comba() { return cuda_comba.active; }
 
     bool has_bitmap_pool_buffers()   { return bitmap_pool_buffers.active; }
     string get_bitmap_pool_buffers() { return bitmap_pool_buffers.arg;    }
