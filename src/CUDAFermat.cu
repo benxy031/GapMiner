@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1072,6 +1073,123 @@ __global__ void sieveBuildBitmapKernelBatch(const uint32_t *primes,
   }
 }
 
+/**
+ * sievePrototypeMarkCompositesOptimized: GPU Sieve Marking Kernel (Per-Word Strategy)
+ * 
+ * Strategy: Each thread marks all composites in one 32-bit word across ALL primes.
+ * This provides excellent memory coalescing and vectorization.
+ * 
+ * Algorithm: For each 32-bit word, check all bits to see if they are:
+ * 1. At odd positions (base_offset + bit is odd)
+ * 2. Composites (multiples of any small prime)
+ * 
+ * Parameters:
+ *   bitmap: Output bitmap to fill with composite markers (1 = composite, 0 = prime candidate)
+ *   bitmap_word_count: Total number of 32-bit words in bitmap
+ *   base_offset: Absolute starting position of sieve window (must be odd)
+ *   prime_residues: [const memory] Array of residue[i] = starting offset of prime[i] in window
+ *   prime_count: Number of small primes to sieve with
+ *   shift: Gap mining shift parameter (for absolute position calculation)
+ * 
+ * Thread mapping: Each thread idx processes bitmap word idx, marking all odd composites
+ * in bits [32*idx, 32*idx+32).
+ */
+__global__ void sievePrototypeMarkCompositesOptimized(
+    uint32_t *bitmap,
+    uint32_t bitmap_word_count,
+    uint64_t base_offset,
+    const uint32_t *prime_residues,
+    uint32_t prime_count,
+    uint32_t shift)
+{
+  (void)shift;
+  // Grid-stride loop: handle all words in the bitmap
+  for (uint32_t word_idx = blockIdx.x * blockDim.x + threadIdx.x;
+       word_idx < bitmap_word_count;
+       word_idx += blockDim.x * gridDim.x) {
+    
+    uint32_t result = 0;  // Accumulate composite bits for this word
+    uint32_t word_bits_base = word_idx << 5;  // word_idx * 32
+    uint32_t parity_base = (base_offset >> 0) & 1u;  // Whether base_offset is odd
+    
+    // Check each of the 32 bits in this word for composites
+    for (uint32_t bit_in_word = 0; bit_in_word < 32; ++bit_in_word) {
+      uint32_t bit = word_bits_base + bit_in_word;
+      
+      // Check if absolute position (base_offset + bit) is odd
+      // absolute is odd iff (base_offset XOR bit) is odd
+      uint32_t absolute_parity = parity_base ^ (bit & 1u);
+      if (absolute_parity == 0u)
+        continue;  // Even position, skip (we only care about odd)
+      
+      // Check if this bit is a composite (multiple of some prime)
+      bool is_composite = false;
+      for (uint32_t p_idx = 0; p_idx < prime_count; ++p_idx) {
+        uint32_t prime = kSmallPrimesDevice[p_idx];
+        uint32_t residue = prime_residues[p_idx];
+        
+        // Is (bit - residue) divisible by prime?
+        if (bit >= residue) {
+          uint32_t delta = bit - residue;
+          if (delta % prime == 0u) {
+            is_composite = true;
+            break;
+          }
+        }
+      }
+      
+      if (is_composite) {
+        result |= (1u << bit_in_word);
+      }
+    }
+    
+    // Single coalesced write per thread
+    bitmap[word_idx] = result;
+  }
+}
+
+/**
+ * sievePrototypeMarkCompositesPerPrime: GPU Sieve Marking Kernel (Per-Prime Strategy)
+ * 
+ * Alternative strategy: Each thread handles all multiples of one prime.
+ * Uses atomicOr for thread-safe bit marking. Simpler but with more contention.
+ * Good for comparison and smaller prime counts.
+ */
+__global__ void sievePrototypeMarkCompositesPerPrime(
+    uint32_t *bitmap,
+    uint32_t window_size,      // Size in bits
+    uint64_t base_offset,
+    const uint32_t *prime_residues,
+    uint32_t prime_count)
+{
+  // Grid-stride loop: each thread handles one or more primes
+  for (uint32_t p_idx = blockIdx.x * blockDim.x + threadIdx.x;
+       p_idx < prime_count;
+       p_idx += blockDim.x * gridDim.x) {
+    
+    uint32_t prime = kSmallPrimesDevice[p_idx];
+    uint32_t residue = prime_residues[p_idx];
+    
+    if (prime <= 2u)
+      continue;
+    
+    // Mark all multiples: residue, residue + 2*prime, residue + 4*prime, ...
+    // (double-stepping ensures we only mark odd positions)
+    for (uint32_t offset = residue; offset < window_size; offset += (prime << 1)) {
+      uint32_t word_idx = (offset >> 5);
+      uint32_t bit_idx = offset & 0x1F;
+      uint32_t bit_mask = 1u << bit_idx;
+      
+      // Verify absolute position is odd
+      uint64_t absolute = base_offset + offset;
+      if ((absolute & 1ull) == 1ull) {
+        // Thread-safe bit setting with atomicOr
+        atomicOr(&bitmap[word_idx], bit_mask);
+      }
+    }
+  }
+}
+
 __global__ __launch_bounds__(kCudaBlockSize, 2)
 void fermatTest320Kernel(const uint32_t *__restrict__ numbers,
                          ResultWord *__restrict__ results,
@@ -1397,6 +1515,10 @@ GPUFermat::~GPUFermat() {
   sievePrototypeBitmap.reset();
   sievePrototypePrimes.reset();
   sievePrototypeResidues.reset();
+  sievePrototypeWindowBits.reset();
+  sievePrototypeWindowBases.reset();
+  sievePrototypeWindowCounts.reset();
+  sievePrototypeWindowDescs.reset();
 }
 
 bool GPUFermat::init_cuda(unsigned device_id, const char *platformId) {
@@ -1708,6 +1830,7 @@ void GPUFermat::configure_sieve_primes(const uint32_t *primes, size_t count) {
   CUDA_CHECK(cudaStreamSynchronize(stream));
   sievePrimesConfigured = true;
   configuredPrimeCount = static_cast<uint32_t>(count);
+  ensureMarkingResidueCapacity(count);
 }
 
 void GPUFermat::run_cuda(uint32_t batchElements) {
@@ -1949,6 +2072,7 @@ void GPUFermat::prototype_sieve_batch(const SievePrototypeParams *params,
 
   size_t byte_cursor = 0;
   uint64_t bit_cursor = 0;
+  bool any_host_bitmap = false;
   bit_prefix[0] = 0u;
   for (uint32_t idx = 0; idx < window_count; ++idx) {
     const uint32_t window_bits = params[idx].window_size;
@@ -1960,8 +2084,10 @@ void GPUFermat::prototype_sieve_batch(const SievePrototypeParams *params,
       memset(target, 0, window_bytes);
     const size_t copy_bytes = std::min(window_bytes,
                                        static_cast<size_t>(params[idx].sieve_byte_len));
-    if (copy_bytes > 0 && params[idx].sieve_bytes)
+    if (copy_bytes > 0 && params[idx].sieve_bytes) {
       memcpy(target, params[idx].sieve_bytes, copy_bytes);
+      any_host_bitmap = true;
+    }
     byte_cursor += window_bytes;
     bit_cursor += window_bits;
     bit_prefix[idx + 1] = static_cast<uint32_t>(bit_cursor);
@@ -1974,7 +2100,12 @@ void GPUFermat::prototype_sieve_batch(const SievePrototypeParams *params,
   }
 
   cudaStream_t stream = streams[0];
-  sievePrototypeBitmap.copyToDevice(stream, static_cast<size_t>(total_words));
+  if (any_host_bitmap) {
+    sievePrototypeBitmap.copyToDevice(stream, static_cast<size_t>(total_words));
+  } else {
+    const size_t bitmap_bytes = static_cast<size_t>(total_words) * sizeof(uint32_t);
+    CUDA_CHECK(cudaMemsetAsync(sievePrototypeBitmap.DeviceData, 0, bitmap_bytes, stream));
+  }
   sievePrototypeWindowBits.copyToDevice(stream, window_count + 1);
   sievePrototypeWindowBases.copyToDevice(stream, window_count);
 
@@ -2057,6 +2188,7 @@ void GPUFermat::prototype_sieve_batch(const SievePrototypeParams *params,
 
   const bool compact_scan_enabled = Opts::get_instance()->use_cuda_sieve_proto();
   bool compact_scan_used = false;
+  const bool residue_only = !any_host_bitmap && !residue_buffer.empty();
   if (compact_scan_enabled &&
       total_bits <= static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
     if (run_compact_scan(window_count,
@@ -2068,6 +2200,10 @@ void GPUFermat::prototype_sieve_batch(const SievePrototypeParams *params,
         ss << get_time() << "CUDA sieve prototype batched " << window_count
            << " windows; candidates=" << lastPrototypeCount;
         extra_verbose_log(ss.str());
+
+        std::ostringstream ok;
+        ok << get_time() << "GPU sieve offsets produced: yes";
+        extra_verbose_log(ok.str());
 
         std::ostringstream perf;
         perf << get_time() << "CUDA sieve perf: windows=" << window_count
@@ -2100,6 +2236,16 @@ void GPUFermat::prototype_sieve_batch(const SievePrototypeParams *params,
          << window_count << " windows (total_bits=" << total_bits << ")";
       extra_verbose_log(ss.str());
     }
+  }
+
+  if (!compact_scan_used && residue_only) {
+    if (extra_verbose) {
+      std::ostringstream ss;
+      ss << get_time()
+         << "CUDA sieve prototype residue-only batch skipped legacy scan";
+      extra_verbose_log(ss.str());
+    }
+    return;
   }
 
   const uint32_t threads = GroupSize;
@@ -2156,6 +2302,10 @@ void GPUFermat::prototype_sieve_batch(const SievePrototypeParams *params,
     ss << get_time() << "CUDA sieve prototype batched " << window_count
        << " windows; candidates=" << lastPrototypeCount;
     extra_verbose_log(ss.str());
+
+    std::ostringstream ok;
+    ok << get_time() << "GPU sieve offsets produced: yes";
+    extra_verbose_log(ok.str());
 
     std::ostringstream perf;
     perf << get_time() << "CUDA sieve perf: windows=" << window_count
@@ -2343,6 +2493,156 @@ uint32_t GPUFermat::prototype_window_count() const {
 
 unsigned GPUFermat::get_stream_count() const {
   return static_cast<unsigned>(streams.size());
+}
+
+void GPUFermat::ensureMarkingResidueCapacity(size_t required) {
+  ensurePrototypeResidueCapacity(required);
+}
+
+void GPUFermat::upload_prime_residues_to_device(const uint32_t *residues,
+                                                 uint32_t count,
+                                                 uint32_t **device_ptr) {
+  if (!residues || count == 0) {
+    *device_ptr = nullptr;
+    return;
+  }
+  
+  ensureMarkingResidueCapacity(count);
+  memcpy(sievePrototypeResidues.HostData, residues, count * sizeof(uint32_t));
+  sievePrototypeResidues.copyToDevice(streams[0], count);
+  *device_ptr = buffer_cast<uint32_t>(sievePrototypeResidues.DeviceData);
+}
+
+void GPUFermat::mark_sieve_window_optimized(const SieveMarkingJob &job) {
+  if (!initialized || job.prime_count == 0)
+    return;
+  
+  const uint32_t window_words = (job.window_size + 31) >> 5;
+  ensurePrototypeBitmapCapacity(window_words);
+
+  const uint32_t *device_residues = job.gpu_prime_residues;
+  if (!device_residues && job.host_prime_residues) {
+    uint32_t *uploaded = nullptr;
+    upload_prime_residues_to_device(job.host_prime_residues,
+                                    job.prime_count,
+                                    &uploaded);
+    device_residues = uploaded;
+  }
+  if (!device_residues) {
+    if (Opts::get_instance() && Opts::get_instance()->has_extra_vb()) {
+      std::ostringstream ss;
+      ss << get_time() << " CUDA mark skipped: missing residue buffer";
+      extra_verbose_log(ss.str());
+    }
+    return;
+  }
+  
+  // Clear bitmap (zeros = prime candidates)
+  uint8_t *bitmap_host = sievePrototypeBitmap.HostData;
+  memset(bitmap_host, 0, window_words * sizeof(uint32_t));
+  sievePrototypeBitmap.copyToDevice(streams[0], window_words);
+  
+  // Launch optimized per-word kernel
+  const uint32_t threads_per_block = 256;
+  const uint32_t blocks = (window_words + threads_per_block - 1) / threads_per_block;
+  
+  cudaStream_t stream = streams[0];
+  
+  sievePrototypeMarkCompositesOptimized<<<blocks, threads_per_block, 0, stream>>>(
+      buffer_cast<uint32_t>(sievePrototypeBitmap.DeviceData),
+      window_words,
+      job.base_offset,
+      device_residues,
+      job.prime_count,
+      job.shift);
+  
+  CUDA_CHECK(cudaGetLastError());
+  
+  auto t_start = std::chrono::high_resolution_clock::now();
+  CUDA_CHECK(cudaStreamSynchronize(stream));
+  auto t_end = std::chrono::high_resolution_clock::now();
+  auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
+  
+  if (Opts::get_instance() && Opts::get_instance()->has_extra_vb()) {
+    std::ostringstream ss;
+    ss << get_time() << " CUDA mark (optimized) window=" << job.base_offset
+       << " size=" << job.window_size << " primes=" << job.prime_count
+       << " time=" << duration_ms << "ms";
+    extra_verbose_log(ss.str());
+  }
+}
+
+void GPUFermat::mark_sieve_window_per_prime(const SieveMarkingJob &job) {
+  if (!initialized || job.prime_count == 0)
+    return;
+  
+  const uint32_t window_words = (job.window_size + 31) >> 5;
+  ensurePrototypeBitmapCapacity(window_words);
+
+  const uint32_t *device_residues = job.gpu_prime_residues;
+  if (!device_residues && job.host_prime_residues) {
+    uint32_t *uploaded = nullptr;
+    upload_prime_residues_to_device(job.host_prime_residues,
+                                    job.prime_count,
+                                    &uploaded);
+    device_residues = uploaded;
+  }
+  if (!device_residues) {
+    if (Opts::get_instance() && Opts::get_instance()->has_extra_vb()) {
+      std::ostringstream ss;
+      ss << get_time() << " CUDA mark skipped: missing residue buffer";
+      extra_verbose_log(ss.str());
+    }
+    return;
+  }
+  
+  // Clear bitmap
+  uint8_t *bitmap_host = sievePrototypeBitmap.HostData;
+  memset(bitmap_host, 0, window_words * sizeof(uint32_t));
+  sievePrototypeBitmap.copyToDevice(streams[0], window_words);
+  
+  // Launch per-prime kernel
+  const uint32_t threads_per_block = 256;
+  const uint32_t blocks = (job.prime_count + threads_per_block - 1) / threads_per_block;
+  
+  cudaStream_t stream = streams[0];
+  
+  sievePrototypeMarkCompositesPerPrime<<<blocks, threads_per_block, 0, stream>>>(
+      buffer_cast<uint32_t>(sievePrototypeBitmap.DeviceData),
+      job.window_size,
+      job.base_offset,
+      device_residues,
+      job.prime_count);
+  
+  CUDA_CHECK(cudaGetLastError());
+  
+  auto t_start = std::chrono::high_resolution_clock::now();
+  CUDA_CHECK(cudaStreamSynchronize(stream));
+  auto t_end = std::chrono::high_resolution_clock::now();
+  auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
+  
+  if (Opts::get_instance() && Opts::get_instance()->has_extra_vb()) {
+    std::ostringstream ss;
+    ss << get_time() << " CUDA mark (per-prime) window=" << job.base_offset
+       << " size=" << job.window_size << " primes=" << job.prime_count
+       << " time=" << duration_ms << "ms";
+    extra_verbose_log(ss.str());
+  }
+}
+
+void GPUFermat::mark_sieve_window(const SieveMarkingJob &job) {
+  // Wrapper that calls optimized version by default
+  mark_sieve_window_optimized(job);
+}
+
+void GPUFermat::gpu_mark_sieve_window(const SieveMarkingJob &job) {
+  // Public interface - delegates to optimized implementation
+  mark_sieve_window_optimized(job);
+}
+
+void GPUFermat::gpu_mark_sieve_optimized(const SieveMarkingJob &job) {
+  // Public interface - explicit call to optimized variant
+  mark_sieve_window_optimized(job);
 }
 
 void GPUFermat::benchmark_montgomery_mul() {

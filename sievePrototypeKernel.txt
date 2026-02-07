@@ -10,18 +10,17 @@ enumerate candidate offsets before they are queued for Fermat testing.
 
 Pipeline
 --------
-1. `HybridSieve::gpu_work_thread()` produces the sieve bitmap as before, but when
-   the prototype flag is enabled it exports the bitmap and window metadata to
-   `GPUFermat::prototype_sieve()` instead of scanning it on the CPU.
+1. `HybridSieve::gpu_work_thread()` produces window metadata and (optionally)
+  a CPU bitmap. When the prototype flag is enabled it exports metadata to
+  `GPUFermat::prototype_sieve()` for GPU scanning.
 2. `GPUFermat::prototype_sieve_batch()` copies one or more consecutive windows
-  to device memory, launches the sieve kernel once, and copies the batched
-  offsets back to host memory before exposing per-window slices. Only windows
-  backed by a fully materialized bitmap are included in these CUDA batches;
-  residue-snapshot windows stick to the CPU scan path so mixed build modes
-  never share a kernel launch.
+  to device memory, builds bitmaps from residue snapshots when no CPU bitmap
+  is provided, launches the scan kernel, and copies offsets back to host
+  memory before exposing per-window slices. Bitmap-backed windows can be
+  batched; residue-only windows are processed individually.
 3. The returned offsets are chunked into `GPUWorkItem`s exactly like CPU-generated
-   candidates, so the rest of the pipeline (GPU Fermat tests, PoW submission) is
-   unchanged.
+  candidates, so the rest of the pipeline (GPU Fermat tests, PoW submission) is
+  unchanged.
 
 Kernel Behavior (`src/CUDAFermat.cu`)
 -------------------------------------
@@ -38,8 +37,9 @@ Kernel Behavior (`src/CUDAFermat.cu`)
 
 Current Scope
 -------------
-- The CPU still constructs the sieve bitmap (marking composites for each prime).
-- The CUDA prototype only accelerates the bitmap scan / candidate enumeration.
+- The CPU still computes residue snapshots and window metadata.
+- The CUDA prototype builds bitmaps from residues when CPU bitmaps are absent,
+  then scans the bitmap / enumerates candidates on-device.
 - When the GPU queue is starved, the worker adaptively batches up to four sieve
   rounds per kernel launch, reducing host synchronization and copy overhead.
 - Consecutive sieve windows reuse a shared bitmap buffer pool, so the GPU thread
@@ -69,10 +69,8 @@ Adaptive Batching
   are re-mapped back to their original `SieveItem` indices so logs can spell
   out exactly which CPU window contributed to a CUDA launch.
 - Windows that rely on residue snapshots are processed individually to avoid
-  mixing build modes in the same batch. Starting with the January 2026 tuning,
-  the worker simply skips snapshot-backed windows when composing the batch and
-  leaves them on the CPU scan path, which keeps the CUDA logs deterministic and
-  prevents snapshot/bitmap artifacts from starving the GPU queue.
+  mixing build modes in the same batch. Snapshot windows are now fully GPU
+  handled; CPU scan fallback is skipped for residue-only windows.
 
 Future Work
 -----------

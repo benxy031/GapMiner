@@ -211,13 +211,57 @@ void *ShareProcessor::share_processor(void *args) {
 
 
     /* send the share to server */
+    PoW pow = cur->get_pow();
+    const uint64_t share_difficulty = pow.difficulty();
+    const bool is_block_candidate = share_difficulty >= pow.get_target();
+    const double normalized_merit = ((double) share_difficulty) / TWO_POW48;
+    
     if (has_stratum) {
+      /* submit share and log it */
+      log_str("Submitting Share: " + itoa(share_difficulty), LOG_D);
       stratum->sendwork(cur);
-    } else {
+      
+      /* log share submission for Stratum (response feedback comes async via recv_thread) */
+      const string block_status = (is_block_candidate ? " (block)" : "");
+      ostringstream share_line;
+      share_line.setf(std::ios::fixed, std::ios::floatfield);
+      share_line.precision(7);
+      share_line << get_time();
+      share_line << "Submitted Share: ";
+      share_line << normalized_merit;
+      share_line << block_status;
+      const string formatted_share = share_line.str();
 
-      PoW pow = cur->get_pow();
-      const uint64_t share_difficulty = pow.difficulty();
-      const bool is_block_candidate = share_difficulty >= pow.get_target();
+      pthread_mutex_lock(&io_mutex);
+      cout.setf(std::ios::fixed, std::ios::floatfield);
+      cout.precision(7);
+      cout << formatted_share << endl;
+
+      if (opts->log_shares()) {
+        static ofstream share_log_file;
+        static bool share_log_initialized = false;
+        static bool share_log_failed = false;
+
+        if (!share_log_initialized) {
+          share_log_file.open("shares.txt", ios::app);
+          if (share_log_file) {
+            share_log_file.setf(std::ios::fixed, std::ios::floatfield);
+            share_log_file.precision(7);
+          } else if (!share_log_failed) {
+            log_str("failed to open shares.txt for share logging", LOG_W);
+            share_log_failed = true;
+          }
+          share_log_initialized = true;
+        }
+
+        if (share_log_file) {
+          share_log_file << formatted_share << endl;
+          share_log_file.flush();
+        }
+      }
+
+      pthread_mutex_unlock(&io_mutex);
+    } else {
 
       /* submit share */
       log_str("Submitting Share: " + itoa(share_difficulty), LOG_D);
@@ -228,7 +272,6 @@ void *ShareProcessor::share_processor(void *args) {
       log_str("Found Share: " + itoa(share_difficulty) +
               "  =>  " + base_status + block_status, LOG_I);
 
-      const double normalized_merit = ((double) share_difficulty) / TWO_POW48;
       const string status = base_status + block_status;
       ostringstream share_line;
       share_line.setf(std::ios::fixed, std::ios::floatfield);

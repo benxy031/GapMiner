@@ -149,9 +149,10 @@ Both miners expose the same CLI surface; simply run the binary you built (`bin/g
  - `-v  --license` show license of this program
 
  - `--cuda-sieve-proto` enable the experimental CUDA sieve front-end. The CPU
-   sieve still marks composites, but candidate enumeration and Fermat prefill
-   happen on the GPU with adaptive multi-window batching. Requires building
-   `gapminer-cuda` and an NVIDIA GPU.
+  sieve metadata is prepared on the CPU, while bitmap construction (from
+  residue snapshots) and candidate enumeration happen on the GPU with
+  adaptive multi-window batching. Requires building `gapminer-cuda` and an
+  NVIDIA GPU.
 
  - `--cuda-comba` use the Comba/CIOS variant of Montgomery multiplication on
    CUDA (both standard Fermat and experimental sieve prototype). Achieves
@@ -164,22 +165,22 @@ Both miners expose the same CLI surface; simply run the binary you built (`bin/g
 When `--cuda-sieve-proto` is supplied (on the CUDA binary), the miner routes the
 `HybridSieve` output through an experimental CUDA pipeline:
 
-- **Bitmap ingestion** – Each `SieveItem` hands the ready bitmap to
-  `GPUFermat::prototype_sieve_batch()`, which can pack up to four consecutive
-  sieve windows into a single kernel launch when the GPU candidate queue is
-  running low. Windows built from residue snapshots run as single-window CUDA
-  prototype launches (no multi-window batching), so mixed launches only
-  include bitmap-backed work.
+- **Bitmap ingestion** – Each `SieveItem` hands window metadata to
+  `GPUFermat::prototype_sieve_batch()`. If a CPU bitmap is present it is copied
+  once; if only residue snapshots are available, the GPU builds the bitmap in
+ -place before scanning. Batching still packs up to four consecutive bitmap
+  windows into a single launch when the GPU queue is low.
 - **Adaptive batching** – The GPU worker inspects `GPUWorkList` fill levels and
   opportunistically dequeues additional windows so the CUDA kernel amortizes
-  transfers over more work without stalling the sieve thread. Windows that rely
-  on residue snapshots are still processed individually (one window per launch).
+  transfers over more work without stalling the sieve thread. Residue-only
+  windows remain single-window launches to keep each kernel homogeneous.
 - **Per-window slices** – Even when launches are batched, the code preserves a
   window-offset index so downstream Fermat/chain validation logic receives the
   exact offsets that originated from each sieve round.
 - **Visibility & tuning** – Extra verbose logging (`-e`) will emit
-  `CUDA sieve prototype batched N windows; candidates=...` lines so you can see
-  how often batching kicks in. It also logs a compact perf summary line:
+  `CUDA sieve prototype batched N windows; candidates=...` and
+  `GPU sieve offsets produced: yes` lines so you can see when CUDA offsets are
+  created. It also logs a compact perf summary line:
   `CUDA sieve perf: windows=... total_bits=... total_words=... residue_words=... compact_scan=yes|no`.
   Combine this with `--work-items`/`--queue-size` to keep the GPU fed.
 

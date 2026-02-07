@@ -2388,6 +2388,11 @@ void HybridSieve::GPUWorkList::parse_results(
 
   pthread_cond_signal(&notfull_cond);
   pthread_mutex_unlock(&access_mutex);
+  
+  /* Yield CPU after releasing queue items to give work thread immediate opportunity
+   * to populate queue. With -e flag, file I/O below naturally provides this delay.
+   * Without -e, explicit yield prevents results thread from monopolizing CPU. */
+  sched_yield();
 
   if (extra_verbose && logged_valid) {
     stringstream ss;

@@ -29,6 +29,16 @@ class GPUFermat {
     uint32_t prime_count;
   };
 
+  struct SieveMarkingJob {
+    uint64_t base_offset;        // Absolute window start position
+    uint32_t window_size;        // Sieve window size in bits
+    uint32_t sieve_round;        // Round number (for logging)
+    uint32_t shift;              // Gap mining shift parameter
+    uint32_t prime_count;        // Number of primes
+    const uint32_t *host_prime_residues;  // Host pointer to residues (optional)
+    const uint32_t *gpu_prime_residues;  // Device pointer to residues
+  };
+
  private:
   class CudaBuffer {
    public:
@@ -74,6 +84,7 @@ class GPUFermat {
   CudaBuffer sievePrototypeBitmap;
   CudaBuffer sievePrototypePrimes;
   CudaBuffer sievePrototypeResidues;
+  // Reused for GPU marking residues to avoid extra allocations.
   CudaBuffer sievePrototypeWindowBits;
   CudaBuffer sievePrototypeWindowBases;
   CudaBuffer sievePrototypeWindowCounts;
@@ -115,6 +126,15 @@ class GPUFermat {
                         cudaStream_t stream);
   void prototype_sieve_single(const SievePrototypeParams &params);
   void benchmark_montgomery_mul();
+  
+  // GPU Sieve Marking Methods
+  void mark_sieve_window(const SieveMarkingJob &job);
+  void mark_sieve_window_optimized(const SieveMarkingJob &job);
+  void mark_sieve_window_per_prime(const SieveMarkingJob &job);
+  void upload_prime_residues_to_device(const uint32_t *residues,
+                                       uint32_t count,
+                                       uint32_t **device_ptr);
+  void ensureMarkingResidueCapacity(size_t required);
 
  public:
   static GPUFermat *get_instance(unsigned device_id = static_cast<unsigned>(-1),
@@ -133,6 +153,10 @@ class GPUFermat {
   void fermat_gpu(uint32_t elementsNum);
   unsigned get_elements_num();
   unsigned get_block_size();
+  
+  // GPU Sieve Marking Public Interface
+  void gpu_mark_sieve_window(const SieveMarkingJob &job);
+  void gpu_mark_sieve_optimized(const SieveMarkingJob &job);
   void prototype_sieve(const SievePrototypeParams &params);
   void prototype_sieve_batch(const SievePrototypeParams *params,
                              uint32_t window_count);

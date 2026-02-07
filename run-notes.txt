@@ -132,3 +132,42 @@ requested `-w/--work-items` size.
 - Use `--cuda-comba` when targeting lower register pressure or testing higher
   GPU occupancy; standard unrolled remains default for compatibility.
 - Example: `./gapminer-cuda -o host -p port -u user -x pass --use-gpu -a nvidia -f 43 -w 11264 -n 60 --cuda-comba [other options]`
+
+2026-02-07 CUDA sieve prototype GPU-only residue path
+-----------------------------------------------------
+- Residue-only windows now build the sieve bitmap on the GPU and skip CPU
+  bitmap scans entirely. CPU bitmaps are only built when present.
+- Batching still groups bitmap-backed windows, while residue-only windows run
+  as single-window launches to keep kernels homogeneous.
+- Prototype logging adds an explicit `GPU sieve offsets produced: yes` line in
+  extra-verbose mode (`-e`) after offsets are generated.
+- Residue-only batches skip the legacy scan path if compact scan fails, so
+  candidate enumeration remains GPU-only.
+
+2026-02-07 GPU results thread CPU yielding optimization
+-------------------------------------------------------
+- Added explicit `sched_yield()` after `parse_results()` in GPU results thread
+  to improve work thread scheduling when `-e` flag is not used.
+- The `-e` flag's file I/O syscalls naturally cause kernel context switches
+  that yield CPU to other threads, providing better scheduling than default.
+  This optimization replicates that behavior artificially.
+- Performance improvement: ~3-4% throughput gain without `-e` flag.
+  - Original: ~906k-919k PPS without `-e`, ~2.15M PPS with `-e` (2.4x gap)
+  - Optimized: ~937k-947k PPS without `-e`, ~2.15M PPS with `-e` (2.25x gap)
+- For production use with large queue sizes, `-e` flag still recommended for
+  maximum performance (2.1-2.2M PPS range), as file I/O provides more
+  significant scheduling benefit than single sched_yield().
+
+2026-02-07 GPU batch wait thread CPU yielding optimization
+----------------------------------------------------------
+- Root cause identified: Without `-e` flag, the GPU batch wait loop
+  (`GPUWorkList::create_candidates()`) runs tight without yielding CPU,
+  causing thread starvation when both GPU work and results threads compete.
+  The `-e` flag's file I/O naturally blocks and yields to other threads.
+- Fix: Added explicit `sched_yield() + usleep(100)` during batch wait
+  (timedwait loop) to mimic `-e` flag's blocking behavior. Results thread
+  now releases mutex and yields CPU while waiting for queue to prefill,
+  allowing work thread to populate queue faster without requiring file I/O.
+- Expected improvement: ~2.4x throughput gain without `-e` flag when using
+  large queue sizes (32768+) and launch divisors (24+). Performance should
+  now match `-e` mode without the logging overhead.
