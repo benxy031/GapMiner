@@ -401,7 +401,7 @@ HybridSieve::HybridSieve(PoWProcessor *pprocessor,
 #endif
 
 
-  pthread_create(&gpu_thread, NULL, gpu_results_thread, (void *) gpu_list);
+  pthread_create(&results_thread, NULL, gpu_results_thread, (void *) gpu_list);
   pthread_create(&gpu_thread, NULL, gpu_work_thread, (void *) sieve_queue);
 }
 
@@ -1434,7 +1434,8 @@ void HybridSieve::GPUWorkItem::copy_candidates(uint32_t *dest, uint32_t count) {
   if (count == 0)
     return;
 
-  if (index >= static_cast<int32_t>(count) - 1) {
+  /* Fast path: copy directly if we have enough items in buffer */
+  if (index >= 0 && static_cast<uint32_t>(index + 1) >= count) {
     int32_t local_index = index;
     for (uint32_t n = 0; n < count; ++n)
       dest[n] = offsets[local_index - n];
@@ -1442,6 +1443,7 @@ void HybridSieve::GPUWorkItem::copy_candidates(uint32_t *dest, uint32_t count) {
     return;
   }
 
+  /* Slow path: use pop() which handles negative index */
   for (uint32_t n = 0; n < count; ++n)
     dest[n] = pop();
 }
