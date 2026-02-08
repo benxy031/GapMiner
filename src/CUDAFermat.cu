@@ -947,7 +947,6 @@ __global__ void sievePrototypeScanKernel(const uint32_t *bitmap_words,
     return;
 
   const uint32_t parity_mask = parity_mask_from_base(desc.base_parity);
-
   for (uint32_t word_rel = threadIdx.x; word_rel < desc.word_count;
        word_rel += blockDim.x) {
     const uint32_t local_bit_base = word_rel * 32u;

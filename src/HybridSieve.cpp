@@ -538,9 +538,8 @@ void HybridSieve::run_sieve(PoW *pow,
           sieve_t residue = starts[idx];
           if (residue >= sievesize) {
             const sieve_t step = primes2[idx];
-            if (step != 0)
+            if (step != 0 && residue >= step)
               residue %= step;
-            residue %= sievesize;
           }
           prime_start_snapshot[idx] = static_cast<uint32_t>(
               std::min<sieve_t>(residue,
@@ -581,7 +580,7 @@ void HybridSieve::run_sieve(PoW *pow,
         bool handed_off = false;
         if (!should_stop(hash)) {
     #ifdef USE_CUDA_BACKEND
-      PrimeStartPool *start_pool_ptr =
+          PrimeStartPool *start_pool_ptr =
           (offload_window && prime_start_snapshot != nullptr) ? &prime_start_pool
                           : nullptr;
       const uint32_t snapshot_count = (offload_window && prime_start_snapshot != nullptr)
@@ -803,7 +802,8 @@ void *HybridSieve::gpu_work_thread(void *args) {
   mpz_init_set_ui64(mpz_start, 0);
 
   #ifdef USE_CUDA_BACKEND
-  constexpr uint32_t kMaxPrototypeBatch = 4u;
+  // Increased from 4 to 16 for better GPU utilization and amortization of launch overhead
+  constexpr uint32_t kMaxPrototypeBatch = 16u;
   struct PrototypeSlice {
     const uint32_t *offsets = nullptr;
     size_t count = 0;
@@ -875,12 +875,14 @@ void *HybridSieve::gpu_work_thread(void *args) {
 #endif
 
     vector<sieve_t> batch_min_len(batch.size(), 0);
+    vector<uint8_t> batch_cpu_bitmap_available;
 #ifdef USE_CUDA_BACKEND
     vector<GPUFermat::SievePrototypeParams> batch_params;
     vector<size_t> gpu_param_to_batch;
     if (use_gpu_sieve) {
       batch_params.reserve(batch.size());
       gpu_param_to_batch.reserve(batch.size());
+      batch_cpu_bitmap_available.assign(batch.size(), 1u);
     }
 #endif
 
@@ -925,6 +927,8 @@ void *HybridSieve::gpu_work_thread(void *args) {
         const bool build_bitmap_from_residues =
           prime_start_residues != nullptr && prime_start_count > 0;
         const bool has_host_bitmap = !build_bitmap_from_residues;
+        if (idx < batch_cpu_bitmap_available.size())
+          batch_cpu_bitmap_available[idx] = has_host_bitmap ? 1u : 0u;
         if (build_bitmap_from_residues) {
           params.sieve_bytes = nullptr;
           params.sieve_byte_len = 0u;
@@ -989,10 +993,10 @@ void *HybridSieve::gpu_work_thread(void *args) {
           if (slice_count == 0)
             continue;
 
-            const size_t slice_offset = gpu_absolute_offsets.size();
-            const uint64_t round_base =
-                static_cast<uint64_t>(slice_item->sieve_round) *
-                static_cast<uint64_t>(slice_item->sievesize);
+          const size_t slice_offset = gpu_absolute_offsets.size();
+          const uint64_t round_base =
+              static_cast<uint64_t>(slice_item->sieve_round) *
+              static_cast<uint64_t>(slice_item->sievesize);
           size_t pushed = 0;
             // collect local absolute offsets for this slice then sort to
             // produce deterministic ascending ordering matching OpenCL
@@ -1020,9 +1024,10 @@ void *HybridSieve::gpu_work_thread(void *args) {
           }
         }
       } else {
-        if (use_gpu_sieve)
+        if (use_gpu_sieve) {
           gpu_window_slices.assign(batch.size(), PrototypeSlice{});
           gpu_absolute_offsets.clear();
+        }
       }
     }
 #endif
@@ -2119,7 +2124,6 @@ uint32_t HybridSieve::GPUWorkList::create_candidates() {
   /* Extra-verbose diagnostic: print first few packed candidate offsets and
    * the host-side reconstructed limbs (LSW and top limb) to aid debugging. */
   if (extra_verbose && packed > 0) {
-    GPUFermat *fermat_ptr = GPUFermat::get_instance();
     const uint32_t *prime_base_words = prime_base;
     const uint32_t sample_count = std::min<uint32_t>(8u, packed);
     std::ostringstream dss;
