@@ -13,7 +13,7 @@
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
- * 
+ * (((())))
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
@@ -475,15 +475,15 @@ void start_chinese_evolution(sieve_t n_primes,
   args.continue_ev          = continue_chinese;
   args.population_size      = population;
   args.generation_limit     = 10000000;
-  args.mutation_probability = 1;
+  args.mutation_propability = 1;
   args.death_percentage     = 0.5;
   args.opts                 = (void **) opts;
   args.num_threads          = n_threads;
-  args.verbosity            = EV_VERBOSITY_ONELINE;
   args.flags                = EV_USE_MUTATION |
                               EV_ALWAYS_MUTATE |
                               EV_KEEP_LAST_GENERATION |
                               EV_SORT_MIN |
+                              EV_VERBOSE_ONELINE |
                               EV_USE_ABORT_REQUIREMENT;
 
   
