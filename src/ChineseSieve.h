@@ -88,6 +88,11 @@ class ChineseSieve : public Sieve {
 
     /* the current merit */
     static double cur_merit;
+
+    /* gap pool helpers to reduce contention */
+    static GapCandidate *acquire_gap_from_pool();
+    static bool release_gap_to_pool(GapCandidate *gap);
+    static void flush_local_gap_pool();
     
     /* check if we should stop sieving */
     bool should_stop(uint8_t hash[SHA256_DIGEST_LENGTH]);

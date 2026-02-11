@@ -36,6 +36,14 @@ using namespace std;
 
 #define MAX_CANDIDATES 65536
 
+#if __WORDSIZE == 64
+static inline uint32_t ctz_sieve_word(uint64_t v) { return __builtin_ctzll(v); }
+static const sieve_t k_odd_mask = 0xAAAAAAAAAAAAAAAAULL;
+#else
+static inline uint32_t ctz_sieve_word(uint32_t v) { return __builtin_ctz(v); }
+static const sieve_t k_odd_mask = 0xAAAAAAAAU;
+#endif
+
 /* compare function to sort by highest score */
 static bool compare_gap_candidate(GapCandidate *a, GapCandidate *b) {
   return a->score >= b->score;
@@ -47,6 +55,8 @@ vector<GapCandidate *> ChineseSieve::gaps = vector<GapCandidate *>();
 /* simple free-list to reuse GapCandidate allocations */
 vector<GapCandidate *> ChineseSieve::gap_pool = vector<GapCandidate *>();
 uint32_t ChineseSieve::gap_pool_limit = 16384;
+static thread_local vector<GapCandidate *> gap_pool_local = vector<GapCandidate *>();
+static uint32_t gap_pool_local_limit = 256;
 
 /* syncronisation mutex */
 pthread_mutex_t ChineseSieve::mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -65,6 +75,60 @@ uint8_t ChineseSieve::hash_prev_block[SHA256_DIGEST_LENGTH];
 
 /* the current merit */
 double ChineseSieve::cur_merit = 1.0;
+
+GapCandidate *ChineseSieve::acquire_gap_from_pool() {
+  if (!gap_pool_local.empty()) {
+    GapCandidate *gap = gap_pool_local.back();
+    gap_pool_local.pop_back();
+    return gap;
+  }
+
+  pthread_mutex_lock(&mutex);
+  GapCandidate *gap = nullptr;
+  if (!gap_pool.empty()) {
+    gap = gap_pool.back();
+    gap_pool.pop_back();
+  }
+  pthread_mutex_unlock(&mutex);
+  return gap;
+}
+
+bool ChineseSieve::release_gap_to_pool(GapCandidate *gap) {
+  if (gap == nullptr)
+    return true;
+
+  if (gap_pool_local.size() < gap_pool_local_limit) {
+    gap_pool_local.push_back(gap);
+    return true;
+  }
+
+  pthread_mutex_lock(&mutex);
+  if (gap_pool.size() < gap_pool_limit) {
+    gap_pool.push_back(gap);
+    pthread_mutex_unlock(&mutex);
+    return true;
+  }
+  pthread_mutex_unlock(&mutex);
+  return false;
+}
+
+void ChineseSieve::flush_local_gap_pool() {
+  if (gap_pool_local.empty())
+    return;
+
+  pthread_mutex_lock(&mutex);
+  while (!gap_pool_local.empty() &&
+         gap_pool.size() < gap_pool_limit) {
+    gap_pool.push_back(gap_pool_local.back());
+    gap_pool_local.pop_back();
+  }
+  pthread_mutex_unlock(&mutex);
+
+  while (!gap_pool_local.empty()) {
+    delete gap_pool_local.back();
+    gap_pool_local.pop_back();
+  }
+}
 
 /* reste the sieve */
 void ChineseSieve::reset() {
@@ -163,7 +227,8 @@ void ChineseSieve::calc_avg_prime_candidates() {
 
     memset(sieve, 0, sievesize / 8);
     this->crt_status = i / 10.0;
-    log_str("init CRT " + itoa(i) + " / " + itoa(1000u), LOG_I);
+    if (Opts::get_instance()->has_extra_vb())
+      log_str("init CRT " + itoa(i) + " / " + itoa(1000u), LOG_I);
 
     for (sieve_t x = 0; x < n_primes; x++) {
     
@@ -231,6 +296,7 @@ ChineseSieve::ChineseSieve(PoWProcessor *processor,
 
   /* size the reuse pool relative to the queue cap to avoid unbounded growth */
   gap_pool_limit = std::max<uint32_t>(gap_queue_limit * 2, gap_pool_limit);
+  gap_pool_local_limit = std::max<uint32_t>(64u, gap_pool_limit / 8);
 
 
   log_str("Creating ChineseSieve with" + itoa(cset->n_primes) + 
@@ -317,6 +383,11 @@ void ChineseSieve::run_sieve(PoW *pow, uint8_t hash[SHA256_DIGEST_LENGTH]) {
   log_str("init time: " + itoa(PoWUtils::gettime_usec() - time) + "us", LOG_D);
   log_str("sievesize: " + itoa(sievesize), LOG_D);
 
+  uint64_t cand_time_total_us = 0;
+  uint64_t cand_time_samples = 0;
+
+
+  double log_start = mpz_log(mpz_start);
 
   for (uint64_t cur_gap = start; cur_gap < end && !should_stop(hash); cur_gap++) {
 
@@ -345,32 +416,46 @@ void ChineseSieve::run_sieve(PoW *pow, uint8_t hash[SHA256_DIGEST_LENGTH]) {
       }
     }
 
-    /* collect the prime candidates */
+    /* collect the prime candidates with a word-level scan */
+    const uint64_t cand_time_start = PoWUtils::gettime_usec();
     uint32_t candidates[MAX_CANDIDATES];
     uint32_t candidate_count = 0;
-    for (uint32_t i = 1; i < sievesize && candidate_count < MAX_CANDIDATES; i += 2)
-      if (is_prime(sieve, i))
-        candidates[candidate_count++] = i;
+    const uint64_t word_bits = sizeof(sieve_t) * 8;
+    const uint64_t bit_limit = sievesize;
+    const uint64_t word_count = (bit_limit + word_bits - 1) / word_bits;
 
-    /* optional backpressure: keep the gap queue bounded to avoid lock churn */
-    pthread_mutex_lock(&mutex);
-    while (running && gaps.size() >= gap_queue_limit)
-      pthread_cond_wait(&gap_cv, &mutex);
-    pthread_mutex_unlock(&mutex);
+    for (uint64_t w = 0; w < word_count && candidate_count < MAX_CANDIDATES; ++w) {
+      sieve_t mask = ~sieve[w] & k_odd_mask;
+      if (w == word_count - 1) {
+        const uint64_t tail_bits = bit_limit % word_bits;
+        if (tail_bits != 0) {
+          const sieve_t tail_mask = ((sieve_t) 1 << tail_bits) - 1;
+          mask &= tail_mask;
+        }
+      }
 
-    const double log_start = mpz_log(mpz_start);
+      while (mask && candidate_count < MAX_CANDIDATES) {
+        const uint32_t bit = ctz_sieve_word(mask);
+        const uint64_t idx = (w * word_bits) + bit;
+        candidates[candidate_count++] = (uint32_t) idx;
+        mask &= mask - 1;
+      }
+    }
+    cand_time_total_us += PoWUtils::gettime_usec() - cand_time_start;
+    cand_time_samples++;
+    if (Opts::get_instance()->has_extra_vb() && (cand_time_samples % 1024u == 0)) {
+      const double avg_us = (double) cand_time_total_us / (double) cand_time_samples;
+      extra_verbose_log("avg candidate scan " + dtoa(avg_us, 2) + " us");
+    }
+
+    /* save the gap, reusing a pooled node when available */
+    GapCandidate *gap = acquire_gap_from_pool();
+
+    if ((cur_gap & 1023u) == 0u)
+      log_start = mpz_log(mpz_start);
     const double denom = (log_start > 1.0 ? log_start : 1.0);
     const double target_factor = ((double) pow->get_target()) / TWO_POW48;
     const double score = (static_cast<double>(candidate_count) / denom) * target_factor;
-
-    /* save the gap, reusing a pooled node when available */
-    GapCandidate *gap = nullptr;
-    pthread_mutex_lock(&mutex);
-    if (!gap_pool.empty()) {
-      gap = gap_pool.back();
-      gap_pool.pop_back();
-    }
-    pthread_mutex_unlock(&mutex);
 
     if (gap)
       gap->reset(pow->get_nonce(), pow->get_target(), mpz_start, candidates, candidate_count, score);
@@ -379,17 +464,44 @@ void ChineseSieve::run_sieve(PoW *pow, uint8_t hash[SHA256_DIGEST_LENGTH]) {
 
     pthread_mutex_lock(&mutex);
 
-    gaps.push_back(gap);
-    push_heap(gaps.begin(), gaps.end(), compare_gap_candidate);
+    bool dropped = false;
+    if (gaps.size() >= gap_queue_limit) {
+      auto min_it = min_element(gaps.begin(), gaps.end(),
+                                [](GapCandidate *a, GapCandidate *b) {
+                                  return a->score < b->score;
+                                });
+      if (min_it != gaps.end() && (*min_it)->score < gap->score) {
+        GapCandidate *old = *min_it;
+        *min_it = gap;
+        make_heap(gaps.begin(), gaps.end(), compare_gap_candidate);
+
+        if (!release_gap_to_pool(old))
+          delete old;
+      } else {
+        dropped = true;
+      }
+    } else {
+      gaps.push_back(gap);
+      push_heap(gaps.begin(), gaps.end(), compare_gap_candidate);
+    }
+
     const size_t queue_size = gaps.size();
-    pthread_cond_signal(&gap_cv);
+    if (!dropped)
+      pthread_cond_signal(&gap_cv);
     pthread_mutex_unlock(&mutex);
+
+    if (dropped) {
+      if (!release_gap_to_pool(gap))
+        delete gap;
+    }
 
     if (Opts::get_instance()->has_extra_vb()) {
       string msg = "gap push cand=" + itoa(candidate_count) +
                    " score=" + dtoa(score, 4) +
                    " queue=" + itoa((uint64_t) queue_size) +
                    "/" + itoa((uint64_t) gap_queue_limit);
+      if (dropped)
+        msg += " dropped";
       extra_verbose_log(msg);
     }
 
@@ -398,6 +510,13 @@ void ChineseSieve::run_sieve(PoW *pow, uint8_t hash[SHA256_DIGEST_LENGTH]) {
     /* recalculate the start for the given gap */
     recalc_starts();
   }
+
+  if (cand_time_samples > 0 && Opts::get_instance()->has_extra_vb()) {
+    const double avg_us = (double) cand_time_total_us / (double) cand_time_samples;
+    extra_verbose_log("avg candidate scan " + dtoa(avg_us, 2) + " us (final)");
+  }
+
+  flush_local_gap_pool();
 
   log_str("run_sieve finished", LOG_D);
 }
@@ -470,6 +589,10 @@ void ChineseSieve::run_fermat() {
 
       PoW pow(mpz_hash, shift, mpz_p, gap->target, gap->nonce);
 
+      if (Opts::get_instance()->has_extra_vb()) {
+        extra_verbose_log("submit-candidate: candidates=" + itoa(gap->n_candidates));
+      }
+
       if (pow.valid()) {
         if (pprocessor->process(&pow)) {
           log_str("ShareProcessor requestet reset", LOG_D);
@@ -504,21 +627,24 @@ void ChineseSieve::run_fermat() {
       time = PoWUtils::gettime_usec();
     }
 
-    bool recycled = false;
-    pthread_mutex_lock(&mutex);
-    if (gap_pool.size() < gap_pool_limit) {
-      gap_pool.push_back(gap);
-      recycled = true;
-    }
-    pthread_mutex_unlock(&mutex);
-
-    if (!recycled)
+    if (!release_gap_to_pool(gap))
       delete gap;
   }
+
+  flush_local_gap_pool();
 }
 
 /* finds the prevoius prime for a given mpz value (if src is not a prime) */
 void ChineseSieve::mpz_previous_prime(mpz_t mpz_dst, mpz_t mpz_src) {
+
+  if (mpz_cmp_ui(mpz_src, 2) <= 0) {
+    mpz_set_ui(mpz_dst, 0);
+    return;
+  }
+  if (mpz_cmp_ui(mpz_src, 3) <= 0) {
+    mpz_set_ui(mpz_dst, 2);
+    return;
+  }
 
 #ifdef DEBUG_PREV_PRIME
   mpz_t mpz_check;
@@ -534,40 +660,45 @@ void ChineseSieve::mpz_previous_prime(mpz_t mpz_dst, mpz_t mpz_src) {
   const sieve_t sievesize = 1 << 14;
   sieve_t sieve[sievesize];
   mpz_t mpz_tmp;
+  mpz_t mpz_curr;
   mpz_init(mpz_tmp);
+  mpz_init_set(mpz_curr, mpz_src);
 
-  memset(sieve, 0, sievesize / 8);
-  for (sieve_t i = 0; i < n_primes / 10; i++) {
-    for (sieve_t p = mpz_tdiv_ui(mpz_src, primes[i]); 
-         p < sievesize; 
-         p += primes[i]) {
-      
-      set_composite(sieve, p);
-    }
-  }
-
-  for (sieve_t p = 0; p < sievesize; p++) {
-    if (is_prime(sieve, p)) {
-      mpz_sub_ui(mpz_tmp, mpz_src, p);
-      
-      if (fermat_test(mpz_tmp)) {
-        mpz_set(mpz_dst, mpz_tmp);
-        mpz_clear(mpz_tmp);
-#ifdef DEBUG_PREV_PRIME
-        if (mpz_cmp(mpz_check, mpz_dst))
-          cout << "mpz_previous_prime check [FAILED]" << endl;
-        else
-          cout << "mpz_previous_prime check [VALID]" << endl;
-#endif
-        return;
+  while (true) {
+    memset(sieve, 0, sievesize / 8);
+    for (sieve_t i = 0; i < n_primes / 10; i++) {
+      for (sieve_t p = mpz_tdiv_ui(mpz_curr, primes[i]); 
+           p < sievesize; 
+           p += primes[i]) {
+        set_composite(sieve, p);
       }
     }
-  }
 
-  /* start again */
-  mpz_sub_ui(mpz_tmp, mpz_src, sievesize);
-  mpz_previous_prime(mpz_dst, mpz_tmp);
-  mpz_clear(mpz_tmp);
+    for (sieve_t p = 0; p < sievesize; p++) {
+      if (is_prime(sieve, p)) {
+        mpz_sub_ui(mpz_tmp, mpz_curr, p);
+        
+        if (fermat_test(mpz_tmp)) {
+          mpz_set(mpz_dst, mpz_tmp);
+          mpz_clear(mpz_curr);
+          mpz_clear(mpz_tmp);
+#ifdef DEBUG_PREV_PRIME
+          if (mpz_cmp(mpz_check, mpz_dst))
+            cout << "mpz_previous_prime check [FAILED]" << endl;
+          else
+            cout << "mpz_previous_prime check [VALID]" << endl;
+#endif
+          return;
+        }
+      }
+    }
+
+    /* move to the next window */
+    if (mpz_cmp_ui(mpz_curr, sievesize) <= 0)
+      mpz_set_ui(mpz_curr, 1);
+    else
+      mpz_sub_ui(mpz_curr, mpz_curr, sievesize);
+  }
 }
 
 
