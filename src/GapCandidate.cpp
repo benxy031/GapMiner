@@ -22,8 +22,8 @@
 /* creat a new GapCandidate */
 GapCandidate::GapCandidate(uint32_t nonce,
                            uint64_t target,
-                           mpz_t mpz_gap_start, 
-                           uint32_t* candidates,
+                           mpz_t mpz_gap_start,
+                           const uint32_t* candidates,
                            uint32_t n_candidates,
                            double score) {
 
@@ -31,21 +31,29 @@ GapCandidate::GapCandidate(uint32_t nonce,
   this->target       = target;
   this->n_candidates = n_candidates;
   this->score        = score;
-  memcpy(this->candidates, candidates, n_candidates * sizeof(uint32_t));
+  if (candidates && n_candidates > 0) {
+    this->candidates.assign(candidates, candidates + n_candidates);
+  } else {
+    this->candidates.clear();
+  }
   mpz_init_set(this->mpz_gap_start, mpz_gap_start);
 }
 
 void GapCandidate::reset(uint32_t nonce,
                          uint64_t target,
                          mpz_t mpz_gap_start,
-                         uint32_t* candidates,
+                         const uint32_t* candidates,
                          uint32_t n_candidates,
                          double score) {
   this->nonce        = nonce;
   this->target       = target;
   this->n_candidates = n_candidates;
   this->score        = score;
-  memcpy(this->candidates, candidates, n_candidates * sizeof(uint32_t));
+  if (candidates && n_candidates > 0) {
+    this->candidates.assign(candidates, candidates + n_candidates);
+  } else {
+    this->candidates.clear();
+  }
   mpz_set(this->mpz_gap_start, mpz_gap_start);
 }
 

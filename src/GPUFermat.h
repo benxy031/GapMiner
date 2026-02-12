@@ -97,10 +97,16 @@ class GPUFermat {
     cl_program gProgram;
 
     /* the fermat kernel to run on the gpu */
-    cl_kernel mFermatBenchmarkKernel320;  
+    cl_kernel mFermatBenchmarkKernel320;
 
     /* the fermat kernel to run on the gpu */
-    cl_kernel mFermatKernel320;  
+    cl_kernel mFermatKernel320;
+
+    /* montgomery benchmark kernels */
+    cl_kernel mMontgomeryMulBenchmark320;
+    cl_kernel mMontgomerySqrBenchmark320;
+    cl_kernel mMontgomeryMulBenchmark352;
+    cl_kernel mMontgomerySqrBenchmark352;
 
     /* cl device to run the test on */
     cl_device_id gpu;

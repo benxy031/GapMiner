@@ -34,7 +34,6 @@
 
 using namespace std;
 
-#define MAX_CANDIDATES 65536
 
 #if __WORDSIZE == 64
 static inline uint32_t ctz_sieve_word(uint64_t v) { return __builtin_ctzll(v); }
@@ -389,6 +388,9 @@ void ChineseSieve::run_sieve(PoW *pow, uint8_t hash[SHA256_DIGEST_LENGTH]) {
 
   double log_start = mpz_log(mpz_start);
 
+  std::vector<uint32_t> candidates;
+  candidates.reserve(1024u);
+
   for (uint64_t cur_gap = start; cur_gap < end && !should_stop(hash); cur_gap++) {
 
    /* reinit the sieve */
@@ -418,13 +420,12 @@ void ChineseSieve::run_sieve(PoW *pow, uint8_t hash[SHA256_DIGEST_LENGTH]) {
 
     /* collect the prime candidates with a word-level scan */
     const uint64_t cand_time_start = PoWUtils::gettime_usec();
-    uint32_t candidates[MAX_CANDIDATES];
-    uint32_t candidate_count = 0;
+    candidates.clear();
     const uint64_t word_bits = sizeof(sieve_t) * 8;
     const uint64_t bit_limit = sievesize;
     const uint64_t word_count = (bit_limit + word_bits - 1) / word_bits;
 
-    for (uint64_t w = 0; w < word_count && candidate_count < MAX_CANDIDATES; ++w) {
+    for (uint64_t w = 0; w < word_count; ++w) {
       sieve_t mask = ~sieve[w] & k_odd_mask;
       if (w == word_count - 1) {
         const uint64_t tail_bits = bit_limit % word_bits;
@@ -434,13 +435,15 @@ void ChineseSieve::run_sieve(PoW *pow, uint8_t hash[SHA256_DIGEST_LENGTH]) {
         }
       }
 
-      while (mask && candidate_count < MAX_CANDIDATES) {
+      while (mask) {
         const uint32_t bit = ctz_sieve_word(mask);
         const uint64_t idx = (w * word_bits) + bit;
-        candidates[candidate_count++] = (uint32_t) idx;
+        candidates.push_back(static_cast<uint32_t>(idx));
         mask &= mask - 1;
       }
     }
+    const uint32_t candidate_count =
+        static_cast<uint32_t>(candidates.size());
     cand_time_total_us += PoWUtils::gettime_usec() - cand_time_start;
     cand_time_samples++;
     if (Opts::get_instance()->has_extra_vb() && (cand_time_samples % 1024u == 0)) {
@@ -458,9 +461,9 @@ void ChineseSieve::run_sieve(PoW *pow, uint8_t hash[SHA256_DIGEST_LENGTH]) {
     const double score = (static_cast<double>(candidate_count) / denom) * target_factor;
 
     if (gap)
-      gap->reset(pow->get_nonce(), pow->get_target(), mpz_start, candidates, candidate_count, score);
+      gap->reset(pow->get_nonce(), pow->get_target(), mpz_start, candidates.data(), candidate_count, score);
     else
-      gap = new GapCandidate(pow->get_nonce(), pow->get_target(), mpz_start, candidates, candidate_count, score);
+      gap = new GapCandidate(pow->get_nonce(), pow->get_target(), mpz_start, candidates.data(), candidate_count, score);
 
     pthread_mutex_lock(&mutex);
 

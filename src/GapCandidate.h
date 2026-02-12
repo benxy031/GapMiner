@@ -25,7 +25,6 @@
 
 using namespace std;
 
-#define MAX_CANDIDATES 65536
 
 class GapCandidate {
 
@@ -44,26 +43,26 @@ class GapCandidate {
     uint32_t n_candidates;
  
     /* the candidate offsets */
-    uint32_t candidates[MAX_CANDIDATES];
+    std::vector<uint32_t> candidates;
 
     /* score used for priority queue ordering */
     double score;
 
     /* reuse an existing GapCandidate without reinitializing mpz state */
-    void reset(uint32_t nonce,
-           uint64_t target,
-           mpz_t mpz_gap_start,
-           uint32_t* candidates,
-           uint32_t n_candidates,
-           double score);
+        void reset(uint32_t nonce,
+          uint64_t target,
+          mpz_t mpz_gap_start,
+          const uint32_t* candidates,
+          uint32_t n_candidates,
+          double score);
 
     /* creat a new GapCandidate */
     GapCandidate(uint32_t nonce,
-                 uint64_t target,
-                 mpz_t mpz_gap_start, 
-                 uint32_t* candidates,
-                 uint32_t n_candidates,
-                 double score);
+           uint64_t target,
+           mpz_t mpz_gap_start,
+           const uint32_t* candidates,
+           uint32_t n_candidates,
+           double score);
  
     ~GapCandidate();
 };

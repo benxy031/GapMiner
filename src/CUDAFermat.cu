@@ -178,6 +178,22 @@ __device__ __forceinline__ bool big_is_one(const BigInt &n) {
   return acc == 0u;
 }
 
+__device__ __forceinline__ int big_bit_length(const BigInt &n) {
+  for (int i = kOperandSize - 1; i >= 0; --i) {
+    const uint32_t limb = n.limb[i];
+    if (limb != 0u)
+      return i * 32 + (31 - __clz(limb)) + 1;
+  }
+  return 0;
+}
+
+__device__ __forceinline__ uint32_t big_get_bit(const BigInt &n,
+                                                int bit_index) {
+  const int limb = bit_index >> 5;
+  const int shift = bit_index & 31;
+  return (n.limb[limb] >> shift) & 1u;
+}
+
 __device__ __forceinline__ int big_compare(const BigInt &a, const BigInt &b) {
   for (int i = kOperandSize - 1; i >= 0; --i) {
     if (a.limb[i] > b.limb[i])
@@ -237,11 +253,11 @@ __host__ __device__ __forceinline__ uint32_t montgomery_inverse32(uint32_t n0) {
   return ~inv + 1u;
 }
 
-__device__ void montgomery_mul(const BigInt &a,
-                               const BigInt &b,
-                               const BigInt &mod,
-                               uint32_t nPrime,
-                               BigInt &out) {
+__device__ __forceinline__ void montgomery_mul(const BigInt &a,
+                                               const BigInt &b,
+                                               const BigInt &mod,
+                                               uint32_t nPrime,
+                                               BigInt &out) {
   const int totalLimbs = kOperandSize * 2;
   uint64_t t[totalLimbs];
 #pragma unroll
@@ -283,11 +299,11 @@ __device__ void montgomery_mul(const BigInt &a,
 }
 
 // CIOS Montgomery multiply using t[N] + high carry (smaller temp footprint than t[2N]).
-__device__ void montgomery_mul_cios(const BigInt &a,
-                                    const BigInt &b,
-                                    const BigInt &mod,
-                                    uint32_t nPrime,
-                                    BigInt &out) {
+__device__ __forceinline__ void montgomery_mul_cios(const BigInt &a,
+                                                    const BigInt &b,
+                                                    const BigInt &mod,
+                                                    uint32_t nPrime,
+                                                    BigInt &out) {
   uint32_t t[kOperandSize];
   #pragma unroll
   for (int i = 0; i < kOperandSize; ++i)
@@ -847,34 +863,51 @@ __device__ bool fermat_probable_prime(const BigInt &n) {
   BigInt baseMont;
   montgomery_mul_fast(base, r2, n, nPrime, baseMont);
 
+  BigInt baseMont2;
+  montgomery_mul_fast(baseMont, baseMont, n, nPrime, baseMont2);
+
+  BigInt pow_odd[4];
+  big_copy(pow_odd[0], baseMont);           // 2^1
+  montgomery_mul_fast(baseMont2, baseMont, n, nPrime, pow_odd[1]); // 2^3
+  montgomery_mul_fast(pow_odd[1], baseMont2, n, nPrime, pow_odd[2]); // 2^5
+  montgomery_mul_fast(pow_odd[2], baseMont2, n, nPrime, pow_odd[3]); // 2^7
+
   BigInt result;
   big_copy(result, oneMont);
 
-  BigInt expCopy;
-  big_copy(expCopy, exponent);
-  while (!big_is_zero(expCopy)) {
-    const uint32_t bits = expCopy.limb[0] & 0x3u;
-    if (bits & 0x1u) {
+  const int bit_len = big_bit_length(exponent);
+  int i = bit_len - 1;
+  while (i >= 0) {
+    if (big_get_bit(exponent, i) == 0u) {
       BigInt tmp;
-      montgomery_mul_fast(result, baseMont, n, nPrime, tmp);
+      montgomery_mul_fast(result, result, n, nPrime, tmp);
+      big_copy(result, tmp);
+      --i;
+      continue;
+    }
+
+    int window = (i >= 2) ? 3 : (i + 1);
+    int j = i - window + 1;
+    while (j < i && big_get_bit(exponent, j) == 0u)
+      ++j;
+
+    uint32_t value = 0u;
+    for (int k = j; k <= i; ++k) {
+      value = (value << 1) | big_get_bit(exponent, k);
+    }
+
+    for (int k = 0; k < (i - j + 1); ++k) {
+      BigInt tmp;
+      montgomery_mul_fast(result, result, n, nPrime, tmp);
       big_copy(result, tmp);
     }
 
-    BigInt tmp;
-    montgomery_mul_fast(baseMont, baseMont, n, nPrime, tmp);
-    big_copy(baseMont, tmp);
+    const uint32_t odd_index = (value - 1u) >> 1;
+    BigInt tmpMul;
+    montgomery_mul_fast(result, pow_odd[odd_index], n, nPrime, tmpMul);
+    big_copy(result, tmpMul);
 
-    if (bits & 0x2u) {
-      BigInt tmpMul;
-      montgomery_mul_fast(result, baseMont, n, nPrime, tmpMul);
-      big_copy(result, tmpMul);
-    }
-
-    BigInt tmpSquare;
-    montgomery_mul_fast(baseMont, baseMont, n, nPrime, tmpSquare);
-    big_copy(baseMont, tmpSquare);
-
-    big_shift_right_two(expCopy);
+    i = j - 1;
   }
 
   BigInt finalRes;
@@ -1097,6 +1130,7 @@ __global__ void sievePrototypeMarkCompositesOptimized(
     uint32_t *bitmap,
     uint32_t bitmap_word_count,
     uint64_t base_offset,
+  const uint32_t *primes,
     const uint32_t *prime_residues,
     uint32_t prime_count,
     uint32_t shift)
@@ -1124,7 +1158,7 @@ __global__ void sievePrototypeMarkCompositesOptimized(
       // Check if this bit is a composite (multiple of some prime)
       bool is_composite = false;
       for (uint32_t p_idx = 0; p_idx < prime_count; ++p_idx) {
-        uint32_t prime = kSmallPrimesDevice[p_idx];
+        uint32_t prime = primes[p_idx];
         uint32_t residue = prime_residues[p_idx];
         
         // Is (bit - residue) divisible by prime?
@@ -1158,6 +1192,7 @@ __global__ void sievePrototypeMarkCompositesPerPrime(
     uint32_t *bitmap,
     uint32_t window_size,      // Size in bits
     uint64_t base_offset,
+  const uint32_t *primes,
     const uint32_t *prime_residues,
     uint32_t prime_count)
 {
@@ -1166,7 +1201,7 @@ __global__ void sievePrototypeMarkCompositesPerPrime(
        p_idx < prime_count;
        p_idx += blockDim.x * gridDim.x) {
     
-    uint32_t prime = kSmallPrimesDevice[p_idx];
+    uint32_t prime = primes[p_idx];
     uint32_t residue = prime_residues[p_idx];
     
     if (prime <= 2u)
@@ -2079,12 +2114,15 @@ void GPUFermat::prototype_sieve_batch(const SievePrototypeParams *params,
         static_cast<uint32_t>((static_cast<uint64_t>(window_bits) + 31ull) >> 5);
     const size_t window_bytes = static_cast<size_t>(window_words) * sizeof(uint32_t);
     uint8_t *target = bitmap_host_bytes + byte_cursor;
-    if (window_bytes)
+    const bool has_host_bitmap = window_attrs[idx].has_bitmap;
+    if (window_bytes && !has_host_bitmap)
       memset(target, 0, window_bytes);
     const size_t copy_bytes = std::min(window_bytes,
                                        static_cast<size_t>(params[idx].sieve_byte_len));
-    if (copy_bytes > 0 && params[idx].sieve_bytes) {
+    if (has_host_bitmap && copy_bytes > 0 && params[idx].sieve_bytes) {
       memcpy(target, params[idx].sieve_bytes, copy_bytes);
+      if (window_bytes > copy_bytes)
+        memset(target + copy_bytes, 0, window_bytes - copy_bytes);
       any_host_bitmap = true;
     }
     byte_cursor += window_bytes;
@@ -2515,6 +2553,15 @@ void GPUFermat::upload_prime_residues_to_device(const uint32_t *residues,
 void GPUFermat::mark_sieve_window_optimized(const SieveMarkingJob &job) {
   if (!initialized || job.prime_count == 0)
     return;
+
+  if (!sievePrimesConfigured || !sievePrototypePrimes.DeviceData) {
+    if (Opts::get_instance() && Opts::get_instance()->has_extra_vb()) {
+      std::ostringstream ss;
+      ss << get_time() << " CUDA mark skipped: prime list not configured";
+      extra_verbose_log(ss.str());
+    }
+    return;
+  }
   
   const uint32_t window_words = (job.window_size + 31) >> 5;
   ensurePrototypeBitmapCapacity(window_words);
@@ -2537,22 +2584,29 @@ void GPUFermat::mark_sieve_window_optimized(const SieveMarkingJob &job) {
   }
   
   // Clear bitmap (zeros = prime candidates)
-  uint8_t *bitmap_host = sievePrototypeBitmap.HostData;
-  memset(bitmap_host, 0, window_words * sizeof(uint32_t));
-  sievePrototypeBitmap.copyToDevice(streams[0], window_words);
+  cudaStream_t stream = streams[0];
+  const size_t bitmap_bytes = static_cast<size_t>(window_words) * sizeof(uint32_t);
+  CUDA_CHECK(cudaMemsetAsync(sievePrototypeBitmap.DeviceData,
+                             0,
+                             bitmap_bytes,
+                             stream));
   
+  const uint32_t effective_prime_count =
+      std::min(job.prime_count, configuredPrimeCount);
+  if (effective_prime_count == 0)
+    return;
+
   // Launch optimized per-word kernel
   const uint32_t threads_per_block = 256;
   const uint32_t blocks = (window_words + threads_per_block - 1) / threads_per_block;
-  
-  cudaStream_t stream = streams[0];
   
   sievePrototypeMarkCompositesOptimized<<<blocks, threads_per_block, 0, stream>>>(
       buffer_cast<uint32_t>(sievePrototypeBitmap.DeviceData),
       window_words,
       job.base_offset,
+      buffer_cast<const uint32_t>(sievePrototypePrimes.DeviceData),
       device_residues,
-      job.prime_count,
+      effective_prime_count,
       job.shift);
   
   CUDA_CHECK(cudaGetLastError());
@@ -2574,6 +2628,15 @@ void GPUFermat::mark_sieve_window_optimized(const SieveMarkingJob &job) {
 void GPUFermat::mark_sieve_window_per_prime(const SieveMarkingJob &job) {
   if (!initialized || job.prime_count == 0)
     return;
+
+  if (!sievePrimesConfigured || !sievePrototypePrimes.DeviceData) {
+    if (Opts::get_instance() && Opts::get_instance()->has_extra_vb()) {
+      std::ostringstream ss;
+      ss << get_time() << " CUDA mark skipped: prime list not configured";
+      extra_verbose_log(ss.str());
+    }
+    return;
+  }
   
   const uint32_t window_words = (job.window_size + 31) >> 5;
   ensurePrototypeBitmapCapacity(window_words);
@@ -2596,22 +2659,29 @@ void GPUFermat::mark_sieve_window_per_prime(const SieveMarkingJob &job) {
   }
   
   // Clear bitmap
-  uint8_t *bitmap_host = sievePrototypeBitmap.HostData;
-  memset(bitmap_host, 0, window_words * sizeof(uint32_t));
-  sievePrototypeBitmap.copyToDevice(streams[0], window_words);
+  cudaStream_t stream = streams[0];
+  const size_t bitmap_bytes = static_cast<size_t>(window_words) * sizeof(uint32_t);
+  CUDA_CHECK(cudaMemsetAsync(sievePrototypeBitmap.DeviceData,
+                             0,
+                             bitmap_bytes,
+                             stream));
   
+  const uint32_t effective_prime_count =
+      std::min(job.prime_count, configuredPrimeCount);
+  if (effective_prime_count == 0)
+    return;
+
   // Launch per-prime kernel
   const uint32_t threads_per_block = 256;
-  const uint32_t blocks = (job.prime_count + threads_per_block - 1) / threads_per_block;
-  
-  cudaStream_t stream = streams[0];
+  const uint32_t blocks = (effective_prime_count + threads_per_block - 1) / threads_per_block;
   
   sievePrototypeMarkCompositesPerPrime<<<blocks, threads_per_block, 0, stream>>>(
       buffer_cast<uint32_t>(sievePrototypeBitmap.DeviceData),
       job.window_size,
       job.base_offset,
+      buffer_cast<const uint32_t>(sievePrototypePrimes.DeviceData),
       device_residues,
-      job.prime_count);
+      effective_prime_count);
   
   CUDA_CHECK(cudaGetLastError());
   
@@ -2630,13 +2700,13 @@ void GPUFermat::mark_sieve_window_per_prime(const SieveMarkingJob &job) {
 }
 
 void GPUFermat::mark_sieve_window(const SieveMarkingJob &job) {
-  // Wrapper that calls optimized version by default
-  mark_sieve_window_optimized(job);
+  // Default to per-prime stepping kernel for better throughput.
+  mark_sieve_window_per_prime(job);
 }
 
 void GPUFermat::gpu_mark_sieve_window(const SieveMarkingJob &job) {
-  // Public interface - delegates to optimized implementation
-  mark_sieve_window_optimized(job);
+  // Public interface - default to per-prime stepping kernel.
+  mark_sieve_window_per_prime(job);
 }
 
 void GPUFermat::gpu_mark_sieve_optimized(const SieveMarkingJob &job) {

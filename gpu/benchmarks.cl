@@ -33,6 +33,69 @@ __kernel void squareBenchmark320(__global uint32_t *m1,
 #undef OperandSize
 }
 
+// Montgomery helpers are defined in procs.cl
+void monMul320(uint32_t *op1, uint32_t *op2, uint32_t *mod, uint32_t invm);
+void monSqr320(uint32_t *op, uint32_t *mod, uint32_t invm);
+void monMul352(uint32_t *op1, uint32_t *op2, uint32_t *mod, uint32_t invm);
+void monSqr352(uint32_t *op, uint32_t *mod, uint32_t invm);
+
+__kernel void montgomeryMulBenchmark320(__global uint32_t *m1,
+                                        __global uint32_t *m2,
+                                        __global uint32_t *mod,
+                                        __global uint32_t *invm,
+                                        __global uint32_t *out,
+                                        unsigned elementsNum,
+                                        unsigned rounds)
+{
+#define OperandSize 10
+  unsigned globalSize = get_global_size(0);
+  for (unsigned i = get_global_id(0); i < elementsNum; i += globalSize) {
+    uint32_t op1[OperandSize];
+    uint32_t op2[OperandSize];
+    uint32_t modl[OperandSize];
+    for (unsigned j = 0; j < OperandSize; ++j) {
+      op1[j] = m1[i * OperandSize + j];
+      op2[j] = m2[i * OperandSize + j];
+      modl[j] = mod[i * OperandSize + j];
+    }
+
+    uint32_t inv = invm[i];
+    for (unsigned r = 0; r < rounds; ++r)
+      monMul320(op1, op2, modl, inv);
+
+    for (unsigned j = 0; j < OperandSize; ++j)
+      out[i * OperandSize + j] = op1[j];
+  }
+#undef OperandSize
+}
+
+__kernel void montgomerySqrBenchmark320(__global uint32_t *m1,
+                                        __global uint32_t *mod,
+                                        __global uint32_t *invm,
+                                        __global uint32_t *out,
+                                        unsigned elementsNum,
+                                        unsigned rounds)
+{
+#define OperandSize 10
+  unsigned globalSize = get_global_size(0);
+  for (unsigned i = get_global_id(0); i < elementsNum; i += globalSize) {
+    uint32_t op1[OperandSize];
+    uint32_t modl[OperandSize];
+    for (unsigned j = 0; j < OperandSize; ++j) {
+      op1[j] = m1[i * OperandSize + j];
+      modl[j] = mod[i * OperandSize + j];
+    }
+
+    uint32_t inv = invm[i];
+    for (unsigned r = 0; r < rounds; ++r)
+      monSqr320(op1, modl, inv);
+
+    for (unsigned j = 0; j < OperandSize; ++j)
+      out[i * OperandSize + j] = op1[j];
+  }
+#undef OperandSize
+}
+
 __kernel void squareBenchmark352(__global uint32_t *m1,
                                  __global uint32_t *out,
                                  unsigned elementsNum)
@@ -157,6 +220,67 @@ __kernel void multiplyBenchmark352(__global uint32_t *m1,
       out[i*OperandSize*2 + j] = pResult[j];
   }
   
+#undef GmpOperandSize
+#undef OperandSize
+}
+
+__kernel void montgomeryMulBenchmark352(__global uint32_t *m1,
+                                        __global uint32_t *m2,
+                                        __global uint32_t *mod,
+                                        __global uint32_t *invm,
+                                        __global uint32_t *out,
+                                        unsigned elementsNum,
+                                        unsigned rounds)
+{
+#define OperandSize 11
+#define GmpOperandSize 12
+  unsigned globalSize = get_global_size(0);
+  for (unsigned i = get_global_id(0); i < elementsNum; i += globalSize) {
+    uint32_t op1[OperandSize];
+    uint32_t op2[OperandSize];
+    uint32_t modl[OperandSize];
+    for (unsigned j = 0; j < OperandSize; ++j) {
+      op1[j] = m1[i * GmpOperandSize + j];
+      op2[j] = m2[i * GmpOperandSize + j];
+      modl[j] = mod[i * GmpOperandSize + j];
+    }
+
+    uint32_t inv = invm[i];
+    for (unsigned r = 0; r < rounds; ++r)
+      monMul352(op1, op2, modl, inv);
+
+    for (unsigned j = 0; j < OperandSize; ++j)
+      out[i * OperandSize + j] = op1[j];
+  }
+#undef GmpOperandSize
+#undef OperandSize
+}
+
+__kernel void montgomerySqrBenchmark352(__global uint32_t *m1,
+                                        __global uint32_t *mod,
+                                        __global uint32_t *invm,
+                                        __global uint32_t *out,
+                                        unsigned elementsNum,
+                                        unsigned rounds)
+{
+#define OperandSize 11
+#define GmpOperandSize 12
+  unsigned globalSize = get_global_size(0);
+  for (unsigned i = get_global_id(0); i < elementsNum; i += globalSize) {
+    uint32_t op1[OperandSize];
+    uint32_t modl[OperandSize];
+    for (unsigned j = 0; j < OperandSize; ++j) {
+      op1[j] = m1[i * GmpOperandSize + j];
+      modl[j] = mod[i * GmpOperandSize + j];
+    }
+
+    uint32_t inv = invm[i];
+    for (unsigned r = 0; r < rounds; ++r)
+      monSqr352(op1, modl, inv);
+
+    for (unsigned j = 0; j < OperandSize; ++j)
+      out[i * OperandSize + j] = op1[j];
+  }
 #undef GmpOperandSize
 #undef OperandSize
 }

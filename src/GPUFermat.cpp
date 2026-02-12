@@ -23,6 +23,15 @@ constexpr array<const char *, 3> kKernelSourceFiles = {"gpu/procs.cl",
                                                        "gpu/fermat.cl",
                                                        "gpu/benchmarks.cl"};
 constexpr const char *kBuildOptions = "-cl-mad-enable -cl-fast-relaxed-math";
+
+uint32_t montgomery_inverse32_host(uint32_t n0) {
+  uint32_t inv = 1u;
+  for (int i = 0; i < 5; ++i) {
+    uint64_t prod = static_cast<uint64_t>(n0) * inv;
+    inv *= 2u - static_cast<uint32_t>(prod);
+  }
+  return ~inv + 1u;
+}
 }
 
 #define OCL(error)                                            \
@@ -87,6 +96,22 @@ GPUFermat::~GPUFermat() {
     clReleaseKernel(mFermatKernel320);
     mFermatKernel320 = nullptr;
   }
+  if (mMontgomeryMulBenchmark320) {
+    clReleaseKernel(mMontgomeryMulBenchmark320);
+    mMontgomeryMulBenchmark320 = nullptr;
+  }
+  if (mMontgomerySqrBenchmark320) {
+    clReleaseKernel(mMontgomerySqrBenchmark320);
+    mMontgomerySqrBenchmark320 = nullptr;
+  }
+  if (mMontgomeryMulBenchmark352) {
+    clReleaseKernel(mMontgomeryMulBenchmark352);
+    mMontgomeryMulBenchmark352 = nullptr;
+  }
+  if (mMontgomerySqrBenchmark352) {
+    clReleaseKernel(mMontgomerySqrBenchmark352);
+    mMontgomerySqrBenchmark352 = nullptr;
+  }
   if (queue) {
     clReleaseCommandQueue(queue);
     queue = nullptr;
@@ -140,6 +165,10 @@ GPUFermat::GPUFermat(unsigned device_id, const char *platformId, unsigned workIt
   gProgram = nullptr;
   mFermatBenchmarkKernel320 = nullptr;
   mFermatKernel320 = nullptr;
+  mMontgomeryMulBenchmark320 = nullptr;
+  mMontgomerySqrBenchmark320 = nullptr;
+  mMontgomeryMulBenchmark352 = nullptr;
+  mMontgomerySqrBenchmark352 = nullptr;
   gpu = nullptr;
   computeUnits = 0;
   queue = nullptr;
@@ -347,6 +376,15 @@ bool GPUFermat::init_cl(unsigned device_id, const char *platformId) {
 
   mFermatKernel320 = clCreateKernel(gProgram, "fermatTest320", &error);  
   OCLR(error, false);
+
+  mMontgomeryMulBenchmark320 = clCreateKernel(gProgram, "montgomeryMulBenchmark320", &error);
+  OCLR(error, false);
+  mMontgomerySqrBenchmark320 = clCreateKernel(gProgram, "montgomerySqrBenchmark320", &error);
+  OCLR(error, false);
+  mMontgomeryMulBenchmark352 = clCreateKernel(gProgram, "montgomeryMulBenchmark352", &error);
+  OCLR(error, false);
+  mMontgomerySqrBenchmark352 = clCreateKernel(gProgram, "montgomerySqrBenchmark352", &error);
+  OCLR(error, false);
   
   char deviceName[128] = {0};
 
@@ -461,28 +499,278 @@ bool GPUFermat::buildKernelBinary(const std::string &sourcefile) {
 
 /* run a benchmark test */
 void GPUFermat::benchmark() {
-
   test_gpu();
-  return;
 
-  for (int i = 1; i <= 10; i++) {
-    
-    clBuffer numbers;
+  const unsigned rounds = 128u;
+  const unsigned elements_count = elementsNum;
+  const size_t globalThreads[1] = { elements_count };
+  const size_t localThreads[1] = { GroupSize };
 
-    unsigned elementsNum    = 131072 * i;
-    unsigned operandSize    = 320/32;
-    unsigned numberLimbsNum = elementsNum*operandSize;
-    numbers.init(numberLimbsNum, CL_MEM_READ_WRITE);
+  auto report_error = [&](cl_int err, const char *label) {
+    if (err == CL_SUCCESS)
+      return false;
+    pthread_mutex_lock(&io_mutex);
+    cout << get_time() << label << err << endl;
+    pthread_mutex_unlock(&io_mutex);
+    return true;
+  };
 
-    for (unsigned j = 0; j < elementsNum; j++) {
-      for (unsigned k = 0; k < operandSize; k++)
-        numbers[j*operandSize + k] = (k == operandSize-1) ? (1 << (j % 32)) : rand32();
-      numbers[j*operandSize] |= 0x1; 
+  auto run_mul = [&](cl_kernel kernel,
+                     clBuffer &m1,
+                     clBuffer &m2,
+                     clBuffer &mod,
+                     clBuffer &invm,
+                     clBuffer &out,
+                     unsigned count,
+                     unsigned rounds_local,
+                     const char *label) {
+    cl_int err = 0;
+    err |= clSetKernelArg(kernel, 0, sizeof(cl_mem), &m1.DeviceData);
+    err |= clSetKernelArg(kernel, 1, sizeof(cl_mem), &m2.DeviceData);
+    err |= clSetKernelArg(kernel, 2, sizeof(cl_mem), &mod.DeviceData);
+    err |= clSetKernelArg(kernel, 3, sizeof(cl_mem), &invm.DeviceData);
+    err |= clSetKernelArg(kernel, 4, sizeof(cl_mem), &out.DeviceData);
+    err |= clSetKernelArg(kernel, 5, sizeof(unsigned), &count);
+    err |= clSetKernelArg(kernel, 6, sizeof(unsigned), &rounds_local);
+    if (report_error(err, "clSetKernelArg error: "))
+      return;
+
+    auto start = std::chrono::steady_clock::now();
+    err = clEnqueueNDRangeKernel(queue, kernel, 1, 0, globalThreads, localThreads,
+                                 0, 0, nullptr);
+    if (report_error(err, "clEnqueueNDRangeKernel error: "))
+      return;
+    err = clFinish(queue);
+    if (report_error(err, "clFinish error: "))
+      return;
+    auto end = std::chrono::steady_clock::now();
+
+    const double ms =
+        std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() /
+        1000.0;
+    const double ops = (static_cast<double>(count) * rounds_local) / 1e6;
+    pthread_mutex_lock(&io_mutex);
+    cout << get_time() << label << ms << " ms, " << (ops / (ms / 1000.0))
+         << " Mmul/s" << endl;
+    pthread_mutex_unlock(&io_mutex);
+  };
+
+  auto run_fermat_full = [&](cl_kernel kernel,
+                             clBuffer &numbers_buf,
+                             clBuffer &results_buf,
+                             clBuffer &prime_base_buf,
+                             unsigned count,
+                             const char *label) {
+    cl_int err = 0;
+    err |= clSetKernelArg(kernel, 0, sizeof(cl_mem), &numbers_buf.DeviceData);
+    err |= clSetKernelArg(kernel, 1, sizeof(cl_mem), &results_buf.DeviceData);
+    err |= clSetKernelArg(kernel, 2, sizeof(cl_mem), &prime_base_buf.DeviceData);
+    err |= clSetKernelArg(kernel, 3, sizeof(unsigned), &count);
+    err |= clSetKernelArg(kernel, 4, sizeof(cl_mem), &smallPrimes.DeviceData);
+    err |= clSetKernelArg(kernel, 5, sizeof(cl_mem), &primeReciprocals.DeviceData);
+    if (report_error(err, "clSetKernelArg error: "))
+      return;
+
+    const size_t kernelGlobal[1] = { groupsNum * GroupSize };
+    const size_t kernelLocal[1] = { GroupSize };
+    const unsigned repeats = 3u;
+
+    auto start = std::chrono::steady_clock::now();
+    for (unsigned r = 0; r < repeats; ++r) {
+      err = clEnqueueNDRangeKernel(queue, kernel, 1, 0, kernelGlobal,
+                                   kernelLocal, 0, 0, nullptr);
+      if (report_error(err, "clEnqueueNDRangeKernel error: "))
+        return;
+    }
+    err = clFinish(queue);
+    if (report_error(err, "clFinish error: "))
+      return;
+    auto end = std::chrono::steady_clock::now();
+
+    const double ms =
+        std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() /
+        1000.0;
+    const double tests = (static_cast<double>(count) * repeats) / 1e6;
+    pthread_mutex_lock(&io_mutex);
+    cout << get_time() << label << ms << " ms, "
+         << (tests / (ms / 1000.0)) << " Mtests/s" << endl;
+    pthread_mutex_unlock(&io_mutex);
+  };
+
+  auto run_sqr = [&](cl_kernel kernel,
+                     clBuffer &m1,
+                     clBuffer &mod,
+                     clBuffer &invm,
+                     clBuffer &out,
+                     unsigned count,
+                     unsigned rounds_local,
+                     const char *label) {
+    cl_int err = 0;
+    err |= clSetKernelArg(kernel, 0, sizeof(cl_mem), &m1.DeviceData);
+    err |= clSetKernelArg(kernel, 1, sizeof(cl_mem), &mod.DeviceData);
+    err |= clSetKernelArg(kernel, 2, sizeof(cl_mem), &invm.DeviceData);
+    err |= clSetKernelArg(kernel, 3, sizeof(cl_mem), &out.DeviceData);
+    err |= clSetKernelArg(kernel, 4, sizeof(unsigned), &count);
+    err |= clSetKernelArg(kernel, 5, sizeof(unsigned), &rounds_local);
+    if (report_error(err, "clSetKernelArg error: "))
+      return;
+
+    auto start = std::chrono::steady_clock::now();
+    err = clEnqueueNDRangeKernel(queue, kernel, 1, 0, globalThreads, localThreads,
+                                 0, 0, nullptr);
+    if (report_error(err, "clEnqueueNDRangeKernel error: "))
+      return;
+    err = clFinish(queue);
+    if (report_error(err, "clFinish error: "))
+      return;
+    auto end = std::chrono::steady_clock::now();
+
+    const double ms =
+        std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() /
+        1000.0;
+    const double ops = (static_cast<double>(count) * rounds_local) / 1e6;
+    pthread_mutex_lock(&io_mutex);
+    cout << get_time() << label << ms << " ms, " << (ops / (ms / 1000.0))
+         << " Mmul/s" << endl;
+    pthread_mutex_unlock(&io_mutex);
+  };
+
+  {
+    const unsigned opSize = 10u;
+    const unsigned gmpSize = 10u;
+    clBuffer m1;
+    clBuffer m2;
+    clBuffer mod;
+    clBuffer invm;
+    clBuffer out;
+    m1.init(elements_count * gmpSize, CL_MEM_READ_WRITE);
+    m2.init(elements_count * gmpSize, CL_MEM_READ_WRITE);
+    mod.init(elements_count * gmpSize, CL_MEM_READ_WRITE);
+    invm.init(elements_count, CL_MEM_READ_WRITE);
+    out.init(elements_count * opSize, CL_MEM_READ_WRITE);
+
+    for (unsigned i = 0; i < elements_count; ++i) {
+      for (unsigned j = 0; j < gmpSize; ++j) {
+        m1[i * gmpSize + j] = rand32();
+        m2[i * gmpSize + j] = rand32();
+        mod[i * gmpSize + j] = rand32();
+      }
+      mod[i * gmpSize] |= 1u;
+      mod[i * gmpSize + (opSize - 1)] |= 0x80000000u;
+      invm[i] = montgomery_inverse32_host(mod[i * gmpSize]);
     }
 
+    m1.copyToDevice(queue);
+    m2.copyToDevice(queue);
+    mod.copyToDevice(queue);
+    invm.copyToDevice(queue);
 
-    fermatTestBenchmark(queue, mFermatBenchmarkKernel320, numbers, elementsNum);
+        run_mul(mMontgomeryMulBenchmark320,
+          m1, m2, mod, invm, out,
+          elements_count, rounds,
+            "OpenCL montgomery mul 320: ");
+        run_sqr(mMontgomerySqrBenchmark320,
+          m1, mod, invm, out,
+          elements_count, rounds,
+            "OpenCL montgomery sqr 320: ");
   }
+
+  {
+    const unsigned opSize = 11u;
+    const unsigned gmpSize = 12u;
+    clBuffer m1;
+    clBuffer m2;
+    clBuffer mod;
+    clBuffer invm;
+    clBuffer out;
+    m1.init(elements_count * gmpSize, CL_MEM_READ_WRITE);
+    m2.init(elements_count * gmpSize, CL_MEM_READ_WRITE);
+    mod.init(elements_count * gmpSize, CL_MEM_READ_WRITE);
+    invm.init(elements_count, CL_MEM_READ_WRITE);
+    out.init(elements_count * opSize, CL_MEM_READ_WRITE);
+
+    for (unsigned i = 0; i < elements_count; ++i) {
+      for (unsigned j = 0; j < gmpSize; ++j) {
+        m1[i * gmpSize + j] = rand32();
+        m2[i * gmpSize + j] = rand32();
+        mod[i * gmpSize + j] = rand32();
+      }
+      mod[i * gmpSize] |= 1u;
+      mod[i * gmpSize + (opSize - 1)] |= 0x80000000u;
+      invm[i] = montgomery_inverse32_host(mod[i * gmpSize]);
+    }
+
+    m1.copyToDevice(queue);
+    m2.copyToDevice(queue);
+    mod.copyToDevice(queue);
+    invm.copyToDevice(queue);
+
+        run_mul(mMontgomeryMulBenchmark352,
+          m1, m2, mod, invm, out,
+          elements_count, rounds,
+            "OpenCL montgomery mul 352: ");
+        run_sqr(mMontgomerySqrBenchmark352,
+          m1, mod, invm, out,
+          elements_count, rounds,
+            "OpenCL montgomery sqr 352: ");
+  }
+
+      {
+        clBuffer numbers_buf;
+        clBuffer results_buf;
+        clBuffer prime_base_buf;
+
+        numbers_buf.init(elements_count, CL_MEM_READ_WRITE);
+        results_buf.init(elements_count, CL_MEM_READ_WRITE);
+        prime_base_buf.init(operandSize, CL_MEM_READ_WRITE);
+
+        mpz_class mpz(rand32());
+        for (int i = 0; i < 8; i++) {
+          mpz <<= 32;
+          mpz += rand32();
+        }
+        if (mpz.get_ui() & 0x1)
+          mpz += 1;
+
+        memset(prime_base_buf.HostData, 0, operandSize * sizeof(uint32_t));
+        size_t exported_size = 0;
+        mpz_export(prime_base_buf.HostData,
+                   &exported_size,
+                   -1,
+                   sizeof(uint32_t),
+                   0,
+                   0,
+                   mpz.get_mpz_t());
+
+        mpz_class base_mpz;
+        mpz_import(base_mpz.get_mpz_t(), operandSize, -1, 4, 0, 0, prime_base_buf.HostData);
+
+        const uint32_t base_lsw = prime_base_buf.HostData[0];
+        const uint32_t max_offset_no_carry = 0xFFFFFFFFu - base_lsw;
+        const uint32_t offset_cap = std::min<uint32_t>(max_offset_no_carry, (1u << 24) - 1u);
+
+        for (unsigned i = 0; i < elements_count; ++i) {
+          uint32_t small_offset = (offset_cap > 0)
+                                      ? (rand32() % (offset_cap + 1u))
+                                      : 0u;
+          mpz_class candidate = base_mpz + small_offset;
+          mpz_class offset = candidate - base_mpz;
+          numbers_buf.HostData[i] = offset.get_ui() & 0xffffffffu;
+        }
+
+        numbers_buf.copyToDevice(queue);
+        results_buf.copyToDevice(queue);
+        prime_base_buf.copyToDevice(queue);
+        smallPrimes.copyToDevice(queue);
+        primeReciprocals.copyToDevice(queue);
+
+        run_fermat_full(mFermatKernel320,
+                        numbers_buf,
+                        results_buf,
+                        prime_base_buf,
+                        elements_count,
+                        "OpenCL fermat full 320: ");
+      }
 }
 
 /* generates a 32 bit random number */
@@ -660,16 +948,29 @@ void GPUFermat::test_gpu() {
     memset(prime_base, 0, operandSize * sizeof(uint32_t));
     size_t exported_size = 0;
     mpz_export(prime_base, &exported_size, -1, sizeof(uint32_t), 0, 0, mpz.get_mpz_t());
-  
+
+    mpz_class base_mpz;
+    mpz_import(base_mpz.get_mpz_t(), operandSize, -1, 4, 0, 0, prime_base);
+
+    const uint32_t base_lsw = prime_base[0];
+    const uint32_t max_offset_no_carry = 0xFFFFFFFFu - base_lsw;
+    const uint32_t offset_cap = std::min<uint32_t>(max_offset_no_carry, (1u << 24) - 1u);
+
     /* create the test numbers, every second will be prime */
     for (unsigned i = 0; i < size; i++) {
-
-      primes[i] = mpz.get_ui() & 0xffffffff;
-
-      if (i % 2 == 0)
-        mpz_nextprime(mpz.get_mpz_t(), mpz.get_mpz_t());
-      else
-        mpz_add_ui(mpz.get_mpz_t(), mpz.get_mpz_t(), 1);
+      uint32_t small_offset = (offset_cap > 0)
+                                  ? (rand32() % (offset_cap + 1u))
+                                  : 0u;
+      if (i % 2 == 0) {
+        mpz_class candidate = base_mpz + small_offset;
+        mpz_nextprime(candidate.get_mpz_t(), candidate.get_mpz_t());
+        mpz_class offset = candidate - base_mpz;
+        primes[i] = offset.get_ui() & 0xffffffffu;
+      } else {
+        mpz_class composite = base_mpz + small_offset + 1;
+        mpz_class offset = composite - base_mpz;
+        primes[i] = offset.get_ui() & 0xffffffffu;
+      }
 
       if (i % 23 == 0)
         printf("\rcreating test data: %d  \r", size - i);
@@ -683,7 +984,12 @@ void GPUFermat::test_gpu() {
     unsigned failures = 0;
     for (unsigned i = 0; i < size; i++) {
 
-      const uint32_t expected = (i % 2 == 0) ? 0u : 1u;
+      mpz_t check;
+      mpz_init(check);
+      mpz_import(check, operandSize, -1, 4, 0, 0, prime_base);
+      mpz_add_ui(check, check, primes[i]);
+      const uint32_t expected = (mpz_probab_prime_p(check, 25) != 0) ? 1u : 0u;
+      mpz_clear(check);
 
       if (results[i] != expected) {
         if (failures == 0) {
