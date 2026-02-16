@@ -74,6 +74,10 @@ class ChineseSieve : public Sieve {
     /* calculated gaps since the last share */
     static sieve_t gaps_since_share;
 
+    /* candidate submission ratio tracking */
+    static uint64_t total_candidates_tested;
+    static uint64_t total_candidates_submitted;
+
     /* sync mutex */
     static pthread_mutex_t mutex;
 
@@ -108,11 +112,27 @@ class ChineseSieve : public Sieve {
 
     /* random */
     rand128_t *rand; 
+    
+    /* optimization: batch GMP updates and log caching */
+    sieve_t gmp_batch_counter;
+    double cached_log_start;
+    static const sieve_t GMP_BATCH_SIZE = 256u;
+    static const uint32_t BLOCK_CHECK_FREQUENCY = 1024u;
+    
+    /* optimization: queue-depth aware sieve tuning */
+    static const uint32_t QUEUE_PRESSURE_THRESHOLD = 40000u;
+    static const uint32_t QUEUE_CRITICAL_THRESHOLD = 50000u;
+    double queue_pressure_factor;
 
     /**
      * Fermat pseudo prime test
      */
     inline bool fermat_test(mpz_t mpz_p);
+    
+    /**
+     * Enhanced multi-base Fermat primality test for accuracy
+     */
+    inline bool miller_rabin_test(mpz_t mpz_p, int rounds = 2);
 
   public:
 

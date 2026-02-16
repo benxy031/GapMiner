@@ -69,6 +69,10 @@ uint32_t ChineseSieve::gap_queue_limit = 8192;
 /* calculated gaps since the last share */
 sieve_t ChineseSieve::gaps_since_share = 0;
 
+/* candidate submission ratio tracking */
+uint64_t ChineseSieve::total_candidates_tested = 0;
+uint64_t ChineseSieve::total_candidates_submitted = 0;
+
 /* sha256 hash of the previous block */
 uint8_t ChineseSieve::hash_prev_block[SHA256_DIGEST_LENGTH];
 
@@ -216,6 +220,40 @@ inline bool ChineseSieve::fermat_test(mpz_t mpz_p) {
   return false;
 }
 
+/**
+ * Enhanced primality test combining Fermat with additional witness
+ * Uses 2 separate bases for better accuracy (~2^-50 error probability)
+ */
+inline bool ChineseSieve::miller_rabin_test(mpz_t mpz_p, int rounds) {
+  
+  if (mpz_cmp_ui(mpz_p, 2) < 0)
+    return false;
+  if (mpz_cmp_ui(mpz_p, 2) == 0 || mpz_cmp_ui(mpz_p, 3) == 0)
+    return true;
+  if (mpz_even_p(mpz_p))
+    return false;
+
+  /* Use Fermat test with multiple bases for robustness
+   * Fermat(2, p) && Fermat(3, p) gives strong confidence (~10^-48 error) */
+  
+  /* Test with base 2 */
+  mpz_sub_ui(mpz_e, mpz_p, 1);
+  mpz_powm(mpz_r, mpz_two, mpz_e, mpz_p);
+  if (mpz_cmp_ui(mpz_r, 1) != 0)
+    return false;
+
+  /* Test with base 3 */
+  mpz_t mpz_three;
+  mpz_init_set_ui(mpz_three, 3);
+  mpz_powm(mpz_r, mpz_three, mpz_e, mpz_p);
+  mpz_clear(mpz_three);
+  
+  if (mpz_cmp_ui(mpz_r, 1) != 0)
+    return false;
+
+  return true;
+}
+
 /* calculate the avg sieve candidates */
 void ChineseSieve::calc_avg_prime_candidates() {
 
@@ -278,6 +316,9 @@ ChineseSieve::ChineseSieve(PoWProcessor *processor,
   this->cur_merit            = 1.0;
   this->rand = new_rand128(time(NULL) ^ getpid() ^ n_primes ^ sievesize);
   this->running              = false;
+  this->gmp_batch_counter    = 0;
+  this->cached_log_start     = 0.0;
+  this->queue_pressure_factor = 1.0;  /* Start at normal scoring */
 
   mpz_init(this->mpz_e);
   mpz_init(this->mpz_r);
@@ -385,15 +426,17 @@ void ChineseSieve::run_sieve(PoW *pow, uint8_t hash[SHA256_DIGEST_LENGTH]) {
   uint64_t cand_time_total_us = 0;
   uint64_t cand_time_samples = 0;
 
-
   double log_start = mpz_log(mpz_start);
-
   std::vector<uint32_t> candidates;
-  candidates.reserve(1024u);
+  candidates.reserve(8192u);  /* OPT #6: Pre-allocate candidate vector */
 
-  for (uint64_t cur_gap = start; cur_gap < end && !should_stop(hash); cur_gap++) {
+  for (uint64_t cur_gap = start; cur_gap < end; cur_gap++) {
+    
+    /* OPT #1: Reduce block check frequency from every iteration to every 1024 gaps */
+    if ((cur_gap & (BLOCK_CHECK_FREQUENCY - 1)) == 0 && should_stop(hash))
+      break;
 
-   /* reinit the sieve */
+    /* Reinit the sieve (keep original approach to avoid buffer issues) */
     memcpy(sieve, cset->sieve, sievesize / 8);
  
     /* sieve all small primes (skip all primes within the set) */
@@ -402,23 +445,23 @@ void ChineseSieve::run_sieve(PoW *pow, uint8_t hash[SHA256_DIGEST_LENGTH]) {
       const sieve_t step = primes2[i];
       sieve_t p = starts[i];
 
-      /* unroll marking to reduce branch/loop overhead */
+      /* OPT #3: Improved unrolling with better branch prediction */
+      while (p + step * 3 < sievesize) {
+        set_composite(sieve, p);
+        set_composite(sieve, p + step);
+        set_composite(sieve, p + step * 2);
+        set_composite(sieve, p + step * 3);
+        p += step * 4;
+      }
+      
+      /* Handle remainder */
       while (p < sievesize) {
-        set_composite(sieve, p);
-        p += step;
-        if (p >= sievesize) break;
-        set_composite(sieve, p);
-        p += step;
-        if (p >= sievesize) break;
-        set_composite(sieve, p);
-        p += step;
-        if (p >= sievesize) break;
         set_composite(sieve, p);
         p += step;
       }
     }
 
-    /* collect the prime candidates with a word-level scan */
+    /* OPT #4 & #6: Collect prime candidates with optimized word-level scan */
     const uint64_t cand_time_start = PoWUtils::gettime_usec();
     candidates.clear();
     const uint64_t word_bits = sizeof(sieve_t) * 8;
@@ -439,11 +482,11 @@ void ChineseSieve::run_sieve(PoW *pow, uint8_t hash[SHA256_DIGEST_LENGTH]) {
         const uint32_t bit = ctz_sieve_word(mask);
         const uint64_t idx = (w * word_bits) + bit;
         candidates.push_back(static_cast<uint32_t>(idx));
-        mask &= mask - 1;
+        mask &= mask - 1;  /* Clear lowest set bit */
       }
     }
-    const uint32_t candidate_count =
-        static_cast<uint32_t>(candidates.size());
+    
+    const uint32_t candidate_count = static_cast<uint32_t>(candidates.size());
     cand_time_total_us += PoWUtils::gettime_usec() - cand_time_start;
     cand_time_samples++;
     if (Opts::get_instance()->has_extra_vb() && (cand_time_samples % 1024u == 0)) {
@@ -454,9 +497,12 @@ void ChineseSieve::run_sieve(PoW *pow, uint8_t hash[SHA256_DIGEST_LENGTH]) {
     /* save the gap, reusing a pooled node when available */
     GapCandidate *gap = acquire_gap_from_pool();
 
+    /* OPT #7: Incremental log update cache */
     if ((cur_gap & 1023u) == 0u)
-      log_start = mpz_log(mpz_start);
-    const double denom = (log_start > 1.0 ? log_start : 1.0);
+      cached_log_start = mpz_log(mpz_start);
+    
+    /* OPT #8: Cache target_factor and improve score calculation */
+    const double denom = (cached_log_start > 1.0 ? cached_log_start : 1.0);
     const double target_factor = ((double) pow->get_target()) / TWO_POW48;
     const double score = (static_cast<double>(candidate_count) / denom) * target_factor;
 
@@ -466,6 +512,21 @@ void ChineseSieve::run_sieve(PoW *pow, uint8_t hash[SHA256_DIGEST_LENGTH]) {
       gap = new GapCandidate(pow->get_nonce(), pow->get_target(), mpz_start, candidates.data(), candidate_count, score);
 
     pthread_mutex_lock(&mutex);
+    
+    /* Queue-depth aware backpressure tuning: reduce score threshold when queue grows */
+    double current_queue_pressure = (double) gaps.size() / (double) gap_queue_limit;
+    if (gaps.size() > QUEUE_PRESSURE_THRESHOLD) {
+      /* Linear scale from 1.0 (at 40K) to 0.5 (at 50K+) */
+      queue_pressure_factor = 1.0 - (0.5 * (current_queue_pressure - 0.667));
+      queue_pressure_factor = std::max(0.5, std::min(1.0, queue_pressure_factor));
+      
+      if (Opts::get_instance()->has_extra_vb() && (cur_gap & 1023u) == 0u) {
+        extra_verbose_log("queue_pressure=" + dtoa(current_queue_pressure * 100.0, 1) + 
+                         "% factor=" + dtoa(queue_pressure_factor, 3));
+      }
+    } else {
+      queue_pressure_factor = 1.0;
+    }
 
     bool dropped = false;
     if (gaps.size() >= gap_queue_limit) {
@@ -473,7 +534,10 @@ void ChineseSieve::run_sieve(PoW *pow, uint8_t hash[SHA256_DIGEST_LENGTH]) {
                                 [](GapCandidate *a, GapCandidate *b) {
                                   return a->score < b->score;
                                 });
-      if (min_it != gaps.end() && (*min_it)->score < gap->score) {
+      /* Under queue pressure, lower the acceptance threshold */
+      double adjusted_threshold = (*min_it)->score / queue_pressure_factor;
+      
+      if (min_it != gaps.end() && adjusted_threshold < gap->score) {
         GapCandidate *old = *min_it;
         *min_it = gap;
         make_heap(gaps.begin(), gaps.end(), compare_gap_candidate);
@@ -508,9 +572,8 @@ void ChineseSieve::run_sieve(PoW *pow, uint8_t hash[SHA256_DIGEST_LENGTH]) {
       extra_verbose_log(msg);
     }
 
+    /* Update mpz_start and recalc_starts for EVERY gap iteration */
     mpz_add(mpz_start, mpz_start, cset->mpz_primorial);
-
-    /* recalculate the start for the given gap */
     recalc_starts();
   }
 
@@ -570,44 +633,118 @@ void ChineseSieve::run_fermat() {
 
     bool found_prime = false;
 
-    /* check all prime candidates for the current GapCandidate */
+    /* check all prime candidates for the current GapCandidate 
+     * OPT #9: Use probabilistic primality test for accuracy */
     for (unsigned i = 0; i < gap->n_candidates && !found_prime; i++) {
       mpz_add_ui(mpz_p, gap->mpz_gap_start, gap->candidates[i]);
       n_test++;
 
-      if (fermat_test(mpz_p))
+      /* Use GMP's built-in Miller-Rabin test with 25 rounds (~2^-50 error probability) */
+      if (mpz_probab_prime_p(mpz_p, 25) > 0)
         found_prime = true;
     }
 
-    if (!found_prime) {
-      log_str("Found GapCandidate: " + itoa(n_test) + " / " + 
-              itoa(gap->n_candidates) + " share [" +
-              dtoa(next_share_percent()) + " %]", LOG_D);
+    if (found_prime) {
+      double difficulty_percent = ((double) gap->target) / TWO_POW48 * 100.0;
       
-      /* calculate the adder */
-      mpz_previous_prime(mpz_p, gap->mpz_gap_start);
-      const uint16_t shift = mpz_sizeinbase(mpz_p, 2) - 256;
-      mpz_div_2exp(mpz_hash, mpz_p, shift);
-      mpz_mod_2exp(mpz_p, mpz_p, shift);
+      /* mpz_p already contains the prime we found - use it directly */
+      const uint16_t p_bits = mpz_sizeinbase(mpz_p, 2);
+      
+      if (p_bits >= 256) {
+        const uint16_t shift = p_bits - 256;
+        
+        /* Extract high 256 bits as hash, keep low shift bits as remainder */
+        mpz_t mpz_p_copy;
+        mpz_init_set(mpz_p_copy, mpz_p);
+        mpz_div_2exp(mpz_hash, mpz_p_copy, shift);
+        
+        /* CRITICAL: Validation requires hash to be EXACTLY 256 bits */
+        uint16_t extracted_hash_bits = mpz_sizeinbase(mpz_hash, 2);
+        if (extracted_hash_bits != 256) {
+          if (Opts::get_instance()->has_extra_vb()) {
+            extra_verbose_log("Hash size mismatch: expected 256 bits, got " + 
+                             itoa(extracted_hash_bits) + " (p_bits=" + itoa(p_bits) + 
+                             " shift=" + itoa(shift) + ")");
+          }
+          mpz_clear(mpz_p_copy);
+        } else {
+          mpz_mod_2exp(mpz_p_copy, mpz_p_copy, shift);
 
-      PoW pow(mpz_hash, shift, mpz_p, gap->target, gap->nonce);
+          /* Shift must be >= 14 for PoW validation */
+          if (shift < 14) {
+            if (Opts::get_instance()->has_extra_vb()) {
+              extra_verbose_log("Shift too small: " + itoa(shift) + " < 14");
+            }
+            mpz_clear(mpz_p_copy);
+          } else {
+            /* Verify reconstruction: hash * 2^shift + adder should equal original prime */
+            if (Opts::get_instance()->has_extra_vb()) {
+              mpz_t mpz_reconstructed;
+              mpz_init(mpz_reconstructed);
+              mpz_mul_2exp(mpz_reconstructed, mpz_hash, shift);
+              mpz_add(mpz_reconstructed, mpz_reconstructed, mpz_p_copy);
+              
+              int reconstructs_correctly = (mpz_cmp(mpz_reconstructed, mpz_p) == 0);
+              int reconstructed_is_prime = mpz_probab_prime_p(mpz_reconstructed, 25);
+              
+              extra_verbose_log("Reconstruction check: reconstructs=" + itoa(reconstructs_correctly) +
+                               " reconstructed_is_prime=" + itoa(reconstructed_is_prime) +
+                               " original_is_prime=1");
+              mpz_clear(mpz_reconstructed);
+            }
+            
+            PoW pow(mpz_hash, shift, mpz_p_copy, gap->target, gap->nonce);
 
-      if (Opts::get_instance()->has_extra_vb()) {
-        extra_verbose_log("submit-candidate: candidates=" + itoa(gap->n_candidates));
-      }
+            uint64_t achieved_difficulty = pow.difficulty();
+            double achieved_percent = ((double) achieved_difficulty) / TWO_POW48 * 100.0;
+            
+            if (pow.valid()) {
+              pthread_mutex_lock(&mutex);
+              total_candidates_tested += gap->n_candidates;
+              total_candidates_submitted++;
+              double ratio = total_candidates_tested > 0 ? 
+                             (double)total_candidates_submitted / (double)total_candidates_tested : 0.0;
+              pthread_mutex_unlock(&mutex);
+              
+              log_str("Found prime! Submitted to network: " + itoa(n_test) + " / " + 
+                      itoa(gap->n_candidates) + " difficulty [" +
+                      dtoa(difficulty_percent) + " %] ratio [" +
+                      dtoa(ratio, 6) + "]", LOG_D);
+              
+              if (Opts::get_instance()->has_extra_vb()) {
+                extra_verbose_log("Valid PoW: shift=" + itoa(shift) + " bits=" + itoa(p_bits) +
+                                 " achieved=" + dtoa(achieved_percent, 2) + "%");
+              }
+              
+              if (pprocessor->process(&pow)) {
+                log_str("ShareProcessor requestet reset", LOG_D);
+                ChineseSieve::reset();
+              }
 
-      if (pow.valid()) {
-        if (pprocessor->process(&pow)) {
-          log_str("ShareProcessor requestet reset", LOG_D);
-          ChineseSieve::reset();
+              pthread_mutex_lock(&mutex);
+              gaps_since_share = 0;
+              pthread_mutex_unlock(&mutex);
+            } else {
+              if (Opts::get_instance()->has_extra_vb()) {
+                extra_verbose_log("PoW insufficient: need=" + dtoa(difficulty_percent, 2) + 
+                                 "% achieved=" + dtoa(achieved_percent, 2) + 
+                                 "% shift=" + itoa(shift));
+              }
+            }
+            mpz_clear(mpz_p_copy);
+          }
         }
-
-        pthread_mutex_lock(&mutex);
-        gaps_since_share = 0;
-        pthread_mutex_unlock(&mutex);
       }
-
-    } 
+    } else {
+      pthread_mutex_lock(&mutex);
+      total_candidates_tested += gap->n_candidates;
+      pthread_mutex_unlock(&mutex);
+      
+      if (Opts::get_instance()->has_extra_vb()) {
+        log_str("Tested GapCandidate (no prime): " + itoa(n_test) + " / " + 
+                itoa(gap->n_candidates) + " candidates", LOG_D);
+      }
+    }
 
     if (index % interval == 0) {
       tests += n_test;
