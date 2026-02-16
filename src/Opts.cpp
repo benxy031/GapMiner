@@ -124,18 +124,36 @@ quiet(     "-q", "--quiet",          "be quiet (only prints shares)",           
 extra_vb(  "-e", "--extra-verbose",  "additional verbose output",                     false),
 share_log( "-S", "--share-log",      "append share results to shares.txt",            false),
 stats(     "-j", "--stats-interval", "interval (sec) to print mining informations",   true),
+stats_csv( NULL, "--stats-csv",      "log mining stats to stats.csv",                 false),
 threads(   "-t", "--threads",        "number of mining threads",                      true),
 pull(      "-l", "--pull-interval",  "seconds to wait between getwork request",       true),
 timeout(   "-m", "--timeout",        "seconds to wait for server to respond",         true),
 dump_config(NULL, "--dump-config",   "print effective runtime config",                false),
 stratum(   "-c", "--stratum",        "use stratum protocol for connection",           false),
+/* Sieving parameters: larger values = more candidates filtered, more memory used.
+ * Tune based on available RAM and desired candidate quality */
 sievesize( "-s", "--sieve-size",     "the prime sieve size",                          true),
 primes(    "-i", "--sieve-primes",   "number of primes for sieving",                  true),
+/* Shift determines the bit size of primes to search: bit_size = 256 + shift
+ * This translates to decimal digit length via: digits = floor(bit_size * log10(2))
+ * Valid range: [14, 1024] (protocol enforced), default: 25
+ * Examples: shift=13->81 digits, shift=25->85 digits, shift=128->116 digits
+ * Larger shifts = larger primes = more computational work per candidate */
 shift(     "-f", "--shift",          "the adder shift",                               true),
+/* CRT (Chinese Remainder Theorem) optimization: precomputed residue tables in crt/
+ * dramatically accelerate sieve initialization. Use --calc-ctr to generate custom tables
+ * optimized for specific shift values and sieve parameters */
 cset(      "-r", "--crt",            "use the given Chinese Remainder Theorem file",  true),
 fermat_threads("-d", "--fermat-threads", "number of fermat threads wen using the crt",    true),
 gap_queue_limit(NULL, "--gap-queue-limit", "max queued gaps before sieving pauses (default 8192)", true),
+/* Normally, minimum gap length is auto-calculated based on difficulty target.
+ * This option overrides that calculation to force testing of all gaps >= specified length.
+ * Useful for targeting specific gap sizes or merit ranges */
+min_gaplen(NULL, "--min-gaplen", "minimum gap length to test (overrides auto-calculated min)", true),
 #ifndef CPU_ONLY
+/* GPU acceleration options: offload Fermat primality tests to GPU for massive parallelism.
+ * Key tuning parameters for RTX 3060: -w 4096-8192, -n 32-64, --queue-size 16384-32768
+ * Larger work-items and queue-size = more GPU utilization but higher memory usage */
 benchmark( "-b", "--benchmark",      "run a gpu benchmark",                           false),
 use_gpu(   "-g", "--use-gpu",        "use the gpu for Fermat testing",                false),
 gpu_dev(   "-d", "--gpu-dev",        "the gpu device id",                             true),
@@ -143,13 +161,20 @@ work_items("-w", "--work-items",     "gpu work items (default 2048)",           
 queue_size("-z", "--queue-size",     "the gpu waiting queue size (memory intensive)", true),
 platform(  "-a", "--platform",       "opencl platform (amd or nvidia)",               true),
 n_tests(   "-n", "--num-gpu-tests",  "the number of test per gap per gpu run",        true),
+/* CUDA-specific optimizations: experimental sieve on GPU, Comba multiplication algorithm.
+ * Memory pools avoid repeated allocation overhead for high-throughput GPU pipelines */
 cuda_sieve_proto(NULL, "--cuda-sieve-proto", "run the experimental CUDA sieve prototype", false),
 cuda_comba(NULL, "--cuda-comba", "use Comba Montgomery multiply on CUDA", false),
 bitmap_pool_buffers(NULL, "--bitmap-pool-buffers", "override bitmap buffer pool size (default queue-size+2)", true),
 snapshot_pool_buffers(NULL, "--snapshot-pool-buffers", "override CUDA residue snapshot pool size", true),
+/* GPU launch control: divisor affects batch size, wait_ms controls GPU starvation vs latency.
+ * Lower divisor = larger batches = better throughput but higher latency */
 gpu_launch_divisor(NULL, "--gpu-launch-divisor", "override GPU launch divisor (default 6, lower = faster launches)", true),
   gpu_launch_wait_ms(NULL, "--gpu-launch-wait-ms", "maximum wait in ms before forcing a partial GPU batch (default 50)", true),
 #endif
+/* CRT calculation/optimization: generate custom Chinese Remainder Theorem tables
+ * optimized for specific mining parameters. Uses evolutionary algorithms to find
+ * prime residue patterns that maximize sieve efficiency. Advanced users only. */
 calc_ctr(  NULL, "--calc-ctr",       "calculate a chinese remainder theorem file",    false),
 ctr_strength(NULL, "--ctr-strength", "more = longer time and mybe better result",     true),
 ctr_primes(NULL, "--ctr-primes",     "the number of to use primes in the ctr file",   true),
@@ -187,6 +212,8 @@ license(   "-v", "--license",        "show license of this program",            
   stats.active = has_arg(stats.short_opt, stats.long_opt);
   if (stats.active)
     stats.arg = get_arg(stats.short_opt, stats.long_opt);
+
+  stats_csv.active = has_arg(stats_csv.short_opt, stats_csv.long_opt);
 
   threads.active = has_arg(threads.short_opt, threads.long_opt);
   if (threads.active)
@@ -227,6 +254,10 @@ license(   "-v", "--license",        "show license of this program",            
   gap_queue_limit.active = has_arg(gap_queue_limit.short_opt, gap_queue_limit.long_opt);
   if (gap_queue_limit.active)
     gap_queue_limit.arg = get_arg(gap_queue_limit.short_opt, gap_queue_limit.long_opt);
+
+  min_gaplen.active = has_arg(min_gaplen.short_opt, min_gaplen.long_opt);
+  if (min_gaplen.active)
+    min_gaplen.arg = get_arg(min_gaplen.short_opt, min_gaplen.long_opt);
 
 
 #ifndef CPU_ONLY
@@ -373,6 +404,9 @@ string Opts::get_help()  {
   ss << "  " << stats.short_opt << "  " << left << setw(18);
   ss << stats.long_opt << "  " << stats.description << "\n\n";
 
+  ss << "      " << left << setw(18);
+  ss << stats_csv.long_opt << "  " << stats_csv.description << "\n\n";
+
   ss << "  " << threads.short_opt << "  " << left << setw(18);
   ss << threads.long_opt << "  " << threads.description << "\n\n";
 
@@ -405,6 +439,9 @@ string Opts::get_help()  {
 
   ss << "      " << left << setw(18);
   ss << gap_queue_limit.long_opt << "  " << gap_queue_limit.description << "\n\n";
+
+  ss << "      " << left << setw(18);
+  ss << min_gaplen.long_opt << "  " << min_gaplen.description << "\n\n";
 
 #ifndef CPU_ONLY
   ss << "  " << benchmark.short_opt  << "  " << left << setw(18);

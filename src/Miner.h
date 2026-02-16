@@ -76,6 +76,9 @@ class Miner {
      */
     double avg_tests_per_second();
 
+    /* returns the current target difficulty (0 if unavailable) */
+    uint64_t get_target_difficulty();
+
     /**
      * returns the percent we have already calculated form the current share
      */

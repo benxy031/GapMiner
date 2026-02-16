@@ -45,8 +45,14 @@ class ShareProcessor : PoWProcessor {
     static void cleanup();
 
     /**
-     * Validates that a given PoW isn't
-     * obsolete, and if not adds it to the shares queue
+     * Validates that a given PoW isn't obsolete, and if not adds it to the shares queue.
+     * 
+     * Validation includes Baillie-PSW probable primality test of gap endpoints.
+     * See PRIMALITY-TESTING.md in project root for:
+     * - Why BPSW is sufficient for mining
+     * - Optional enhancements for record submissions
+     * - Proof generation for competitive records
+     * - Future optimization opportunities (Lucas tests, deterministic bases)
      */
     bool process(PoW *pow);
 

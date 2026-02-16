@@ -35,6 +35,16 @@ Kernel Behavior (`src/CUDAFermat.cu`)
 - `locate_window()` function optimized with binary search (O(log n)) instead
   of linear search (O(n)) for better performance with large window counts.
 
+Memory Optimizations (Feb 2026)
+--------------------------------
+- Device-side bitmap clearing: `prototype_sieve_batch()` now uses `cudaMemsetAsync()`
+  to zero bitmaps directly on device instead of CPU `memset()` + H2D copy.
+- Eliminates ~14MB host memset + PCIe upload per window for large `--sieve-size`.
+- Async zeroing overlaps with other GPU operations via CUDA streams, improving
+  memory bandwidth utilization.
+- Combined with pinned memory (already present), provides maximum throughput for
+  sieve bitmap preparation and scanning.
+
 Current Scope
 -------------
 - The CPU still computes residue snapshots and window metadata.

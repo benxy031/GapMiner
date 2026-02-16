@@ -156,6 +156,8 @@ void *getwork_thread(void *arg) {
   unsigned int sec = (opts->has_pull() ? atoll(opts->get_pull().c_str()) : 5);
   time_t work_time = time(NULL);
 
+  PoWUtils pow_utils;
+
   while (running) {
     if (!longpoll)
       sleep(sec);
@@ -440,6 +442,22 @@ int main(int argc, char *argv[]) {
     const size_t avg60_samples = std::max<size_t>(1u, (60u + sec - 1u) / sec);
     const size_t avg300_samples = max_samples;
 
+  /* open CSV file for stats logging if requested */
+  FILE *stats_csv_file = NULL;
+  if (opts->has_stats_csv()) {
+    stats_csv_file = fopen("stats.csv", "a");
+    if (stats_csv_file) {
+      /* check if file is empty to write header */
+      fseek(stats_csv_file, 0, SEEK_END);
+      if (ftell(stats_csv_file) == 0) {
+        fprintf(stats_csv_file, "timestamp,pps,pps_avg,tests,tests_avg,gaps,gaps_avg,pps_avg60,tests_avg60,gaps_avg60,pps_avg300,tests_avg300,gaps_avg300\n");
+        fflush(stats_csv_file);
+      }
+    }
+  }
+
+  PoWUtils pow_utils;
+
   while (running) {
     sleep(sec);
 
@@ -458,6 +476,13 @@ int main(int argc, char *argv[]) {
         for (unsigned i = 1; i < time.length(); i++) cout << " ";
         cout << "gaps/s " << (uint64_t) miner->gaps_per_second();
         cout << " / "        << (uint64_t) miner->avg_gaps_per_second();
+
+        const uint64_t target_difficulty = miner->get_target_difficulty();
+        if (target_difficulty > 0) {
+          const double blocks_per_day =
+              pow_utils.gaps_per_day(miner->primes_per_sec(), target_difficulty);
+          cout << "  blocks/day " << fixed << setprecision(2) << blocks_per_day;
+        }
 
         if (opts->has_cset()) {
           cout << "  gaplist " << ChineseSieve::gaplist_size();
@@ -507,12 +532,28 @@ int main(int argc, char *argv[]) {
         cout << " / "        << miner->avg_gaps_per_second();
         cout << "  avg60s " << pps_avg_60 << "/" << tests_avg_60 << "/" << gaps_avg_60;
         cout << "  avg300s " << pps_avg_300 << "/" << tests_avg_300 << "/" << gaps_avg_300;
+        const uint64_t target_difficulty = miner->get_target_difficulty();
+        if (target_difficulty > 0) {
+          const double blocks_per_day =
+              pow_utils.gaps_per_day(pps, target_difficulty);
+          cout << "  blocks/day " << blocks_per_day;
+        }
         cout.unsetf(ios::floatfield);
         cout << setprecision(6);
         if (opts->has_cset()) {
           cout << "  gaplist " << ChineseSieve::gaplist_size();
           cout << "  block [" << setprecision(3);
           cout << miner->next_share_percent() << " %]";
+        }
+
+        /* log to CSV if enabled */
+        if (stats_csv_file) {
+          time_t now = time(NULL);
+          fprintf(stats_csv_file, "%ld,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\n",
+                  now, pps, miner->avg_primes_per_sec(), tests, miner->avg_tests_per_second(),
+                  gaps, miner->avg_gaps_per_second(), pps_avg_60, tests_avg_60, gaps_avg_60,
+                  pps_avg_300, tests_avg_300, gaps_avg_300);
+          fflush(stats_csv_file);
         }
 #endif      
         cout << endl;
@@ -525,6 +566,11 @@ int main(int argc, char *argv[]) {
 
   if (!opts->has_stratum())
     pthread_join(thread, NULL);
+
+  /* close CSV file */
+  if (stats_csv_file) {
+    fclose(stats_csv_file);
+  }
 
   delete miner;
 

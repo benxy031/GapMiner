@@ -46,3 +46,6 @@
   --sieve-size 32000000 --sieve-primes 1400000 --queue-size 16384 \
   --bitmap-pool-buffers 646 --gpu-launch-divisor 12 --gpu-launch-wait-ms 2 \
   --share-log --cuda-comba --cuda-sieve-proto --snapshot-pool-buffers 256
+  
+   ./gapminer-cuda -o 127.0.0.1 -p 31397 -u benxy031 -x xx --use-gpu -a nvidia -f 43 -w 11264 -n 60   --sieve-size 35000000 --sieve-primes 1450000 --queue-size 16384   --bitmap-pool-buffers 1024 --gpu-launch-divisor 24 --gpu-launch-wait-ms 2   --share-log --cuda-comba -e
+

@@ -148,6 +148,58 @@ requested `-w/--work-items` size.
 -------------------------------------------------------
 - Added explicit `sched_yield()` after `parse_results()` in GPU results thread
   to improve work thread scheduling when `-e` flag is not used.
+
+2026-02-12 CUDA Device-Side Bitmap Clearing
+--------------------------------------------
+- Replaced CPU `memset()` + H2D copy with `cudaMemsetAsync()` for device-side
+  bitmap initialization in `CUDAFermat::prototype_sieve_batch()`.
+- Eliminates ~14MB host-side memset + PCIe transfer per sieve window, improving
+  memory bandwidth efficiency and reducing overhead for large `--sieve-size`.
+- Bitmap clearing now executes asynchronously on GPU stream before sieve kernel
+  launch, overlapping with other GPU operations.
+- No user-facing flags required; optimization is transparent for all CUDA sieve
+  prototype workflows (`--cuda-sieve-proto`).
+
+2026-02-12 3-Bit Window Montgomery Exponentiation
+-------------------------------------------------
+- Optimized CUDA `fermat_probable_prime()` kernel with 3-bit sliding window
+  exponentiation instead of 2-bit, reducing total Montgomery multiplications.
+- Precomputes powers {2^1, 2^3, 2^5, 2^7} in Montgomery form at kernel start,
+  then processes exponent in 3-bit chunks instead of 2-bit.
+- Reduces multiplication count for 320-bit Fermat test from ~480 to ~320 ops
+  (theoretical ~33% reduction), improving GPU throughput.
+- Added helper functions `big_bit_length()` and `big_get_bit()` for exponent
+  bit extraction. Force-inlined Montgomery multiplication paths (`montgomery_mul`,
+  `montgomery_mul_cios`) to minimize register spills and instruction overhead.
+- No configuration changes needed; optimization applies to all CUDA Fermat tests.
+
+2026-02-12 OpenCL Montgomery Arithmetic Benchmarks
+--------------------------------------------------
+- Added dedicated Montgomery multiplication and squaring benchmark kernels to
+  `gpu/benchmarks.cl` for 320-bit and 352-bit operand sizes.
+- New kernels: `montgomeryMulBenchmark320`, `montgomeryMulBenchmark352`,
+  `montgomerySqrBenchmark320`, `montgomerySqrBenchmark352`.
+- Integrated into `GPUFermat::benchmark()` function with comprehensive performance
+  reporting: Mmul/s (million Montgomery operations per second), elapsed time, and
+  operations count.
+- Benchmark also includes full Fermat test (base-2, 320-bit modulus) to measure
+  end-to-end primality testing throughput.
+- Example RTX 3060 results: Montgomery mul 320-bit ~4773 Mmul/s, full Fermat
+  320-bit ~14.07 Mtests/s.
+- Access via `GPUFermat::benchmark()` during miner initialization (no user flag).
+
+2026-02-12 OpenCL Test Harness Offset-Based Candidate Fix
+---------------------------------------------------------
+- Fixed `GPUFermat::test_gpu()` to generate offset-based test candidates instead
+  of full BigInt numbers, matching kernel's expected input format.
+- Offsets now constrained to avoid carry propagation into higher limbs (max offset
+  calculated as `~prime_base[0]` to prevent overflow).
+- Added `montgomery_inverse32_host()` helper for computing Montgomery constant
+  `-n^-1 mod 2^32` on host side for test data preparation.
+- Test verification now uses `mpz_probab_prime_p()` for reference primality
+  checking instead of GMP's internal primality state.
+- Resolves GPU test failures (65k+ mismatches) caused by offset vs full number
+  representation mismatch between host and device.
 - The `-e` flag's file I/O syscalls naturally cause kernel context switches
   that yield CPU to other threads, providing better scheduling than default.
   This optimization replicates that behavior artificially.

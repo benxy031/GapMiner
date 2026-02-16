@@ -488,6 +488,19 @@ double Miner::tests_per_second() {
   return tests;
 }
 
+uint64_t Miner::get_target_difficulty() {
+  if (!is_started)
+    return 0;
+
+  pthread_mutex_lock(&mutex);
+  uint64_t target = 0;
+  if (n_threads > 0 && args && args[0] && args[0]->header)
+    target = args[0]->header->target;
+  pthread_mutex_unlock(&mutex);
+
+  return target;
+}
+
 /**
  * returns the crt_status
  */

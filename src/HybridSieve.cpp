@@ -904,6 +904,14 @@ void *HybridSieve::gpu_work_thread(void *args) {
 
       sieve_t min_len = computed_min_len;
 
+      // Allow user override of minimum gap length
+      if (Opts::get_instance() && Opts::get_instance()->has_min_gaplen()) {
+        sieve_t user_min = static_cast<sieve_t>(atoll(Opts::get_instance()->get_min_gaplen().c_str()));
+        if (user_min > 0 && user_min < item->sievesize) {
+          min_len = user_min & ~((sieve_t) 1);  // Ensure even
+        }
+      }
+
       if (Opts::get_instance() && Opts::get_instance()->has_extra_vb()) {
         std::ostringstream ss;
         ss << get_time() << " effective min_len=" << min_len
@@ -1177,7 +1185,15 @@ void *HybridSieve::gpu_work_thread(void *args) {
       }
 
       while (!stop_requested && i < sievesize - min_len) {
-        const size_t needed_capacity = static_cast<size_t>(min_len / 2) + 1;
+        // Calculate needed capacity based on both CPU and GPU sieve paths
+        size_t needed_capacity = static_cast<size_t>(min_len / 2) + 1;
+#ifdef USE_CUDA_BACKEND
+        if (window_use_gpu_offsets) {
+          // GPU sieve can return an unbounded number of candidates within the window
+          // Ensure we have enough capacity for all remaining GPU offsets
+          needed_capacity = std::max(needed_capacity, gpu_sieve_count - gpu_sieve_index + 1);
+        }
+#endif
         if (offset_buffer.capacity() < needed_capacity) {
           const size_t new_capacity = std::max(offset_buffer.capacity() * 2,
                                                needed_capacity);
@@ -2170,6 +2186,67 @@ void HybridSieve::GPUWorkList::parse_results(
     pthread_mutex_unlock(&access_mutex);
     return;
   }
+  if (results == NULL) {
+    if (extra_verbose) {
+      std::ostringstream ss;
+      ss << get_time() << " ERROR: GPU results buffer is null -- skipping parse_results";
+      extra_verbose_log(ss.str());
+    }
+    pthread_mutex_unlock(&access_mutex);
+    return;
+  }
+  if (cycle_items != static_cast<uint32_t>(last_cycle_item_list.size())) {
+    if (extra_verbose) {
+      std::ostringstream ss;
+      ss << get_time() << " ERROR: cycle_items mismatch: cycle_items="
+         << cycle_items << " item_list=" << last_cycle_item_list.size()
+         << " -- skipping parse_results";
+      extra_verbose_log(ss.str());
+    }
+    pthread_mutex_unlock(&access_mutex);
+    return;
+  }
+  GPUFermat *fermat_ptr = GPUFermat::get_instance();
+  if (fermat_ptr) {
+    const uint32_t max_candidates = fermat_ptr->get_elements_num();
+    if (last_candidate_count > max_candidates) {
+      if (extra_verbose) {
+        std::ostringstream ss;
+        ss << get_time() << " ERROR: last_candidate_count exceeds GPU buffer: "
+           << "last_candidate_count=" << last_candidate_count
+           << " max_candidates=" << max_candidates
+           << " -- skipping parse_results";
+        extra_verbose_log(ss.str());
+      }
+      pthread_mutex_unlock(&access_mutex);
+      return;
+    }
+  }
+  if (last_cycle_item_list.size() != last_cycle_item_counts.size()) {
+    if (extra_verbose) {
+      std::ostringstream ss;
+      ss << get_time() << " ERROR: GPU results size mismatch: items="
+         << last_cycle_item_list.size() << " counts="
+         << last_cycle_item_counts.size() << " -- skipping parse_results";
+      extra_verbose_log(ss.str());
+    }
+    pthread_mutex_unlock(&access_mutex);
+    return;
+  }
+  uint32_t expected_candidates = 0;
+  for (size_t idx = 0; idx < last_cycle_item_counts.size(); ++idx)
+    expected_candidates += last_cycle_item_counts[idx];
+  if (expected_candidates != last_candidate_count) {
+    if (extra_verbose) {
+      std::ostringstream ss;
+      ss << get_time() << " ERROR: candidate count mismatch: expected="
+         << expected_candidates << " last_candidate_count="
+         << last_candidate_count << " -- skipping parse_results";
+      extra_verbose_log(ss.str());
+    }
+    pthread_mutex_unlock(&access_mutex);
+    return;
+  }
   GPUWorkItem *del = NULL;
   if (extra_verbose) {
     GPUFermat *fermat_ptr = GPUFermat::get_instance();
@@ -2259,6 +2336,30 @@ void HybridSieve::GPUWorkList::parse_results(
     uint32_t this_count = 0;
     if (sel_idx < last_cycle_item_list.size() && cur == last_cycle_item_list[sel_idx]) {
       this_count = last_cycle_item_counts[sel_idx];
+      if (i + this_count > last_candidate_count) {
+        if (extra_verbose) {
+          std::ostringstream ss;
+          ss << get_time() << " ERROR: GPU results overrun: i=" << i
+             << " this_count=" << this_count
+             << " last_candidate_count=" << last_candidate_count
+             << " -- aborting parse_results";
+          extra_verbose_log(ss.str());
+        }
+        pthread_mutex_unlock(&access_mutex);
+        return;
+      }
+      if (this_count > cur->get_len()) {
+        if (extra_verbose) {
+          std::ostringstream ss;
+          ss << get_time() << " ERROR: GPU results count exceeds item len: "
+             << "this_count=" << this_count
+             << " item_len=" << cur->get_len()
+             << " -- aborting parse_results";
+          extra_verbose_log(ss.str());
+        }
+        pthread_mutex_unlock(&access_mutex);
+        return;
+      }
       /* process this item's results */
       for (uint32_t n = 0; n < this_count; n++) {
         if (results[i + n]) {

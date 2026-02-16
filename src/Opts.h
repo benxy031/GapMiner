@@ -78,6 +78,7 @@ class Opts {
     SingleOpt extra_vb;
     SingleOpt share_log;
     SingleOpt stats;
+    SingleOpt stats_csv;
     SingleOpt threads;
     SingleOpt pull;
     SingleOpt timeout;
@@ -89,6 +90,7 @@ class Opts {
     SingleOpt cset;
     SingleOpt fermat_threads;
     SingleOpt gap_queue_limit;
+    SingleOpt min_gaplen;
 #ifndef CPU_ONLY
     SingleOpt benchmark;
     SingleOpt use_gpu;
@@ -152,6 +154,8 @@ class Opts {
 
     bool has_stats()            { return stats.active;          }
     string get_stats()          { return stats.arg;             }
+
+    bool has_stats_csv()        { return stats_csv.active;      }
                                                                 
     bool has_threads()          { return threads.active;        }
     string get_threads()        { return threads.arg;           }
@@ -183,6 +187,9 @@ class Opts {
 
     bool has_gap_queue_limit()   { return gap_queue_limit.active; }
     string get_gap_queue_limit() { return gap_queue_limit.arg;    }
+
+    bool has_min_gaplen()   { return min_gaplen.active; }
+    string get_min_gaplen() { return min_gaplen.arg;    }
                                                         
 #ifndef CPU_ONLY                                                        
     bool has_benchmark()        { return benchmark.active;      }

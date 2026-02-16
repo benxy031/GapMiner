@@ -97,7 +97,7 @@ Both miners expose the same CLI surface; simply run the binary you built (`bin/g
 
  - `-l  --pull-interval [NUM]` seconds to wait between getwork request
 
- - `-s  --sieve-size [NUM]` the prime sieve size
+ - `-s  --sieve-size [NUM]` the prime sieve size (e.g., 20000000-35000000 for GPU mining)
 
  - `-r  --sieve-primes [NUM]` number of primes to sieve
 
@@ -237,6 +237,25 @@ while keeping full trace logs available in the `tests` extra-verbose file.
   - Compact-scan candidate emission reduces atomic contention by reserving
     output slots per 32-bit word and writing multiple candidates per atomicAdd.
   - Extra-verbose perf counters report batching size and compact-scan usage.
+  - Device-side bitmap clearing with `cudaMemsetAsync()` replaces CPU `memset()`
+    + H2D copy, eliminating ~14MB host memset + PCIe transfer per window.
+
+- CUDA Fermat kernel optimizations (Feb 2026):
+  - 3-bit sliding window Montgomery exponentiation reduces multiplication count
+    by ~33% compared to 2-bit window (from ~480 to ~320 ops for 320-bit modulus).
+  - Force-inlined Montgomery multiplication paths minimize register spills and
+    instruction overhead for maximum GPU throughput.
+  - Added `big_bit_length()` and `big_get_bit()` helper functions for efficient
+    exponent bit extraction.
+
+- OpenCL benchmark suite (Feb 2026):
+  - Added dedicated Montgomery multiplication and squaring benchmark kernels for
+    320-bit and 352-bit operand sizes in `gpu/benchmarks.cl`.
+  - Integrated full Fermat test benchmarking (base-2, 320-bit modulus) to measure
+    end-to-end primality testing throughput.
+  - Example RTX 3060 results: Montgomery mul 320-bit ~4773 Mmul/s, full Fermat
+    320-bit ~14.07 Mtests/s.
+  - Benchmark results help compare OpenCL vs CUDA performance characteristics.
 
 See [sievePrototypeKernel.txt](sievePrototypeKernel.txt) and
 [run-notes.txt](run-notes.txt) for deeper dive notes, troubleshooting tips, and
