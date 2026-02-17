@@ -91,6 +91,9 @@ class Opts {
     SingleOpt fermat_threads;
     SingleOpt gap_queue_limit;
     SingleOpt min_gaplen;
+    SingleOpt disable_batched_gmp;
+    SingleOpt gmp_batch_size;
+    SingleOpt disable_multistage_tests;
 #ifndef CPU_ONLY
     SingleOpt benchmark;
     SingleOpt use_gpu;
@@ -190,8 +193,15 @@ class Opts {
 
     bool has_min_gaplen()   { return min_gaplen.active; }
     string get_min_gaplen() { return min_gaplen.arg;    }
-                                                        
-#ifndef CPU_ONLY                                                        
+
+    bool has_disable_batched_gmp()   { return disable_batched_gmp.active; }
+    
+    bool has_gmp_batch_size()   { return gmp_batch_size.active; }
+    string get_gmp_batch_size() { return gmp_batch_size.arg;    }
+    
+    bool has_disable_multistage_tests() { return disable_multistage_tests.active; }
+
+#ifndef CPU_ONLY
     bool has_benchmark()        { return benchmark.active;      }
                                                                 
     bool has_use_gpu()          { return use_gpu.active;        }

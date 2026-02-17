@@ -56,6 +56,12 @@ Miner::Miner(uint64_t sieve_size,
     this->fermat_threads = atoi(Opts::get_instance()->get_fermat_threads().c_str());
 #ifndef CPU_ONLY  
   this->use_gpu        = Opts::get_instance()->has_use_gpu(); 
+#ifdef USE_CUDA_BACKEND
+  if (this->use_gpu && n_threads > 1) {
+    log_str("CUDA backend supports a single mining thread; forcing -t 1", LOG_W);
+    n_threads = 1;
+  }
+#endif
 #endif  
 
   threads      = (pthread_t *)   calloc(n_threads, sizeof(pthread_t));
