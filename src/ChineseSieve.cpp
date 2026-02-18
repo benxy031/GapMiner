@@ -578,6 +578,17 @@ void ChineseSieve::run_sieve(PoW *pow, uint8_t hash[SHA256_DIGEST_LENGTH]) {
   std::vector<uint32_t> candidates;
   candidates.reserve(8192u);  /* OPT #6: Pre-allocate candidate vector */
 
+  /* OPT #6: Adaptive sieve-primes tuning (bounded and conservative) */
+  const sieve_t base_sieve_primes = n_primes;
+  const sieve_t min_sieve_primes = std::max<sieve_t>(
+      cset->n_primes + 1,
+      static_cast<sieve_t>((base_sieve_primes * 70u) / 100u));
+  sieve_t effective_sieve_primes = base_sieve_primes;
+  static const uint64_t ADAPTIVE_PRIME_UPDATE_PERIOD = 1024u;
+  static const sieve_t ADAPTIVE_PRIME_STEP = 256u;
+  static const double ADAPTIVE_LOW_FILL = 0.15;
+  static const double ADAPTIVE_HIGH_FILL = 0.85;
+
   /* OPT #10: Initialize batched GMP state before main loop */
   if (use_batched_gmp) {
     init_batch_state();
@@ -594,7 +605,7 @@ void ChineseSieve::run_sieve(PoW *pow, uint8_t hash[SHA256_DIGEST_LENGTH]) {
     memcpy(sieve, cset->sieve, sievesize / 8);
  
     /* sieve all small primes (skip all primes within the set) */
-    for (sieve_t i = cset->n_primes; i < n_primes; i++) {
+    for (sieve_t i = cset->n_primes; i < effective_sieve_primes; i++) {
 
       const sieve_t step = primes2[i];
       sieve_t p = starts[i];
@@ -658,7 +669,15 @@ void ChineseSieve::run_sieve(PoW *pow, uint8_t hash[SHA256_DIGEST_LENGTH]) {
     /* OPT #8: Cache target_factor and improve score calculation */
     const double denom = (cached_log_start > 1.0 ? cached_log_start : 1.0);
     const double target_factor = ((double) pow->get_target()) / TWO_POW48;
-    const double score = (static_cast<double>(candidate_count) / denom) * target_factor;
+    const double density_score = (static_cast<double>(candidate_count) / denom) * target_factor;
+
+    /* Favor candidates with larger offset span (better chance for high-merit gaps) */
+    double span_bonus = 1.0;
+    if (candidate_count > 0 && sievesize > 0) {
+      const double max_offset_ratio = (double) candidates.back() / (double) sievesize;
+      span_bonus += 0.35 * std::max(0.0, std::min(1.0, max_offset_ratio));
+    }
+    const double score = density_score * span_bonus;
 
     if (gap)
       gap->reset(pow->get_nonce(), pow->get_target(), mpz_start, candidates.data(), candidate_count, score);
@@ -683,21 +702,33 @@ void ChineseSieve::run_sieve(PoW *pow, uint8_t hash[SHA256_DIGEST_LENGTH]) {
     }
 
     bool dropped = false;
-    if (gaps.size() >= gap_queue_limit) {
+    const size_t soft_queue_limit = std::max<size_t>(2048u, (size_t) (gap_queue_limit / 3u));
+
+    if (candidate_count == 0) {
+      dropped = true;
+    } else if (gaps.size() >= soft_queue_limit) {
       auto min_it = min_element(gaps.begin(), gaps.end(),
                                 [](GapCandidate *a, GapCandidate *b) {
                                   return a->score < b->score;
                                 });
-      /* Under queue pressure, lower the acceptance threshold */
-      double adjusted_threshold = (*min_it)->score / queue_pressure_factor;
-      
-      if (min_it != gaps.end() && adjusted_threshold < gap->score) {
-        GapCandidate *old = *min_it;
-        *min_it = gap;
-        make_heap(gaps.begin(), gaps.end(), compare_gap_candidate);
+      /* Soft admission once queue is populated, stricter when pressure rises */
+      double adjusted_threshold = 0.0;
+      if (min_it != gaps.end()) {
+        adjusted_threshold = (*min_it)->score / queue_pressure_factor;
+      }
 
-        if (!release_gap_to_pool(old))
-          delete old;
+      if (min_it != gaps.end() && adjusted_threshold < gap->score) {
+        if (gaps.size() >= gap_queue_limit) {
+          GapCandidate *old = *min_it;
+          *min_it = gap;
+          make_heap(gaps.begin(), gaps.end(), compare_gap_candidate);
+
+          if (!release_gap_to_pool(old))
+            delete old;
+        } else {
+          gaps.push_back(gap);
+          push_heap(gaps.begin(), gaps.end(), compare_gap_candidate);
+        }
       } else {
         dropped = true;
       }
@@ -707,6 +738,37 @@ void ChineseSieve::run_sieve(PoW *pow, uint8_t hash[SHA256_DIGEST_LENGTH]) {
     }
 
     const size_t queue_size = gaps.size();
+
+    if ((cur_gap & (ADAPTIVE_PRIME_UPDATE_PERIOD - 1u)) == 0u) {
+      const double queue_fill = (gap_queue_limit > 0)
+                                  ? ((double) queue_size / (double) gap_queue_limit)
+                                  : 0.0;
+
+      sieve_t previous_effective = effective_sieve_primes;
+
+      /* Starving queue: reduce sieve prime count to generate gaps faster */
+      if (queue_fill < ADAPTIVE_LOW_FILL) {
+        if (effective_sieve_primes > min_sieve_primes) {
+          effective_sieve_primes = std::max<sieve_t>(
+              min_sieve_primes,
+              static_cast<sieve_t>(effective_sieve_primes - ADAPTIVE_PRIME_STEP));
+        }
+      /* Saturated queue: move back toward configured quality */
+      } else if (queue_fill > ADAPTIVE_HIGH_FILL) {
+        if (effective_sieve_primes < base_sieve_primes) {
+          effective_sieve_primes = std::min<sieve_t>(
+              base_sieve_primes,
+              static_cast<sieve_t>(effective_sieve_primes + ADAPTIVE_PRIME_STEP));
+        }
+      }
+
+      if (Opts::get_instance()->has_extra_vb() &&
+          previous_effective != effective_sieve_primes) {
+        extra_verbose_log("adaptive_sieve_primes=" + itoa((uint64_t) effective_sieve_primes) +
+                         " fill=" + dtoa(queue_fill * 100.0, 1) + "%");
+      }
+    }
+
     if (!dropped)
       pthread_cond_signal(&gap_cv);
     pthread_mutex_unlock(&mutex);

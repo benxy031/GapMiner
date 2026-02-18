@@ -908,7 +908,9 @@ void *HybridSieve::gpu_work_thread(void *args) {
       if (Opts::get_instance() && Opts::get_instance()->has_min_gaplen()) {
         sieve_t user_min = static_cast<sieve_t>(atoll(Opts::get_instance()->get_min_gaplen().c_str()));
         if (user_min > 0 && user_min < item->sievesize) {
-          min_len = user_min & ~((sieve_t) 1);  // Ensure even
+          const sieve_t user_even = user_min & ~((sieve_t) 1);  // Ensure even
+          /* Treat user setting as floor: never reduce below computed min_len */
+          min_len = std::max(min_len, user_even);
         }
       }
 
@@ -2435,8 +2437,7 @@ void HybridSieve::GPUWorkList::parse_results(
          cur->print(prime_base);     
 #endif
          /* Count accepted gaps for GPU stats so gaps/s is non-zero on CUDA. */
-         if (sieve)
-           sieve->increment_gap_counters(1);
+         /* NOTE: Moved gap counting to submit() after PoW::valid() check. */
          /* For CUDA builds, optionally perform an extra-verbose CPU check to avoid
             submitting obvious non-primes caused by device/host mismatches. This
             runs only when extra_verbose is enabled and only on CUDA backend. */
@@ -2611,8 +2612,12 @@ bool HybridSieve::GPUWorkList::submit(uint32_t offset) {
 
   PoW share_pow(mpz_hash, this->shift, mpz_adder, target, nonce);
 
+  const bool pow_valid = share_pow.valid();
+  uint64_t share_diff = 0;
+  if (extra_verbose)
+    share_diff = share_pow.difficulty();
+
   if (extra_verbose) {
-    uint64_t share_diff = share_pow.difficulty();
     std::ostringstream ss_submit;
     double ratio = 0.0;
     if (target != 0) ratio = ((double) share_diff) / ((double) target);
@@ -2620,11 +2625,15 @@ bool HybridSieve::GPUWorkList::submit(uint32_t offset) {
     char *hex_hash = mpz_get_str(NULL, 16, mpz_hash);
     char *hex_adder = mpz_get_str(NULL, 16, mpz_adder);
     ss_submit << get_time() << " submit-candidate: offset=" << offset
-              << " share_difficulty=" << share_diff
-              << " (0x" << std::hex << share_diff << std::dec << ")"
               << " target=" << target
               << " (0x" << std::hex << target << std::dec << ")"
-              << " ratio=" << std::fixed << std::setprecision(6) << ratio
+              << " pow_valid=" << (pow_valid ? 1 : 0)
+              << " ratio=" << std::fixed << std::setprecision(6) << ratio;
+    if (pow_valid) {
+      ss_submit << " share_difficulty=" << share_diff
+                << " (0x" << std::hex << share_diff << std::dec << ")";
+    }
+    ss_submit
               << " mpz_hash=0x" << hex_hash
               << " mpz_adder=0x" << hex_adder;
     free(hex_hash);
@@ -2632,11 +2641,14 @@ bool HybridSieve::GPUWorkList::submit(uint32_t offset) {
     extra_verbose_log(ss_submit.str());
   }
 
-  if (share_pow.valid()) {
+  if (pow_valid) {
 #ifdef DEBUG_FAST
     valid++;
     cout << "[DD] PoW valid (" << valid << ")\n";
 #endif 
+    /* FIX: Count gap only after PoW difficulty validation passes */
+    if (sieve)
+      sieve->increment_gap_counters(1);
 
     /* stop calculating if processor said so */
     if (pprocessor->process(&share_pow)) {

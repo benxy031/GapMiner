@@ -209,6 +209,16 @@ When `--cuda-sieve-proto` is supplied (on the CUDA binary), the miner routes the
     consumers wake producers as they drain the queue.
   - Priority scoring now prefers gaps with higher candidate density and higher
     current target, so Fermat threads focus on stronger gaps first.
+  - Candidate admission now applies a soft score gate before the queue is full:
+    once queue depth reaches `max(2048, gap-queue-limit/3)`, lower-scoring gaps
+    are dropped early (`gap push ... dropped`) so the queue keeps stronger items.
+  - Candidate scoring now includes a span bonus (higher max candidate offset
+    relative to sieve window), which biases toward candidates more likely to
+    produce high-merit outcomes.
+  - Adaptive sieve-primes tuning is enabled in `ChineseSieve` and reacts slowly
+    to avoid fighting queue scoring: update every 1024 gaps, step size 256
+    primes, and trigger thresholds at queue fill <15% (reduce primes for faster
+    generation) and >85% (raise toward configured quality).
   - New option `--gap-queue-limit <N>` lets you tune the queue cap at runtime
     (default `8192`). Lower it to conserve RAM/locking when `--sieve-primes` is
     large; raise it if Fermat throughput is high and you want a deeper backlog.

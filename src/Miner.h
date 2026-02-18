@@ -79,6 +79,9 @@ class Miner {
     /* returns the current target difficulty (0 if unavailable) */
     uint64_t get_target_difficulty();
 
+    /* returns a signature for current work template (0 if unavailable) */
+    uint64_t get_work_signature();
+
     /**
      * returns the percent we have already calculated form the current share
      */

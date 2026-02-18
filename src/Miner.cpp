@@ -507,6 +507,26 @@ uint64_t Miner::get_target_difficulty() {
   return target;
 }
 
+uint64_t Miner::get_work_signature() {
+  if (!is_started)
+    return 0;
+
+  pthread_mutex_lock(&mutex);
+  uint64_t signature = 0;
+  if (n_threads > 0 && args && args[0] && args[0]->header) {
+    BlockHeader *header = args[0]->header;
+    uint64_t prev_hi = 0;
+    memcpy(&prev_hi, header->hash_prev_block, sizeof(uint64_t));
+    signature = prev_hi ^
+                header->target ^
+                header->difficulty ^
+                (((uint64_t) header->time) << 32);
+  }
+  pthread_mutex_unlock(&mutex);
+
+  return signature;
+}
+
 /**
  * returns the crt_status
  */

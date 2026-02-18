@@ -30,6 +30,7 @@
 #include <iomanip>
 #include <algorithm>
 #include <deque>
+#include <cmath>
 #include "BlockHeader.h"
 #include "Miner.h"
 #include "PoWCore/src/PoWUtils.h"
@@ -457,12 +458,34 @@ int main(int argc, char *argv[]) {
   }
 
   PoWUtils pow_utils;
+  uint64_t last_target_difficulty = 0;
+  uint64_t last_work_signature = 0;
+  time_t target_start_ts = time(NULL);
+  uint64_t target_round = 0;
+  bool target_is_new = false;
 
   while (running) {
     sleep(sec);
 
     if (!opts->has_quiet() && !waiting) {
       pthread_mutex_lock(&io_mutex);
+      const uint64_t target_difficulty = miner->get_target_difficulty();
+      const uint64_t work_signature = miner->get_work_signature();
+      const time_t now_ts = time(NULL);
+      target_is_new = false;
+        if (target_difficulty > 0 &&
+          (target_difficulty != last_target_difficulty ||
+           (work_signature != 0 && work_signature != last_work_signature))) {
+        last_target_difficulty = target_difficulty;
+        last_work_signature = work_signature;
+        target_start_ts = now_ts;
+        target_round++;
+        target_is_new = true;
+      }
+      const uint64_t target_age_sec = (target_difficulty > 0)
+                                      ? static_cast<uint64_t>(now_ts - target_start_ts)
+                                      : 0u;
+
       if (opts->has_cset() && miner->get_crt_status() < 100.0) {
         cout << get_time() << "init CRT [" << miner->get_crt_status() << " %]" << endl;
       } else {
@@ -477,17 +500,34 @@ int main(int argc, char *argv[]) {
         cout << "gaps/s " << (uint64_t) miner->gaps_per_second();
         cout << " / "        << (uint64_t) miner->avg_gaps_per_second();
 
-        const uint64_t target_difficulty = miner->get_target_difficulty();
+        double blocks_per_day = 0.0;
         if (target_difficulty > 0) {
-          const double blocks_per_day =
+          blocks_per_day =
               pow_utils.gaps_per_day(miner->primes_per_sec(), target_difficulty);
           cout << "  blocks/day " << fixed << setprecision(2) << blocks_per_day;
         }
 
         if (opts->has_cset()) {
+          const double block_progress = miner->next_share_percent();
+          const double block_prob = (1.0 - std::exp(-(block_progress / 100.0))) * 100.0;
           cout << "  gaplist " << ChineseSieve::gaplist_size();
           cout << "  block [" << setprecision(3);
-          cout << miner->next_share_percent() << " %]";
+          cout << block_progress << " %]";
+          cout << "  block_prob [" << setprecision(3) << block_prob << " %]";
+        } else if (target_difficulty > 0 && blocks_per_day > 0.0) {
+          const double expected_blocks = (blocks_per_day * (double) target_age_sec) / 86400.0;
+          const double block_progress = expected_blocks * 100.0;
+          const double block_prob = (1.0 - std::exp(-expected_blocks)) * 100.0;
+          cout << "  block [" << setprecision(3);
+          cout << block_progress << " %]";
+          cout << "  block_prob [" << setprecision(3) << block_prob << " %]";
+        }
+
+        if (target_difficulty > 0) {
+          cout << "  target_round " << target_round;
+          cout << "  target_age " << target_age_sec << "s";
+          if (target_is_new)
+            cout << "  target NEW";
         }
 #else
         const double pps = miner->primes_per_sec();
@@ -532,18 +572,35 @@ int main(int argc, char *argv[]) {
         cout << " / "        << miner->avg_gaps_per_second();
         cout << "  avg60s " << pps_avg_60 << "/" << tests_avg_60 << "/" << gaps_avg_60;
         cout << "  avg300s " << pps_avg_300 << "/" << tests_avg_300 << "/" << gaps_avg_300;
-        const uint64_t target_difficulty = miner->get_target_difficulty();
+        double blocks_per_day = 0.0;
         if (target_difficulty > 0) {
-          const double blocks_per_day =
+          blocks_per_day =
               pow_utils.gaps_per_day(pps, target_difficulty);
           cout << "  blocks/day " << blocks_per_day;
         }
         cout.unsetf(ios::floatfield);
         cout << setprecision(6);
         if (opts->has_cset()) {
+          const double block_progress = miner->next_share_percent();
+          const double block_prob = (1.0 - std::exp(-(block_progress / 100.0))) * 100.0;
           cout << "  gaplist " << ChineseSieve::gaplist_size();
           cout << "  block [" << setprecision(3);
-          cout << miner->next_share_percent() << " %]";
+          cout << block_progress << " %]";
+          cout << "  block_prob [" << setprecision(3) << block_prob << " %]";
+        } else if (target_difficulty > 0 && blocks_per_day > 0.0) {
+          const double expected_blocks = (blocks_per_day * (double) target_age_sec) / 86400.0;
+          const double block_progress = expected_blocks * 100.0;
+          const double block_prob = (1.0 - std::exp(-expected_blocks)) * 100.0;
+          cout << "  block [" << setprecision(3);
+          cout << block_progress << " %]";
+          cout << "  block_prob [" << setprecision(3) << block_prob << " %]";
+        }
+
+        if (target_difficulty > 0) {
+          cout << "  target_round " << target_round;
+          cout << "  target_age " << target_age_sec << "s";
+          if (target_is_new)
+            cout << "  target NEW";
         }
 
         /* log to CSV if enabled */
