@@ -176,6 +176,8 @@ class GPUFermat {
 
     /* expose the active GPU group size */
     static unsigned get_group_size();
+    /* set the GPU group size (threads per block) before initialization */
+    static void set_group_size(unsigned gs);
 
     /* destroy the singleton instance and release resources */
     static void destroy_instance();

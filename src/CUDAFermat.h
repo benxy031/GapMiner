@@ -89,6 +89,8 @@ class GPUFermat {
   CudaBuffer sievePrototypeWindowBases;
   CudaBuffer sievePrototypeWindowCounts;
   CudaBuffer sievePrototypeWindowDescs;
+  CudaBuffer candidateSoA;
+  bool useSoAEnabled;
   bool sievePrimesConfigured;
   uint32_t configuredPrimeCount;
 
@@ -104,6 +106,7 @@ class GPUFermat {
   bool primeReciprocalsUploaded;
   bool primeBaseConstantsUploaded;
   uint64_t primeBaseFingerprint;
+  std::string autotune_choice;
 
   GPUFermat(unsigned device_id, const char *platformId, unsigned workItems, unsigned streamCount = 2);
   ~GPUFermat();
@@ -142,6 +145,7 @@ class GPUFermat {
                                  unsigned workItems = 0,
                                  unsigned streamCount = 2);
   static unsigned get_group_size();
+  static void set_group_size(unsigned gs);
   static void destroy_instance();
 
   ResultWord *get_results_buffer();
@@ -160,6 +164,7 @@ class GPUFermat {
   void prototype_sieve(const SievePrototypeParams &params);
   void prototype_sieve_batch(const SievePrototypeParams *params,
                              uint32_t window_count);
+  std::string get_autotune_choice() const;
   /* Diagnostic: dump device-built candidate limbs for given sample indices
    * Only meaningful for CUDA backend; no-op for other backends. */
   void dump_device_samples(const uint32_t *sample_indices, unsigned sampleCount);

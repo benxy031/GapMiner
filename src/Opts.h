@@ -97,6 +97,7 @@ class Opts {
 #ifndef CPU_ONLY
     SingleOpt benchmark;
     SingleOpt use_gpu;
+    SingleOpt group_size;
     SingleOpt gpu_dev;
     SingleOpt work_items;
     SingleOpt queue_size;
@@ -104,6 +105,7 @@ class Opts {
     SingleOpt n_tests;
     SingleOpt cuda_sieve_proto;
     SingleOpt cuda_comba;
+    SingleOpt cuda_comba_soa;
     SingleOpt bitmap_pool_buffers;
     SingleOpt snapshot_pool_buffers;
   SingleOpt gpu_launch_divisor;
@@ -205,6 +207,9 @@ class Opts {
     bool has_benchmark()        { return benchmark.active;      }
                                                                 
     bool has_use_gpu()          { return use_gpu.active;        }
+
+    bool has_group_size()       { return group_size.active;     }
+    string get_group_size()     { return group_size.arg;        }
                                                                 
     bool has_gpu_dev()          { return gpu_dev.active;        }
     string get_gpu_dev()        { return gpu_dev.arg;           }
@@ -222,8 +227,8 @@ class Opts {
     string get_n_tests()        { return n_tests.arg;           }
 
     bool use_cuda_sieve_proto() { return cuda_sieve_proto.active; }
-
     bool use_cuda_comba() { return cuda_comba.active; }
+    bool use_comba_soa() { return cuda_comba_soa.active; }
 
     bool has_bitmap_pool_buffers()   { return bitmap_pool_buffers.active; }
     string get_bitmap_pool_buffers() { return bitmap_pool_buffers.arg;    }

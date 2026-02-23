@@ -165,6 +165,7 @@ disable_multistage_tests(NULL, "--disable-multistage-tests", "disable multi-stag
 benchmark( "-b", "--benchmark",      "run a gpu benchmark",                           false),
 use_gpu(   "-g", "--use-gpu",        "use the gpu for Fermat testing",                false),
 gpu_dev(   "-d", "--gpu-dev",        "the gpu device id",                             true),
+group_size( "-G", "--group-size",    "gpu group (block) size (threads per block)",    true),
 work_items("-w", "--work-items",     "gpu work items (default 2048)",                 true),
 queue_size("-z", "--queue-size",     "the gpu waiting queue size (memory intensive)", true),
 platform(  "-a", "--platform",       "opencl platform (amd or nvidia)",               true),
@@ -173,6 +174,7 @@ n_tests(   "-n", "--num-gpu-tests",  "the number of test per gap per gpu run",  
  * Memory pools avoid repeated allocation overhead for high-throughput GPU pipelines */
 cuda_sieve_proto(NULL, "--cuda-sieve-proto", "run the experimental CUDA sieve prototype", false),
 cuda_comba(NULL, "--cuda-comba", "use Comba Montgomery multiply on CUDA", false),
+  cuda_comba_soa(NULL, "--use-comba-soa", "use Comba SoA Montgomery multiply on CUDA", false),
 bitmap_pool_buffers(NULL, "--bitmap-pool-buffers", "override bitmap buffer pool size (default queue-size+2)", true),
 snapshot_pool_buffers(NULL, "--snapshot-pool-buffers", "override CUDA residue snapshot pool size", true),
 /* GPU launch control: divisor affects batch size, wait_ms controls GPU starvation vs latency.
@@ -285,6 +287,10 @@ license(   "-v", "--license",        "show license of this program",            
   if (gpu_dev.active)
     gpu_dev.arg = get_arg(gpu_dev.short_opt,  gpu_dev.long_opt);
                                           
+  group_size.active = has_arg(group_size.short_opt, group_size.long_opt);
+  if (group_size.active)
+    group_size.arg = get_arg(group_size.short_opt, group_size.long_opt);
+
   work_items.active = has_arg(work_items.short_opt,  work_items.long_opt);
   if (work_items.active)
     work_items.arg = get_arg(work_items.short_opt,  work_items.long_opt);
@@ -305,6 +311,7 @@ license(   "-v", "--license",        "show license of this program",            
                                     cuda_sieve_proto.long_opt);
 
   cuda_comba.active = has_arg(cuda_comba.short_opt, cuda_comba.long_opt);
+  cuda_comba_soa.active = has_arg(cuda_comba_soa.short_opt, cuda_comba_soa.long_opt);
 
   bitmap_pool_buffers.active = has_arg(bitmap_pool_buffers.short_opt,
                                        bitmap_pool_buffers.long_opt);

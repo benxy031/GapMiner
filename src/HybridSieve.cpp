@@ -679,6 +679,11 @@ HybridSieve::SieveQueue::SieveQueue(unsigned capacity,
 
 /* destroys a SieveQueue */
 HybridSieve::SieveQueue::~SieveQueue() {
+  /* Ensure any remaining queued items are deleted while holding the
+   * queue lock to avoid destroying the underlying deque storage while
+   * other threads might still have interacted with it. */
+  clear();
+
   pthread_mutex_destroy(&access_mutex);
   pthread_cond_destroy(&notfull_cond);
   pthread_cond_destroy(&full_cond);
@@ -1656,6 +1661,7 @@ HybridSieve::GPUWorkList::GPUWorkList(uint32_t len,
   this->end           = NULL;
   this->running       = true;
   Opts *opts_local = Opts::get_instance();
+  this->extra_verbose = (opts_local && opts_local->has_extra_vb());
   this->shift = 45; // default
   auto parse_u32_option = [&](const char *flag,
                               const std::string &value,

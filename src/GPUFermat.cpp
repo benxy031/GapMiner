@@ -83,6 +83,11 @@ unsigned GPUFermat::get_group_size() {
   return GroupSize;
 }
 
+void GPUFermat::set_group_size(unsigned gs) {
+  if (gs > 0)
+    GroupSize = gs;
+}
+
 unsigned GPUFermat::get_block_size() {
   return GroupSize;
 }

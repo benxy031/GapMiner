@@ -242,6 +242,21 @@ int main(int argc, char *argv[]) {
     string platfrom  = (opts->has_platform() ? string(opts->get_platform()) : "amd", "nvidia");
     unsigned workItems = (opts->has_work_items() ? atoi(opts->get_work_items().c_str()) : 2048);
 
+    // Debug: print parsed GPU/device/group options
+    pthread_mutex_lock(&io_mutex);
+    cout << get_time() << "DEBUG: has_gpu_dev=" << opts->has_gpu_dev();
+    if (opts->has_gpu_dev()) cout << " gpu_dev=" << opts->get_gpu_dev();
+    cout << " has_group_size=" << opts->has_group_size();
+    if (opts->has_group_size()) cout << " group_size=" << opts->get_group_size();
+    cout << endl;
+    pthread_mutex_unlock(&io_mutex);
+
+    if (opts->has_group_size()) {
+      int gs = atoi(opts->get_group_size().c_str());
+      if (gs > 0)
+        GPUFermat::set_group_size(static_cast<unsigned>(gs));
+    }
+
     GPUFermat *fermat = GPUFermat::get_instance(dev_id, platfrom.c_str(), workItems);
     fermat->benchmark();
     exit(EXIT_SUCCESS);
@@ -381,6 +396,7 @@ int main(int argc, char *argv[]) {
           << " num_gpu_tests=" << (opts->has_n_tests() ? opts->get_n_tests() : "")
           << " queue_size=" << (opts->has_queue_size() ? opts->get_queue_size() : "")
           << " cuda_comba=" << (opts->use_cuda_comba() ? "on" : "off")
+          << " cuda_comba_soa=" << (opts->use_comba_soa() ? "on" : "off")
           << " cuda_sieve_proto=" << (opts->use_cuda_sieve_proto() ? "on" : "off")
           << " bitmap_pool_buffers=" << (opts->has_bitmap_pool_buffers() ? opts->get_bitmap_pool_buffers() : "")
           << " snapshot_pool_buffers=" << (opts->has_snapshot_pool_buffers() ? opts->get_snapshot_pool_buffers() : "")
@@ -391,6 +407,9 @@ int main(int argc, char *argv[]) {
         cfg << " cuda_block=" << fermat->get_block_size()
             << " cuda_streams=" << fermat->get_stream_count()
             << " cuda_elements=" << fermat->get_elements_num();
+    std::string at = fermat->get_autotune_choice();
+    if (!at.empty())
+      cfg << " autotune='" << at << "'";
       }
 #endif
       if (opts->has_extra_vb()) {

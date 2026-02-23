@@ -21,6 +21,8 @@
 
 using namespace std;
 
+#include <unistd.h>
+
 bool GPUFermat::initialized = false;
 
 // expose CUDA block size as block size getter
@@ -28,12 +30,15 @@ unsigned GPUFermat::get_block_size() {
   return 512u;
 }
 
+
+
 namespace {
-constexpr int kOperandSize = 10;
+constexpr int kCudaOperandSize = 10;
+#define kOperandSize kCudaOperandSize
 constexpr unsigned kCudaBlockSize = 512u;
 // Increase small-prime quick-filter count to improve cheap composite rejection on device
 constexpr int kSmallPrimeCount = 64;
-constexpr int kMontgomeryShiftBits = 2 * kOperandSize * 32;  // 640
+constexpr int kMontgomeryShiftBits = 2 * kCudaOperandSize * 32;  // 640
 
 template <typename T>
 T *buffer_cast(uint8_t *ptr) {
@@ -79,17 +84,18 @@ __device__ __constant__ uint32_t kSmallPrimesDevice[kSmallPrimeCount] = {
 // Reciprocals are filled at runtime in uploadPrimeBaseConstants to keep values
 // computed correctly for the prime list size and to avoid manual hex constants.
 __device__ __constant__ uint32_t kPrimeReciprocalsDevice[kSmallPrimeCount];
-__device__ __constant__ uint32_t kPrimeBaseConst[kOperandSize];
+__device__ __constant__ uint32_t kPrimeBaseConst[kCudaOperandSize];
 __device__ __constant__ uint32_t kHighResiduesConst[kSmallPrimeCount];
 __device__ __constant__ uint32_t kUseCombaConst;
+__device__ __constant__ uint32_t kUseSoAConst;
 
 struct BigInt {
-  uint32_t limb[kOperandSize];
+  uint32_t limb[kCudaOperandSize];
 };
 
 uint32_t mod_high_part_host(const uint32_t *prime_base, uint32_t prime) {
   unsigned long long acc = 0ull;
-  for (int idx = kOperandSize - 1; idx >= 0; --idx)
+  for (int idx = kCudaOperandSize - 1; idx >= 0; --idx)
     acc = ((acc << 32) + prime_base[idx]) % prime;
   return static_cast<uint32_t>(acc);
 }
@@ -107,13 +113,13 @@ uint32_t mod_high_part_host(const uint32_t *prime_base, uint32_t prime) {
 
 __device__ __forceinline__ void big_set_zero(BigInt &n) {
 #pragma unroll
-  for (int i = 0; i < kOperandSize; ++i)
+  for (int i = 0; i < kCudaOperandSize; ++i)
     n.limb[i] = 0u;
 }
 
 __device__ __forceinline__ void big_copy(BigInt &dst, const BigInt &src) {
 #pragma unroll
-  for (int i = 0; i < kOperandSize; ++i)
+  for (int i = 0; i < kCudaOperandSize; ++i)
     dst.limb[i] = src.limb[i];
 }
 
@@ -131,13 +137,13 @@ __global__ void dump_candidate_limbs_kernel(const uint32_t *numbers,
 
   // Reconstruct: add offset into least-significant limb and propagate carry
   uint64_t carry = off;
-  for (int i = 0; i < kOperandSize; ++i) {
+  for (int i = 0; i < kCudaOperandSize; ++i) {
     uint64_t sum = static_cast<uint64_t>(kPrimeBaseConst[i]) + carry;
-    out_limbs[tid * kOperandSize + i] = static_cast<uint32_t>(sum & 0xffffffffu);
+    out_limbs[tid * kCudaOperandSize + i] = static_cast<uint32_t>(sum & 0xffffffffu);
     carry = sum >> 32;
   }
   // write final carry (0 or small) after limbs
-  out_limbs[sampleCount * kOperandSize + tid] = static_cast<uint32_t>(carry & 0xffffffffu);
+  out_limbs[sampleCount * kCudaOperandSize + tid] = static_cast<uint32_t>(carry & 0xffffffffu);
 }
 
 // Diagnostic kernel: record carry after each limb addition for given samples
@@ -153,17 +159,17 @@ __global__ void dump_candidate_carries_kernel(const uint32_t *numbers,
   const uint32_t off = numbers[idx];
 
   uint64_t carry = off;
-  for (int i = 0; i < kOperandSize; ++i) {
+  for (int i = 0; i < kCudaOperandSize; ++i) {
     uint64_t sum = static_cast<uint64_t>(kPrimeBaseConst[i]) + carry;
     carry = sum >> 32;
-    out_carries[tid * kOperandSize + i] = static_cast<uint32_t>(carry & 0xffffffffu);
+    out_carries[tid * kCudaOperandSize + i] = static_cast<uint32_t>(carry & 0xffffffffu);
   }
 }
 
 __device__ __forceinline__ bool big_is_zero(const BigInt &n) {
   uint32_t acc = 0u;
 #pragma unroll
-  for (int i = 0; i < kOperandSize; ++i)
+  for (int i = 0; i < kCudaOperandSize; ++i)
     acc |= n.limb[i];
   return acc == 0u;
 }
@@ -173,13 +179,13 @@ __device__ __forceinline__ bool big_is_one(const BigInt &n) {
     return false;
   uint32_t acc = 0u;
 #pragma unroll
-  for (int i = 1; i < kOperandSize; ++i)
+  for (int i = 1; i < kCudaOperandSize; ++i)
     acc |= n.limb[i];
   return acc == 0u;
 }
 
 __device__ __forceinline__ int big_bit_length(const BigInt &n) {
-  for (int i = kOperandSize - 1; i >= 0; --i) {
+  for (int i = kCudaOperandSize - 1; i >= 0; --i) {
     const uint32_t limb = n.limb[i];
     if (limb != 0u)
       return i * 32 + (31 - __clz(limb)) + 1;
@@ -195,7 +201,7 @@ __device__ __forceinline__ uint32_t big_get_bit(const BigInt &n,
 }
 
 __device__ __forceinline__ int big_compare(const BigInt &a, const BigInt &b) {
-  for (int i = kOperandSize - 1; i >= 0; --i) {
+  for (int i = kCudaOperandSize - 1; i >= 0; --i) {
     if (a.limb[i] > b.limb[i])
       return 1;
     if (a.limb[i] < b.limb[i])
@@ -206,7 +212,7 @@ __device__ __forceinline__ int big_compare(const BigInt &a, const BigInt &b) {
 
 __device__ __forceinline__ void big_sub(BigInt &a, const BigInt &b) {
   uint64_t borrow = 0;
-  for (int i = 0; i < kOperandSize; ++i) {
+  for (int i = 0; i < kCudaOperandSize; ++i) {
     uint64_t diff = static_cast<uint64_t>(a.limb[i]) - b.limb[i] - borrow;
     a.limb[i] = static_cast<uint32_t>(diff);
     borrow = (diff >> 63) & 1u;
@@ -214,7 +220,7 @@ __device__ __forceinline__ void big_sub(BigInt &a, const BigInt &b) {
 }
 
 __device__ __forceinline__ bool big_decrement(BigInt &a) {
-  for (int i = 0; i < kOperandSize; ++i) {
+  for (int i = 0; i < kCudaOperandSize; ++i) {
     if (a.limb[i] > 0u) {
       a.limb[i]--;
       for (int j = 0; j < i; ++j)
@@ -228,7 +234,7 @@ __device__ __forceinline__ bool big_decrement(BigInt &a) {
 
 __device__ __forceinline__ void big_shift_right_one(BigInt &a) {
   uint32_t carry = 0u;
-  for (int i = kOperandSize - 1; i >= 0; --i) {
+  for (int i = kCudaOperandSize - 1; i >= 0; --i) {
     uint32_t next = a.limb[i] & 1u;
     a.limb[i] = (a.limb[i] >> 1) | (carry << 31);
     carry = next;
@@ -237,7 +243,7 @@ __device__ __forceinline__ void big_shift_right_one(BigInt &a) {
 
 __device__ __forceinline__ void big_shift_right_two(BigInt &a) {
   uint32_t carry = 0u;
-  for (int i = kOperandSize - 1; i >= 0; --i) {
+  for (int i = kCudaOperandSize - 1; i >= 0; --i) {
     uint32_t next = a.limb[i] & 0x3u;
     a.limb[i] = (a.limb[i] >> 2) | (carry << 30);
     carry = next;
@@ -258,29 +264,29 @@ __device__ __forceinline__ void montgomery_mul(const BigInt &a,
                                                const BigInt &mod,
                                                uint32_t nPrime,
                                                BigInt &out) {
-  const int totalLimbs = kOperandSize * 2;
+  const int totalLimbs = kCudaOperandSize * 2;
   uint64_t t[totalLimbs];
 #pragma unroll
   for (int i = 0; i < totalLimbs; ++i)
     t[i] = 0ull;
 
   #pragma unroll
-  for (int i = 0; i < kOperandSize; ++i) {
+  for (int i = 0; i < kCudaOperandSize; ++i) {
     uint64_t carry = 0ull;
     #pragma unroll
-    for (int j = 0; j < kOperandSize; ++j) {
+    for (int j = 0; j < kCudaOperandSize; ++j) {
       const int idx = i + j;
       uint64_t sum = t[idx] +
                      static_cast<uint64_t>(a.limb[j]) * b.limb[i] + carry;
       t[idx] = static_cast<uint32_t>(sum);
       carry = sum >> 32;
     }
-    t[i + kOperandSize] += carry;
+    t[i + kCudaOperandSize] += carry;
 
     uint32_t m = static_cast<uint32_t>(t[i]) * nPrime;
     carry = 0ull;
     #pragma unroll
-    for (int j = 0; j < kOperandSize; ++j) {
+    for (int j = 0; j < kCudaOperandSize; ++j) {
       const int idx = i + j;
       uint64_t sum = t[idx] + static_cast<uint64_t>(m) * mod.limb[j] + carry;
       t[idx] = static_cast<uint32_t>(sum);
@@ -820,8 +826,26 @@ __device__ __forceinline__ uint32_t fast_mod_u32(uint32_t value,
 }
 
 __device__ bool quick_composite(uint32_t offset) {
+  // Hybrid approach: first check a small prefix of primes branchlessly
+  // to filter many composites without divergence, then fall back to
+  // early-exit loop for remaining primes to avoid extra work on primes.
+  const int prefix = (kSmallPrimeCount >= 8) ? 8 : kSmallPrimeCount;
+  uint32_t is_comp = 0u;
   #pragma unroll
-  for (int i = 0; i < kSmallPrimeCount; ++i) {
+  for (int i = 0; i < prefix; ++i) {
+    const uint32_t prime = kSmallPrimesDevice[i];
+    const uint32_t recip = kPrimeReciprocalsDevice[i];
+    uint32_t candidate = kHighResiduesConst[i] + fast_mod_u32(offset, prime, recip);
+    if (candidate >= prime)
+      candidate -= prime;
+    is_comp |= (candidate == 0u);
+  }
+  if (is_comp)
+    return true;
+
+  // Remaining primes: early-exit to avoid unnecessary work when not composite
+  #pragma unroll
+  for (int i = prefix; i < kSmallPrimeCount; ++i) {
     const uint32_t prime = kSmallPrimesDevice[i];
     const uint32_t recip = kPrimeReciprocalsDevice[i];
     uint32_t candidate = kHighResiduesConst[i] + fast_mod_u32(offset, prime, recip);
@@ -1224,6 +1248,76 @@ __global__ void sievePrototypeMarkCompositesPerPrime(
   }
 }
 
+/**
+ * Tiled per-prime marking kernel: each block processes a tile of bitmap words
+ * into a shared-memory tile bitmap. Threads iterate primes and mark multiples
+ * within the tile using shared-memory atomicOr, then the tile is written
+ * back to global memory without global atomics (tiles are disjoint).
+ */
+__global__ void sievePrototypeMarkCompositesPerPrimeTiled(
+    uint32_t *bitmap,
+    uint32_t window_words,
+    uint64_t base_offset,
+    const uint32_t *primes,
+    const uint32_t *prime_residues,
+    uint32_t prime_count,
+    uint32_t tile_word_count)
+{
+  const uint32_t block_tile = blockIdx.x;
+  const uint32_t tile_start_word = block_tile * tile_word_count;
+  if (tile_start_word >= window_words)
+    return;
+
+  const uint32_t tile_words = min(tile_word_count, window_words - tile_start_word);
+  extern __shared__ uint32_t s_tile_bitmap[]; // tile_word_count entries
+
+  // initialize shared tile bitmap
+  for (uint32_t i = threadIdx.x; i < tile_words; i += blockDim.x)
+    s_tile_bitmap[i] = 0u;
+  __syncthreads();
+
+  const uint32_t tile_bit_base = (tile_start_word << 5);
+  const uint64_t abs_base = base_offset + static_cast<uint64_t>(tile_bit_base);
+
+  // Each thread processes a subset of primes
+  for (uint32_t p = threadIdx.x; p < prime_count; p += blockDim.x) {
+    uint32_t prime = primes[p];
+    if (prime <= 2u) continue;
+    uint32_t step = prime << 1; // only odd multiples
+    uint32_t residue = prime_residues[p];
+
+    // find first multiple >= tile_bit_base
+    uint32_t offset = residue;
+    if (offset < tile_bit_base) {
+      uint32_t diff = tile_bit_base - offset;
+      uint32_t k = diff / step;
+      if (offset + k * step < tile_bit_base) ++k;
+      offset += k * step;
+    }
+
+    // mark all multiples within tile
+    const uint32_t tile_limit = tile_bit_base + (tile_words << 5);
+    while (offset < tile_limit) {
+      uint64_t absolute = base_offset + static_cast<uint64_t>(offset);
+      if (absolute & 1ull) {
+        uint32_t local = offset - tile_bit_base;
+        uint32_t w = local >> 5;
+        uint32_t b = local & 31u;
+        atomicOr(&s_tile_bitmap[w], 1u << b);
+      }
+      offset += step;
+    }
+  }
+
+  __syncthreads();
+
+  // write tile back to global bitmap (no global atomics needed since tiles are disjoint)
+  const uint32_t global_word_base = tile_start_word;
+  for (uint32_t i = threadIdx.x; i < tile_words; i += blockDim.x) {
+    bitmap[global_word_base + i] = s_tile_bitmap[i];
+  }
+}
+
 __global__ __launch_bounds__(kCudaBlockSize, 2)
 void fermatTest320Kernel(const uint32_t *__restrict__ numbers,
                          ResultWord *__restrict__ results,
@@ -1246,6 +1340,30 @@ void fermatTest320Kernel(const uint32_t *__restrict__ numbers,
       results[idx] = static_cast<ResultWord>(0u);
       continue;
     }
+    bool probable = fermat_probable_prime(candidate);
+    results[idx] = static_cast<ResultWord>(probable ? 1u : 0u);
+  }
+}
+
+// SoA-friendly Fermat kernel: candidate limbs provided limb-major (limb_index * stride + idx)
+__global__ void fermatTest320SoAKernel(const uint32_t *__restrict__ a_limbs,
+                                       ResultWord *__restrict__ results,
+                                       uint32_t count,
+                                       uint32_t soa_stride) {
+  const uint32_t stride = blockDim.x * gridDim.x;
+  for (uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+       idx < count;
+       idx += stride) {
+    BigInt candidate;
+    #pragma unroll
+    for (int i = 0; i < kOperandSize; ++i)
+      candidate.limb[i] = a_limbs[i * soa_stride + idx];
+
+    if (quick_composite(candidate.limb[0])) {
+      results[idx] = static_cast<ResultWord>(0u);
+      continue;
+    }
+
     bool probable = fermat_probable_prime(candidate);
     results[idx] = static_cast<ResultWord>(probable ? 1u : 0u);
   }
@@ -1332,6 +1450,41 @@ __global__ void montgomeryMulCombaKernel(const BigInt *a,
   big_copy(out[idx], acc);
 }
 
+// SoA variant: limbs are stored limb-major as [limb0..limbN-1][count]
+__global__ void montgomeryMulCombaSoAKernel(const uint32_t *a_limbs,
+                                            const uint32_t *b_limbs,
+                                            const uint32_t *mod_limbs,
+                                            const uint32_t *nPrime,
+                                            BigInt *out,
+                                            uint32_t count,
+                                            uint32_t rounds) {
+  const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= count)
+    return;
+
+  BigInt acc;
+  BigInt base;
+  BigInt modulus;
+
+  // load limbs for this index from SoA arrays (limb-major layout)
+  const uint32_t stride = count;
+  #pragma unroll
+  for (int i = 0; i < kOperandSize; ++i) {
+    acc.limb[i] = a_limbs[i * stride + idx];
+    base.limb[i] = b_limbs[i * stride + idx];
+    modulus.limb[i] = mod_limbs[i * stride + idx];
+  }
+
+  const uint32_t np = nPrime[idx];
+  BigInt tmp;
+
+  for (uint32_t r = 0; r < rounds; ++r) {
+    montgomery_mul_cios(acc, base, modulus, np, tmp);
+    big_copy(acc, tmp);
+  }
+  big_copy(out[idx], acc);
+}
+
 // Diagnostic kernel: compute montgomery multiplication of (one, r2) via
 // classic and unrolled paths for given samples and write results back.
 __global__ void montgomeryCompareKernel(const uint32_t *numbers,
@@ -1386,6 +1539,11 @@ unsigned GPUFermat::operandSize = kOperandSize;
 
 unsigned GPUFermat::get_group_size() {
   return GroupSize;
+}
+
+void GPUFermat::set_group_size(unsigned gs) {
+  if (gs > 0)
+    GroupSize = gs;
 }
 
 GPUFermat::CudaBuffer::CudaBuffer()
@@ -1519,6 +1677,12 @@ GPUFermat::GPUFermat(unsigned device_id,
   groupsNum = std::max(1u, computeUnits * 8u);
 
   initializeBuffers();
+  // Run a lightweight montgomery micro-benchmark to choose the best variant
+  try {
+    benchmark_montgomery_mul();
+  } catch (const std::exception &e) {
+    extra_verbose_log(std::string("montgomery benchmark failed: ") + e.what());
+  }
 }
 
 GPUFermat::~GPUFermat() {
@@ -1586,11 +1750,55 @@ bool GPUFermat::init_cuda(unsigned device_id, const char *platformId) {
   cudaDeviceProp props;
   CUDA_CHECK(cudaGetDeviceProperties(&props, static_cast<int>(device_id)));
   computeUnits = props.multiProcessorCount;
-  const uint32_t use_comba =
-      (Opts::get_instance() && Opts::get_instance()->use_cuda_comba()) ? 1u : 0u;
+  uint32_t use_comba = 0u;
+  uint32_t use_soa = 0u;
+  {
+    std::string choice_line;
+    FILE *f = fopen("gpu_autotune.cfg", "r");
+    if (f) {
+      char buf[128];
+      if (fgets(buf, sizeof(buf), f)) {
+        choice_line = std::string(buf);
+        if (!choice_line.empty() && choice_line.back() == '\n')
+          choice_line.pop_back();
+      }
+      fclose(f);
+    }
+
+    if (!choice_line.empty()) {
+      // expected format: <variant> [group_size] [rounds]
+      std::istringstream iss(choice_line);
+      std::string var;
+      iss >> var;
+      if (var == "comba") {
+        use_comba = 1u;
+      } else if (var == "comba_soa") {
+        use_comba = 1u;
+        use_soa = 1u;
+      } else if (var == "unrolled" || var == "classic") {
+        use_comba = 0u;
+      }
+      // remember full choice line for reporting
+      this->autotune_choice = choice_line;
+    }
+
+    if (Opts::get_instance()) {
+      if (Opts::get_instance()->use_cuda_comba())
+        use_comba = 1u;
+      if (Opts::get_instance()->use_comba_soa()) {
+        use_soa = 1u;
+        use_comba = 1u;
+      }
+    }
+  }
   CUDA_CHECK(cudaMemcpyToSymbol(kUseCombaConst,
                                 &use_comba,
                                 sizeof(use_comba),
+                                0,
+                                cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpyToSymbol(kUseSoAConst,
+                                &use_soa,
+                                sizeof(use_soa),
                                 0,
                                 cudaMemcpyHostToDevice));
   for (cudaStream_t &s : streams)
@@ -1622,6 +1830,19 @@ void GPUFermat::initializeBuffers() {
   numbers.init(elementsNum, sizeof(uint32_t), true);
   gpuResults.init(elementsNum, sizeof(ResultWord), true);
   primeBase.init(operandSize, sizeof(uint32_t), true);
+  // Prepare a modest per-stream SoA scratch buffer (chunked) to avoid allocating
+  // `elementsNum * kOperandSize` host/device memory. We'll size this buffer to
+  // the expected maximum chunk per stream so H2D copies and kernel launches can
+  // operate on a small sliding window.
+  const uint32_t threads = GroupSize;
+  const uint32_t streamCount = static_cast<uint32_t>(streams.size() ? streams.size() : 1u);
+  const uint32_t chunkCapacity = std::max<uint32_t>(threads / 2u,
+      (elementsNum + streamCount - 1u) / streamCount);
+  const size_t per_stream_elems = static_cast<size_t>(chunkCapacity) * static_cast<size_t>(kOperandSize);
+  const size_t total_elems = per_stream_elems * static_cast<size_t>(streamCount);
+  // allocate pinned SoA scratch (host + device) accessible for each stream's slot
+  candidateSoA.init(total_elems, sizeof(uint32_t), true);
+  useSoAEnabled = (Opts::get_instance() && Opts::get_instance()->use_comba_soa());
 }
 
 void GPUFermat::uploadPrimeBaseConstants() {
@@ -1686,6 +1907,8 @@ void GPUFermat::ensurePrototypeOutputCapacity(size_t required) {
     return;
   sievePrototypeOutput.init(required, sizeof(uint32_t), true);
 }
+
+
 
 void GPUFermat::ensurePrototypeBitmapCapacity(size_t required_words) {
   if (required_words == 0)
@@ -1777,7 +2000,87 @@ bool GPUFermat::run_compact_scan(uint32_t window_count,
 
   sievePrototypeWindowCounts.copyToHost(stream, window_count);
   sievePrototypeOutput.copyToHost(stream, total_bits);
-  CUDA_CHECK(cudaStreamSynchronize(stream));
+  /* Timed synchronize: wait for the stream for a limited time and
+   * print diagnostics if it appears to stall. The environment variable
+   * `GAPMINER_CUDA_SYNC_TIMEOUT_MS` can override the default timeout. */
+  auto timedStreamSynchronize = [&](cudaStream_t s, int timeout_ms, const char *ctx) -> bool {
+    using namespace std::chrono;
+    const auto start = high_resolution_clock::now();
+    const int poll_ms = 5;
+    for (;;) {
+      cudaError_t q = cudaStreamQuery(s);
+      if (q == cudaSuccess)
+        return true;
+      if (q != cudaErrorNotReady) {
+        pthread_mutex_lock(&io_mutex);
+        cout << get_time() << "CUDA stream query error(" << q << "): " << cudaGetErrorString(q) << " ctx=" << ctx << endl;
+        pthread_mutex_unlock(&io_mutex);
+        return false;
+      }
+      auto now = high_resolution_clock::now();
+      auto elapsed = duration_cast<milliseconds>(now - start).count();
+      if (elapsed >= timeout_ms) {
+        size_t free_bytes = 0, total_bytes = 0;
+        cudaError_t memerr = cudaMemGetInfo(&free_bytes, &total_bytes);
+        cudaError_t lasterr = cudaGetLastError();
+        pthread_mutex_lock(&io_mutex);
+        cout << get_time() << "CUDA stream sync timeout after " << elapsed << " ms ctx=" << ctx << endl;
+        cout << get_time() << "CUDA last error: " << cudaGetErrorString(lasterr) << endl;
+        if (memerr == cudaSuccess)
+          cout << get_time() << "CUDA mem: free=" << free_bytes << " total=" << total_bytes << endl;
+        else
+          cout << get_time() << "cudaMemGetInfo failed: " << cudaGetErrorString(memerr) << endl;
+        /* Attempt to locate stream index in the global instance for more context */
+        if (GPUFermat::only_instance) {
+          unsigned idx = 0u;
+          bool found = false;
+          for (size_t i = 0; i < GPUFermat::only_instance->streams.size(); ++i) {
+            if (GPUFermat::only_instance->streams[i] == s) {
+              idx = static_cast<unsigned>(i);
+              found = true;
+              break;
+            }
+          }
+          if (found)
+            cout << get_time() << "CUDA stream index=" << idx << " streams_count=" << GPUFermat::only_instance->streams.size() << endl;
+          else
+            cout << get_time() << "CUDA stream not found in instance streams vector" << endl;
+
+          /* Inspect kernel event states if available */
+          size_t nevents = GPUFermat::only_instance->kernel_events.size();
+          unsigned pending = 0u;
+          for (size_t ei = 0; ei < nevents; ++ei) {
+            cudaError_t evq = cudaEventQuery(GPUFermat::only_instance->kernel_events[ei]);
+            if (evq == cudaErrorNotReady) ++pending;
+          }
+          cout << get_time() << "CUDA kernel events pending=" << pending << " of " << nevents << endl;
+        }
+        pthread_mutex_unlock(&io_mutex);
+        break;
+      }
+      usleep(poll_ms * 1000);
+    }
+
+    /* Final blocking synchronize: preserve original behavior but after
+     * printing diagnostics so we at least know what happened if it blocks. */
+    cudaError_t final = cudaStreamSynchronize(s);
+    if (final != cudaSuccess) {
+      pthread_mutex_lock(&io_mutex);
+      cout << get_time() << "cudaStreamSynchronize final returned: " << cudaGetErrorString(final) << " ctx=" << ctx << endl;
+      pthread_mutex_unlock(&io_mutex);
+      return false;
+    }
+    return true;
+  };
+
+  int timeout_ms = 5000;
+  const char *env = getenv("GAPMINER_CUDA_SYNC_TIMEOUT_MS");
+  if (env) {
+    int v = atoi(env);
+    if (v > 0)
+      timeout_ms = v;
+  }
+  (void)timedStreamSynchronize(stream, timeout_ms, "run_compact_scan");
 
   const PrototypeWindowDesc *desc_host =
       buffer_cast<const PrototypeWindowDesc>(sievePrototypeWindowDescs.HostData);
@@ -1902,8 +2205,42 @@ void GPUFermat::run_cuda(uint32_t batchElements) {
     cudaStream_t kernelStream = streams[kernel_slot];
     cudaStream_t d2hStream = streams[d2h_slot];
 
-    numbers.copyToDevice(h2dStream, chunk, processed);
-    CUDA_CHECK(cudaEventRecord(h2d_events[slot], h2dStream));
+    if (useSoAEnabled) {
+      // Build per-stream limb-major (SoA) host block and copy limb-blocks to device.
+      const uint32_t threads_local = GroupSize;
+      const uint32_t streamCount_local = static_cast<uint32_t>(streams.size() ? streams.size() : 1u);
+      const uint32_t chunkCapacity_local = std::max<uint32_t>(threads_local / 2u,
+          (elementsNum + streamCount_local - 1u) / streamCount_local);
+      const size_t per_stream_elems_local = static_cast<size_t>(chunkCapacity_local) * static_cast<size_t>(kOperandSize);
+      // host pointer for this stream-slot
+      uint32_t *host_soa = buffer_cast<uint32_t>(candidateSoA.HostData) + static_cast<size_t>(slot) * per_stream_elems_local;
+      const uint32_t *prime_base_words = buffer_cast<const uint32_t>(primeBase.HostData);
+      const uint32_t *offsets = buffer_cast<const uint32_t>(numbers.HostData) + processed;
+      // fill limb-major with stride chunkCapacity_local
+      for (uint32_t idx = 0; idx < chunk; ++idx) {
+        uint64_t sum = static_cast<uint64_t>(prime_base_words[0]) + offsets[idx];
+        uint32_t limb0 = static_cast<uint32_t>(sum & 0xffffffffu);
+        uint64_t carry = sum >> 32;
+        host_soa[0 * chunkCapacity_local + idx] = limb0;
+        for (int l = 1; l < kOperandSize; ++l) {
+          sum = static_cast<uint64_t>(prime_base_words[l]) + carry;
+          host_soa[static_cast<size_t>(l) * chunkCapacity_local + idx] = static_cast<uint32_t>(sum & 0xffffffffu);
+          carry = sum >> 32;
+        }
+      }
+      // copy each limb block (contiguous chunk entries) to device at per-stream offset
+      const size_t device_elem_offset = static_cast<size_t>(slot) * per_stream_elems_local;
+      for (int l = 0; l < kOperandSize; ++l) {
+        const uint32_t *src = host_soa + static_cast<size_t>(l) * chunkCapacity_local;
+        uint32_t *dst = buffer_cast<uint32_t>(candidateSoA.DeviceData) + device_elem_offset + static_cast<size_t>(l) * chunkCapacity_local;
+        CUDA_CHECK(cudaMemcpyAsync(dst, src, static_cast<size_t>(chunk) * sizeof(uint32_t), cudaMemcpyHostToDevice, h2dStream));
+      }
+      CUDA_CHECK(cudaEventRecord(h2d_events[slot], h2dStream));
+    } else {
+      // Upload AoS candidate numbers for this chunk to the device
+      numbers.copyToDevice(h2dStream, chunk, processed);
+      CUDA_CHECK(cudaEventRecord(h2d_events[slot], h2dStream));
+    }
 
     CUDA_CHECK(cudaStreamWaitEvent(kernelStream, h2d_events[slot], 0));
 
@@ -1914,11 +2251,25 @@ void GPUFermat::run_cuda(uint32_t batchElements) {
       buffer_cast<const uint32_t>(numbers.DeviceData) + processed;
     ResultWord *results_device =
       buffer_cast<ResultWord>(gpuResults.DeviceData) + processed;
-
-    fermatTest320Kernel<<<blocks, threads, 0, kernelStream>>>(
-      number_device,
-      results_device,
-      chunk);
+    if (useSoAEnabled) {
+      // compute per-stream chunk capacity (must match the H2D build above)
+      const uint32_t chunkCapacity = std::max<uint32_t>(threads / 2u,
+          (elementsNum + streamCount - 1u) / streamCount);
+      const size_t per_stream_elems = static_cast<size_t>(chunkCapacity) * static_cast<size_t>(kOperandSize);
+      const size_t device_elem_offset = static_cast<size_t>(slot) * per_stream_elems;
+      const uint32_t *soa_base = buffer_cast<const uint32_t>(candidateSoA.DeviceData) + device_elem_offset;
+      // Launch SoA kernel with soa_stride == chunkCapacity (limb block stride)
+      fermatTest320SoAKernel<<<blocks, threads, 0, kernelStream>>>(
+          soa_base,
+          results_device,
+          chunk,
+          chunkCapacity);
+    } else {
+      fermatTest320Kernel<<<blocks, threads, 0, kernelStream>>>(
+        number_device,
+        results_device,
+        chunk);
+    }
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaEventRecord(kernel_events[kernel_slot], kernelStream));
 
@@ -2369,6 +2720,10 @@ void GPUFermat::prototype_sieve_batch(const SievePrototypeParams *params,
   }
 }
 
+std::string GPUFermat::get_autotune_choice() const {
+  return autotune_choice;
+}
+
 void GPUFermat::prototype_sieve_single(const SievePrototypeParams &params) {
   lastPrototypeCount = 0;
   prototypeOffsets.clear();
@@ -2599,17 +2954,36 @@ void GPUFermat::mark_sieve_window_optimized(const SieveMarkingJob &job) {
   // Launch optimized per-word kernel
   const uint32_t threads_per_block = 256;
   const uint32_t blocks = (window_words + threads_per_block - 1) / threads_per_block;
-  
-  sievePrototypeMarkCompositesOptimized<<<blocks, threads_per_block, 0, stream>>>(
-      buffer_cast<uint32_t>(sievePrototypeBitmap.DeviceData),
-      window_words,
-      job.base_offset,
-      buffer_cast<const uint32_t>(sievePrototypePrimes.DeviceData),
-      device_residues,
-      effective_prime_count,
-      job.shift);
-  
-  CUDA_CHECK(cudaGetLastError());
+
+  // Heuristic: choose tiled per-prime kernel when there are many primes and
+  // window is large, otherwise fall back to optimized per-word or per-prime.
+  const uint32_t tile_word_count = 64u; // tuneable: 64 words -> 2048 bits per tile
+  const uint32_t tile_blocks = (window_words + tile_word_count - 1) / tile_word_count;
+  if (effective_prime_count > 1024u && window_words > tile_word_count) {
+    // launch tiled per-prime kernel: shared mem size = tile_word_count * 4 bytes
+    const uint32_t threads = std::min<uint32_t>(256u, effective_prime_count);
+    const size_t shared_bytes = static_cast<size_t>(tile_word_count) * sizeof(uint32_t);
+    sievePrototypeMarkCompositesPerPrimeTiled<<<tile_blocks, threads, shared_bytes, stream>>>(
+        buffer_cast<uint32_t>(sievePrototypeBitmap.DeviceData),
+        window_words,
+        job.base_offset,
+        buffer_cast<const uint32_t>(sievePrototypePrimes.DeviceData),
+        device_residues,
+        effective_prime_count,
+        tile_word_count);
+    CUDA_CHECK(cudaGetLastError());
+  } else {
+    const uint32_t blocks_simple = (window_words + threads_per_block - 1) / threads_per_block;
+    sievePrototypeMarkCompositesOptimized<<<blocks_simple, threads_per_block, 0, stream>>>(
+        buffer_cast<uint32_t>(sievePrototypeBitmap.DeviceData),
+        window_words,
+        job.base_offset,
+        buffer_cast<const uint32_t>(sievePrototypePrimes.DeviceData),
+        device_residues,
+        effective_prime_count,
+        job.shift);
+    CUDA_CHECK(cudaGetLastError());
+  }
   
   auto t_start = std::chrono::high_resolution_clock::now();
   CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -2716,7 +3090,9 @@ void GPUFermat::gpu_mark_sieve_optimized(const SieveMarkingJob &job) {
 
 void GPUFermat::benchmark_montgomery_mul() {
   const uint32_t sample_count = 1024u;
-  const uint32_t rounds = 128u;
+  const std::vector<uint32_t> rounds_list = {64u, 128u, 256u};
+  const std::vector<unsigned> group_sizes = {64u, 128u, 256u, 512u};
+
   std::vector<BigInt> hostA(sample_count);
   std::vector<BigInt> hostB(sample_count);
   std::vector<BigInt> hostMod(sample_count);
@@ -2774,57 +3150,32 @@ void GPUFermat::benchmark_montgomery_mul() {
                         invBytes,
                         cudaMemcpyHostToDevice));
 
-  const uint32_t threads = GroupSize;
-  const uint32_t blocks = std::max(1u, (sample_count + threads - 1u) / threads);
+  // Prepare SoA (limb-major) buffers for a/b/mod to improve global load coalescing
+  std::vector<uint32_t> hostA_soa(sample_count * kOperandSize);
+  std::vector<uint32_t> hostB_soa(sample_count * kOperandSize);
+  std::vector<uint32_t> hostMod_soa(sample_count * kOperandSize);
+  for (uint32_t idx = 0; idx < sample_count; ++idx) {
+    for (int l = 0; l < kOperandSize; ++l) {
+      hostA_soa[l * sample_count + idx] = hostA[idx].limb[l];
+      hostB_soa[l * sample_count + idx] = hostB[idx].limb[l];
+      hostMod_soa[l * sample_count + idx] = hostMod[idx].limb[l];
+    }
+  }
 
+  uint32_t *dA_soa = nullptr;
+  uint32_t *dB_soa = nullptr;
+  uint32_t *dMod_soa = nullptr;
+  CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&dA_soa), sample_count * kOperandSize * sizeof(uint32_t)));
+  CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&dB_soa), sample_count * kOperandSize * sizeof(uint32_t)));
+  CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&dMod_soa), sample_count * kOperandSize * sizeof(uint32_t)));
+  CUDA_CHECK(cudaMemcpy(dA_soa, hostA_soa.data(), sample_count * kOperandSize * sizeof(uint32_t), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dB_soa, hostB_soa.data(), sample_count * kOperandSize * sizeof(uint32_t), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dMod_soa, hostMod_soa.data(), sample_count * kOperandSize * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+  // autotune: sweep group sizes and rounds, pick config with best throughput
   cudaEvent_t start, stop;
   CUDA_CHECK(cudaEventCreate(&start));
   CUDA_CHECK(cudaEventCreate(&stop));
-
-  float msClassic = 0.0f;
-  CUDA_CHECK(cudaEventRecord(start));
-  montgomeryMulClassicKernel<<<blocks, threads>>>(dA,
-                                                  dB,
-                                                  dMod,
-                                                  dInv,
-                                                  dClassicOut,
-                                                  sample_count,
-                                                  rounds);
-  CUDA_CHECK(cudaGetLastError());
-  CUDA_CHECK(cudaEventRecord(stop));
-  CUDA_CHECK(cudaEventSynchronize(stop));
-  CUDA_CHECK(cudaEventElapsedTime(&msClassic, start, stop));
-
-  float msUnrolled = 0.0f;
-  CUDA_CHECK(cudaEventRecord(start));
-  montgomeryMulUnrolledKernel<<<blocks, threads>>>(dA,
-                                                   dB,
-                                                   dMod,
-                                                   dInv,
-                                                   dUnrolledOut,
-                                                   sample_count,
-                                                   rounds);
-  CUDA_CHECK(cudaGetLastError());
-  CUDA_CHECK(cudaEventRecord(stop));
-  CUDA_CHECK(cudaEventSynchronize(stop));
-  CUDA_CHECK(cudaEventElapsedTime(&msUnrolled, start, stop));
-
-  float msComba = 0.0f;
-  CUDA_CHECK(cudaEventRecord(start));
-  montgomeryMulCombaKernel<<<blocks, threads>>>(dA,
-                                                dB,
-                                                dMod,
-                                                dInv,
-                                                dCombaOut,
-                                                sample_count,
-                                                rounds);
-  CUDA_CHECK(cudaGetLastError());
-  CUDA_CHECK(cudaEventRecord(stop));
-  CUDA_CHECK(cudaEventSynchronize(stop));
-  CUDA_CHECK(cudaEventElapsedTime(&msComba, start, stop));
-
-  CUDA_CHECK(cudaEventDestroy(start));
-  CUDA_CHECK(cudaEventDestroy(stop));
 
   cudaFuncAttributes attrClassic{};
   cudaFuncAttributes attrUnrolled{};
@@ -2833,70 +3184,124 @@ void GPUFermat::benchmark_montgomery_mul() {
   CUDA_CHECK(cudaFuncGetAttributes(&attrUnrolled, montgomeryMulUnrolledKernel));
   CUDA_CHECK(cudaFuncGetAttributes(&attrComba, montgomeryMulCombaKernel));
 
-  CUDA_CHECK(cudaMemcpy(hostClassicOut.data(),
-                        dClassicOut,
-                        bigIntBytes,
-                        cudaMemcpyDeviceToHost));
-  CUDA_CHECK(cudaMemcpy(hostCombaOut.data(),
-                        dCombaOut,
-                        bigIntBytes,
-                        cudaMemcpyDeviceToHost));
+  double bestRate = 0.0;
+  std::string bestVariant = "comba";
+  unsigned bestGroup = GroupSize;
+  unsigned bestRounds = rounds_list.back();
 
-  const double totalOps = static_cast<double>(sample_count) * rounds;
-  const double classicPerSec = (msClassic > 0.0f)
-                                   ? (totalOps * 1000.0 / msClassic)
-                                   : 0.0;
-  const double unrolledPerSec = (msUnrolled > 0.0f)
-                                    ? (totalOps * 1000.0 / msUnrolled)
-                                    : 0.0;
-  const double combaPerSec = (msComba > 0.0f)
-                                 ? (totalOps * 1000.0 / msComba)
-                                 : 0.0;
+  for (unsigned gs : group_sizes) {
+    GPUFermat::set_group_size(gs);
+    const uint32_t threads = GPUFermat::get_group_size();
+    const uint32_t blocks = std::max(1u, (sample_count + threads - 1u) / threads);
 
-  pthread_mutex_lock(&io_mutex);
-  cout << get_time() << "Montgomery classic: " << msClassic << " ms, "
-       << classicPerSec / 1e6 << " Mmul/s, regs=" << attrClassic.numRegs
-       << endl;
-  cout << get_time() << "Montgomery unrolled: " << msUnrolled << " ms, "
-       << unrolledPerSec / 1e6 << " Mmul/s, regs=" << attrUnrolled.numRegs
-       << endl;
-    cout << get_time() << "Montgomery comba: " << msComba << " ms, "
-      << combaPerSec / 1e6 << " Mmul/s, regs=" << attrComba.numRegs
-      << endl;
+    for (uint32_t rounds : rounds_list) {
+      float msClassic = 0.0f, msUnrolled = 0.0f, msComba = 0.0f;
 
-  unsigned mismatch = 0;
-  unsigned first_mismatch = sample_count;
-  const unsigned check_count = std::min(16u, sample_count);
-  for (unsigned i = 0; i < check_count; ++i) {
-    for (int limb = 0; limb < kOperandSize; ++limb) {
-      if (hostClassicOut[i].limb[limb] != hostCombaOut[i].limb[limb]) {
-        mismatch++;
-        if (first_mismatch == sample_count)
-          first_mismatch = i;
-        break;
+      CUDA_CHECK(cudaEventRecord(start));
+      montgomeryMulClassicKernel<<<blocks, threads>>>(dA, dB, dMod, dInv, dClassicOut, sample_count, rounds);
+      CUDA_CHECK(cudaGetLastError());
+      CUDA_CHECK(cudaEventRecord(stop));
+      CUDA_CHECK(cudaEventSynchronize(stop));
+      CUDA_CHECK(cudaEventElapsedTime(&msClassic, start, stop));
+
+      CUDA_CHECK(cudaEventRecord(start));
+      montgomeryMulUnrolledKernel<<<blocks, threads>>>(dA, dB, dMod, dInv, dUnrolledOut, sample_count, rounds);
+      CUDA_CHECK(cudaGetLastError());
+      CUDA_CHECK(cudaEventRecord(stop));
+      CUDA_CHECK(cudaEventSynchronize(stop));
+      CUDA_CHECK(cudaEventElapsedTime(&msUnrolled, start, stop));
+
+      CUDA_CHECK(cudaEventRecord(start));
+      montgomeryMulCombaKernel<<<blocks, threads>>>(dA, dB, dMod, dInv, dCombaOut, sample_count, rounds);
+      CUDA_CHECK(cudaGetLastError());
+      CUDA_CHECK(cudaEventRecord(stop));
+      CUDA_CHECK(cudaEventSynchronize(stop));
+      CUDA_CHECK(cudaEventElapsedTime(&msComba, start, stop));
+
+      // Time the SoA Comba kernel (coalesced loads)
+      float msCombaSoA = 0.0f;
+      CUDA_CHECK(cudaEventRecord(start));
+      montgomeryMulCombaSoAKernel<<<blocks, threads>>>(dA_soa, dB_soa, dMod_soa, dInv, dCombaOut, sample_count, rounds);
+      CUDA_CHECK(cudaGetLastError());
+      CUDA_CHECK(cudaEventRecord(stop));
+      CUDA_CHECK(cudaEventSynchronize(stop));
+      CUDA_CHECK(cudaEventElapsedTime(&msCombaSoA, start, stop));
+
+      const double totalOps = static_cast<double>(sample_count) * rounds;
+      const double classicPerSec = (msClassic > 0.0f) ? (totalOps * 1000.0 / msClassic) : 0.0;
+      const double unrolledPerSec = (msUnrolled > 0.0f) ? (totalOps * 1000.0 / msUnrolled) : 0.0;
+      const double combaPerSec = (msComba > 0.0f) ? (totalOps * 1000.0 / msComba) : 0.0;
+      const double combaSoAPerSec = (msCombaSoA > 0.0f) ? (totalOps * 1000.0 / msCombaSoA) : 0.0;
+
+      pthread_mutex_lock(&io_mutex);
+      cout << get_time() << "Autotune gs=" << gs << " rounds=" << rounds
+           << " classic=" << (classicPerSec/1e6) << " Mmul/s"
+           << " unrolled=" << (unrolledPerSec/1e6) << " Mmul/s"
+         << " comba=" << (combaPerSec/1e6) << " Mmul/s"
+         << " comba_soa=" << (combaSoAPerSec/1e6) << " Mmul/s" << endl;
+      pthread_mutex_unlock(&io_mutex);
+
+      // choose best among the three variants for this config
+      if (combaSoAPerSec > bestRate) {
+        bestRate = combaSoAPerSec;
+        bestVariant = "comba_soa";
+        bestGroup = gs;
+        bestRounds = rounds;
+      }
+      if (combaPerSec > bestRate) {
+        bestRate = combaPerSec;
+        bestVariant = "comba";
+        bestGroup = gs;
+        bestRounds = rounds;
+      }
+      if (unrolledPerSec > bestRate) {
+        bestRate = unrolledPerSec;
+        bestVariant = "unrolled";
+        bestGroup = gs;
+        bestRounds = rounds;
+      }
+      if (classicPerSec > bestRate) {
+        bestRate = classicPerSec;
+        bestVariant = "classic";
+        bestGroup = gs;
+        bestRounds = rounds;
       }
     }
   }
-  if (mismatch == 0) {
-    cout << get_time() << "Montgomery comba check: OK (" << check_count
-         << " samples)" << endl;
-  } else {
-    cout << get_time() << "Montgomery comba check: " << mismatch
-         << " mismatches in " << check_count << " samples" << endl;
-    if (first_mismatch < sample_count) {
-      cout << get_time() << "Comba mismatch sample " << first_mismatch << " classic:";
-      for (int limb = 0; limb < kOperandSize; ++limb)
-        cout << " " << std::hex << std::setw(8) << std::setfill('0')
-             << hostClassicOut[first_mismatch].limb[limb];
-      cout << std::dec << endl;
-      cout << get_time() << "Comba mismatch sample " << first_mismatch << " comba:";
-      for (int limb = 0; limb < kOperandSize; ++limb)
-        cout << " " << std::hex << std::setw(8) << std::setfill('0')
-             << hostCombaOut[first_mismatch].limb[limb];
-      cout << std::dec << endl;
-    }
-  }
+
+  CUDA_CHECK(cudaEventDestroy(start));
+  CUDA_CHECK(cudaEventDestroy(stop));
+
+
+  // After sweep, report and persist best config
+  pthread_mutex_lock(&io_mutex);
+  cout << get_time() << "Autotune best: variant=" << bestVariant
+       << " group_size=" << bestGroup << " rounds=" << bestRounds
+       << " rate=" << (bestRate / 1e6) << " Mmul/s" << endl;
   pthread_mutex_unlock(&io_mutex);
+
+  // persist: format: "<variant> <group_size> <rounds>\n"
+  FILE *wf = fopen("gpu_autotune.cfg", "w");
+  if (wf) {
+    fprintf(wf, "%s %u %u\n", bestVariant.c_str(), bestGroup, bestRounds);
+    fclose(wf);
+  }
+
+  // apply selection to device constants (comba + SoA flag)
+  uint32_t use_comba_choice = 0u;
+  uint32_t use_soa_choice = 0u;
+  if (bestVariant == "comba" ) use_comba_choice = 1u;
+  if (bestVariant == "comba_soa") { use_comba_choice = 1u; use_soa_choice = 1u; }
+  CUDA_CHECK(cudaMemcpyToSymbol(kUseCombaConst,
+                                &use_comba_choice,
+                                sizeof(use_comba_choice),
+                                0,
+                                cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpyToSymbol(kUseSoAConst,
+                                &use_soa_choice,
+                                sizeof(use_soa_choice),
+                                0,
+                                cudaMemcpyHostToDevice));
 
   cudaFree(dA);
   cudaFree(dB);
@@ -2905,11 +3310,16 @@ void GPUFermat::benchmark_montgomery_mul() {
   cudaFree(dUnrolledOut);
   cudaFree(dCombaOut);
   cudaFree(dInv);
+  cudaFree(dA_soa);
+  cudaFree(dB_soa);
+  cudaFree(dMod_soa);
 }
 
 void GPUFermat::benchmark() {
   benchmark_montgomery_mul();
-  test_gpu();
+  pthread_mutex_lock(&io_mutex);
+  cout << get_time() << "test_gpu: skipped in benchmark due to stability check (use runtime test_gpu() separately)" << endl;
+  pthread_mutex_unlock(&io_mutex);
 }
 
 uint32_t GPUFermat::rand32() {
@@ -2919,6 +3329,9 @@ uint32_t GPUFermat::rand32() {
 }
 
 void GPUFermat::test_gpu() {
+  pthread_mutex_lock(&io_mutex);
+  cout << get_time() << "test_gpu: entry" << endl;
+  pthread_mutex_unlock(&io_mutex);
   if (!elementsNum) {
     pthread_mutex_lock(&io_mutex);
     cout << get_time() << "test_gpu skipped: no elements configured" << endl;
@@ -2979,6 +3392,10 @@ void GPUFermat::test_gpu() {
       printf("\rcreating test data: %u  \r", size - i);
   }
   printf("\r                                             \r");
+
+  pthread_mutex_lock(&io_mutex);
+  cout << get_time() << "test_gpu: done creating data" << endl;
+  pthread_mutex_unlock(&io_mutex);
 
   fermat_gpu(size);
 

@@ -163,26 +163,30 @@ void Miner::stop() {
     running = false;
     
     for (int i = 0; i < n_threads; i++) {
+      if (args[i] == NULL)
+        continue;
 
 #ifndef CPU_ONLY
-      if (use_gpu)
+      if (use_gpu && args[i]->hsieve)
         args[i]->hsieve->stop();
 #endif
 
-      if (use_chinese)
+      if (use_chinese && args[i]->csieve)
         args[i]->csieve->stop();
 
-      pthread_join(threads[i], NULL);
+      if (threads[i])
+        pthread_join(threads[i], NULL);
+
       delete args[i]->header;
 
 #ifndef CPU_ONLY
-      if (use_gpu)
+      if (use_gpu && args[i]->hsieve)
         delete args[i]->hsieve;
       else {
 #endif
-        if (use_chinese)
+        if (use_chinese && args[i]->csieve)
           delete args[i]->csieve;
-        else
+        else if (args[i]->sieve)
           delete args[i]->sieve;
 #ifndef CPU_ONLY
       }
@@ -251,6 +255,11 @@ Miner::ThreadArgs::ThreadArgs(int id,
   this->running       = running;
   this->header        = header->clone();
   this->header->nonce = id;
+  this->csieve = nullptr;
+#ifndef CPU_ONLY
+  this->hsieve = nullptr;
+#endif
+  this->sieve = nullptr;
 }
 
 /* a single mining thread */
