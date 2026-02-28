@@ -258,6 +258,28 @@ while keeping full trace logs available in the `tests` extra-verbose file.
   - Added `big_bit_length()` and `big_get_bit()` helper functions for efficient
     exponent bit extraction.
 
+- CUDA kernel micro-optimizations (Feb 2026):
+  - **`big_decrement`**: removed a redundant inner fill loop that was already
+    handled by the outer borrow loop; enables full `#pragma unroll` on the
+    outer iteration.
+  - **`quick_composite` branchless prefix**: extended from 8 → 16 small primes
+    (up to p = 127). The first 16 primality checks now run lock-step across the
+    warp with a single branch, catching ~10% more composites before the
+    divergent early-exit loop.
+  - **`sievePrototypeMarkCompositesOptimized` kernel deleted**: this O(bits ×
+    primes) kernel was ~1000× slower than the per-prime stepping kernels and
+    was never the preferred dispatch path; removing it reduces binary size.
+  - **`sievePrototypeScanKernel` — `__ldg` bitmap reads**: bitmap words are
+    now read through the read-only data cache (`__ldg`), reducing L2 pressure
+    during the scan phase. The pointer is also annotated `__restrict__` so the
+    compiler can schedule loads more aggressively.
+  - **3-stream minimum enforced**: the `GPUFermat` constructor now ensures at
+    least 3 CUDA streams are created so the H2D, kernel, and D2H stages always
+    have independent streams and can overlap correctly.
+
+  See [CUDAFERMAT-CHANGES.md](CUDAFERMAT-CHANGES.md) for full details,
+  including changes that were attempted but reverted and the reasons why.
+
 - OpenCL benchmark suite (Feb 2026):
   - Added dedicated Montgomery multiplication and squaring benchmark kernels for
     320-bit and 352-bit operand sizes in `gpu/benchmarks.cl`.

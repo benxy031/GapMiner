@@ -110,6 +110,7 @@ class Opts {
     SingleOpt snapshot_pool_buffers;
   SingleOpt gpu_launch_divisor;
   SingleOpt gpu_launch_wait_ms;
+    SingleOpt gpu_low_latency_launch;
 #endif    
     SingleOpt calc_ctr;
     SingleOpt ctr_strength;
@@ -241,6 +242,8 @@ class Opts {
 
     bool has_gpu_launch_wait_ms()   { return gpu_launch_wait_ms.active; }
     string get_gpu_launch_wait_ms() { return gpu_launch_wait_ms.arg;    }
+
+    bool use_gpu_low_latency_launch() { return gpu_low_latency_launch.active; }
     
 #endif    
 

@@ -181,6 +181,7 @@ snapshot_pool_buffers(NULL, "--snapshot-pool-buffers", "override CUDA residue sn
  * Lower divisor = larger batches = better throughput but higher latency */
 gpu_launch_divisor(NULL, "--gpu-launch-divisor", "override GPU launch divisor (default 6, lower = faster launches)", true),
   gpu_launch_wait_ms(NULL, "--gpu-launch-wait-ms", "maximum wait in ms before forcing a partial GPU batch (default 50)", true),
+  gpu_low_latency_launch(NULL, "--gpu-low-latency-launch", "prefer immediate GPU launches for fresh work (lower stale risk, may reduce throughput)", false),
 #endif
 /* CRT calculation/optimization: generate custom Chinese Remainder Theorem tables
  * optimized for specific mining parameters. Uses evolutionary algorithms to find
@@ -336,6 +337,9 @@ license(   "-v", "--license",        "show license of this program",            
   if (gpu_launch_wait_ms.active)
     gpu_launch_wait_ms.arg = get_arg(gpu_launch_wait_ms.short_opt,
                                      gpu_launch_wait_ms.long_opt);
+
+  gpu_low_latency_launch.active = has_arg(gpu_low_latency_launch.short_opt,
+                                          gpu_low_latency_launch.long_opt);
 #endif    
 
   calc_ctr.active = has_arg(calc_ctr.short_opt, calc_ctr.long_opt);
@@ -514,6 +518,9 @@ string Opts::get_help()  {
 
   ss << "      " << left << setw(18);
   ss << gpu_launch_wait_ms.long_opt << "  " << gpu_launch_wait_ms.description << "\n\n";
+
+  ss << "      " << left << setw(18);
+  ss << gpu_low_latency_launch.long_opt << "  " << gpu_low_latency_launch.description << "\n\n";
 #endif  
 
   ss << "      " << left << setw(18);

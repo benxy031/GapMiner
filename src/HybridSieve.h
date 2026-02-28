@@ -305,6 +305,8 @@ class HybridSieve : public Sieve {
         uint16_t shift;
                                 uint32_t preferred_launch_divisor;
                                 uint32_t preferred_launch_max_wait_ms;
+                                bool low_latency_launch_enabled;
+                                uint64_t fresh_launch_deadline_us;
 
       public : 
 

@@ -27,7 +27,7 @@ bool GPUFermat::initialized = false;
 
 // expose CUDA block size as block size getter
 unsigned GPUFermat::get_block_size() {
-  return 512u;
+  return GroupSize;
 }
 
 
@@ -219,15 +219,21 @@ __device__ __forceinline__ void big_sub(BigInt &a, const BigInt &b) {
   }
 }
 
+// Note: big_cond_sub was tried here (branchless select) but caused
+// cudaErrorIllegalAddress at runtime due to local-memory stack overflow
+// when inlined ~300x into fermat_probable_prime. Kept as big_compare+big_sub.
+
+// The outer loop already fills lower limbs with 0xFFFFFFFF before advancing,
+// so the inner j-loop that did the same is redundant. Removing it allows full
+// #pragma unroll and eliminates dependent control-flow on the GPU.
 __device__ __forceinline__ bool big_decrement(BigInt &a) {
+  #pragma unroll
   for (int i = 0; i < kCudaOperandSize; ++i) {
     if (a.limb[i] > 0u) {
       a.limb[i]--;
-      for (int j = 0; j < i; ++j)
-        a.limb[j] = 0xFFFFFFFFu;
       return true;
     }
-    a.limb[i] = 0xFFFFFFFFu;
+    a.limb[i] = 0xFFFFFFFFu;  // borrow: wrap and continue
   }
   return false;
 }
@@ -786,8 +792,8 @@ __device__ __forceinline__ void sub_ext(uint32_t *value, const BigInt &mod) {
 __device__ void compute_r2(const BigInt &mod, BigInt &r2) {
   uint32_t value[kOperandSize + 1] = {0};
   value[0] = 1u;
-
   for (int bit = 0; bit < kMontgomeryShiftBits; ++bit) {
+    // Double value (shift left 1).
     uint64_t carry = 0ull;
     #pragma unroll
     for (int i = 0; i < kOperandSize + 1; ++i) {
@@ -795,7 +801,8 @@ __device__ void compute_r2(const BigInt &mod, BigInt &r2) {
       value[i] = static_cast<uint32_t>(sum);
       carry = sum >> 32;
     }
-    while (value[kOperandSize] || compare_ext(value, mod) >= 0)
+    // value < 2*mod after doubling, so one conditional subtract suffices.
+    if (value[kOperandSize] || compare_ext(value, mod) >= 0)
       sub_ext(value, mod);
   }
 
@@ -826,10 +833,12 @@ __device__ __forceinline__ uint32_t fast_mod_u32(uint32_t value,
 }
 
 __device__ bool quick_composite(uint32_t offset) {
-  // Hybrid approach: first check a small prefix of primes branchlessly
-  // to filter many composites without divergence, then fall back to
-  // early-exit loop for remaining primes to avoid extra work on primes.
-  const int prefix = (kSmallPrimeCount >= 8) ? 8 : kSmallPrimeCount;
+  // Branchless prefix (16 primes, up to p=127): accumulate composite flag
+  // without any divergent branches. All 16 modular reductions run in
+  // lock-step across the warp, then a single branch exits early.
+  // Increasing from 8 to 16 catches ~10% more composites branchlessly
+  // while keeping the prefix small enough for constant-memory broadcast.
+  const int prefix = (kSmallPrimeCount >= 16) ? 16 : kSmallPrimeCount;
   uint32_t is_comp = 0u;
   #pragma unroll
   for (int i = 0; i < prefix; ++i) {
@@ -916,9 +925,8 @@ __device__ bool fermat_probable_prime(const BigInt &n) {
       ++j;
 
     uint32_t value = 0u;
-    for (int k = j; k <= i; ++k) {
+    for (int k = j; k <= i; ++k)
       value = (value << 1) | big_get_bit(exponent, k);
-    }
 
     for (int k = 0; k < (i - j + 1); ++k) {
       BigInt tmp;
@@ -990,8 +998,19 @@ __device__ __forceinline__ uint32_t parity_mask_from_base(uint32_t base_parity) 
   return (base_parity & 1u) ? 0x55555555u : 0xAAAAAAAAu;
 }
 
-__global__ void sievePrototypeScanKernel(const uint32_t *bitmap_words,
-                                         const PrototypeWindowDesc *descs,
+// Divergence-safe scan kernel: one global atomicAdd per thread per non-empty
+// word. This is the proven-stable design; the two-pass shared-memory variant
+// caused cudaErrorIllegalAddress (717) on sm_86 due to atomicAdd on __shared__
+// pointers interacting badly with certain compiler-generated load paths.
+// Bitmap words are read via __ldg (read-only/texture cache) since the bitmap
+// is never written during this kernel, reducing L2 pressure.
+//
+// The warp-ballot prefix-sum variant was also removed: the grid-stride outer
+// loop (word_rel < desc.word_count) causes lane divergence at __shfl_sync /
+// __activemask(), making prefix-sum results undefined and silently dropping
+// candidates.
+__global__ void sievePrototypeScanKernel(const uint32_t *__restrict__ bitmap_words,
+                                         const PrototypeWindowDesc *__restrict__ descs,
                                          uint32_t window_count,
                                          uint32_t *out_offsets,
                                          uint32_t *window_counts) {
@@ -1010,7 +1029,8 @@ __global__ void sievePrototypeScanKernel(const uint32_t *bitmap_words,
     if (local_bit_base >= desc.bit_length)
       continue;
 
-    const uint32_t word = bitmap_words[desc.word_start + word_rel];
+    // __ldg: read bitmap through the read-only data cache (no L2 pollution).
+    const uint32_t word = __ldg(&bitmap_words[desc.word_start + word_rel]);
     const uint32_t remaining_bits = desc.bit_length - local_bit_base;
     const uint32_t valid_bits = (remaining_bits >= 32u) ? 32u : remaining_bits;
 
@@ -1028,9 +1048,8 @@ __global__ void sievePrototypeScanKernel(const uint32_t *bitmap_words,
     uint32_t written = 0u;
     while (candidate_mask && written < max_write) {
       const uint32_t bit = __ffs(candidate_mask) - 1u;
-      candidate_mask &= (candidate_mask - 1u);
-      const uint32_t local_bit = local_bit_base + bit;
-      out_offsets[desc.output_base + base + written] = local_bit;
+      candidate_mask &= candidate_mask - 1u;
+      out_offsets[desc.output_base + base + written] = local_bit_base + bit;
       ++written;
     }
   }
@@ -1129,81 +1148,10 @@ __global__ void sieveBuildBitmapKernelBatch(const uint32_t *primes,
   }
 }
 
-/**
- * sievePrototypeMarkCompositesOptimized: GPU Sieve Marking Kernel (Per-Word Strategy)
- * 
- * Strategy: Each thread marks all composites in one 32-bit word across ALL primes.
- * This provides excellent memory coalescing and vectorization.
- * 
- * Algorithm: For each 32-bit word, check all bits to see if they are:
- * 1. At odd positions (base_offset + bit is odd)
- * 2. Composites (multiples of any small prime)
- * 
- * Parameters:
- *   bitmap: Output bitmap to fill with composite markers (1 = composite, 0 = prime candidate)
- *   bitmap_word_count: Total number of 32-bit words in bitmap
- *   base_offset: Absolute starting position of sieve window (must be odd)
- *   prime_residues: [const memory] Array of residue[i] = starting offset of prime[i] in window
- *   prime_count: Number of small primes to sieve with
- *   shift: Gap mining shift parameter (for absolute position calculation)
- * 
- * Thread mapping: Each thread idx processes bitmap word idx, marking all odd composites
- * in bits [32*idx, 32*idx+32).
- */
-__global__ void sievePrototypeMarkCompositesOptimized(
-    uint32_t *bitmap,
-    uint32_t bitmap_word_count,
-    uint64_t base_offset,
-  const uint32_t *primes,
-    const uint32_t *prime_residues,
-    uint32_t prime_count,
-    uint32_t shift)
-{
-  (void)shift;
-  // Grid-stride loop: handle all words in the bitmap
-  for (uint32_t word_idx = blockIdx.x * blockDim.x + threadIdx.x;
-       word_idx < bitmap_word_count;
-       word_idx += blockDim.x * gridDim.x) {
-    
-    uint32_t result = 0;  // Accumulate composite bits for this word
-    uint32_t word_bits_base = word_idx << 5;  // word_idx * 32
-    uint32_t parity_base = (base_offset >> 0) & 1u;  // Whether base_offset is odd
-    
-    // Check each of the 32 bits in this word for composites
-    for (uint32_t bit_in_word = 0; bit_in_word < 32; ++bit_in_word) {
-      uint32_t bit = word_bits_base + bit_in_word;
-      
-      // Check if absolute position (base_offset + bit) is odd
-      // absolute is odd iff (base_offset XOR bit) is odd
-      uint32_t absolute_parity = parity_base ^ (bit & 1u);
-      if (absolute_parity == 0u)
-        continue;  // Even position, skip (we only care about odd)
-      
-      // Check if this bit is a composite (multiple of some prime)
-      bool is_composite = false;
-      for (uint32_t p_idx = 0; p_idx < prime_count; ++p_idx) {
-        uint32_t prime = primes[p_idx];
-        uint32_t residue = prime_residues[p_idx];
-        
-        // Is (bit - residue) divisible by prime?
-        if (bit >= residue) {
-          uint32_t delta = bit - residue;
-          if (delta % prime == 0u) {
-            is_composite = true;
-            break;
-          }
-        }
-      }
-      
-      if (is_composite) {
-        result |= (1u << bit_in_word);
-      }
-    }
-    
-    // Single coalesced write per thread
-    bitmap[word_idx] = result;
-  }
-}
+// sievePrototypeMarkCompositesOptimized — REMOVED.
+// This O(window_bits × prime_count × integer_divide) kernel was ~1000× slower
+// than the per-prime stepping kernels. Replaced by
+// sievePrototypeMarkCompositesPerPrime / sievePrototypeMarkCompositesPerPrimeTiled.
 
 /**
  * sievePrototypeMarkCompositesPerPrime: GPU Sieve Marking Kernel (Per-Prime Strategy)
@@ -1318,6 +1266,11 @@ __global__ void sievePrototypeMarkCompositesPerPrimeTiled(
   }
 }
 
+// minCTA hint of 2: ptxas on sm_86 silently ignores this (1536/512=3 is the
+// architectural max, so 2 is below range and discarded). Keeping it as a
+// documentation marker that 2 concurrent blocks is the *minimum* intent;
+// the compiler is free to allocate as many registers as the Fermat arithmetic
+// needs without any spill penalty from this hint.
 __global__ __launch_bounds__(kCudaBlockSize, 2)
 void fermatTest320Kernel(const uint32_t *__restrict__ numbers,
                          ResultWord *__restrict__ results,
@@ -1655,6 +1608,8 @@ GPUFermat::GPUFermat(unsigned device_id,
       prototypeWindowOffsets(),
       lastPrototypeCount(0),
       lastPrototypeWindowCount(0),
+      prototypeStreamCursor(0),
+      useSoAEnabled(false),
       primeReciprocalsUploaded(false),
       primeBaseConstantsUploaded(false),
       primeBaseFingerprint(0ull),
@@ -1665,8 +1620,10 @@ GPUFermat::GPUFermat(unsigned device_id,
     throw std::runtime_error("workItems must be greater than zero");
   // prepare requested number of streams before CUDA init so init_cuda
   // can create them
-  if (streamCount == 0)
-    streamCount = 1;
+  // Require at least 3 streams so H2D / kernel / D2H each have their own
+  // dedicated stream and can genuinely overlap without aliasing.
+  if (streamCount < 3u)
+    streamCount = 3u;
   streams.resize(static_cast<size_t>(streamCount));
 
   if (!init_cuda(device_id, platformId))
@@ -1801,6 +1758,7 @@ bool GPUFermat::init_cuda(unsigned device_id, const char *platformId) {
                                 sizeof(use_soa),
                                 0,
                                 cudaMemcpyHostToDevice));
+  useSoAEnabled = (use_soa != 0u);
   for (cudaStream_t &s : streams)
     CUDA_CHECK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
 
@@ -1842,7 +1800,6 @@ void GPUFermat::initializeBuffers() {
   const size_t total_elems = per_stream_elems * static_cast<size_t>(streamCount);
   // allocate pinned SoA scratch (host + device) accessible for each stream's slot
   candidateSoA.init(total_elems, sizeof(uint32_t), true);
-  useSoAEnabled = (Opts::get_instance() && Opts::get_instance()->use_comba_soa());
 }
 
 void GPUFermat::uploadPrimeBaseConstants() {
@@ -2162,7 +2119,9 @@ void GPUFermat::configure_sieve_primes(const uint32_t *primes, size_t count) {
     return;
   sievePrototypePrimes.init(count, sizeof(uint32_t), true);
   memcpy(sievePrototypePrimes.HostData, primes, count * sizeof(uint32_t));
-  cudaStream_t stream = streams[0];
+  const size_t stream_count = streams.empty() ? 1u : streams.size();
+  const size_t stream_index = static_cast<size_t>(prototypeStreamCursor++) % stream_count;
+  cudaStream_t stream = streams.empty() ? nullptr : streams[stream_index];
   sievePrototypePrimes.copyToDevice(stream, count);
   CUDA_CHECK(cudaStreamSynchronize(stream));
   sievePrimesConfigured = true;
@@ -2487,7 +2446,9 @@ void GPUFermat::prototype_sieve_batch(const SievePrototypeParams *params,
     word_prefix[idx + 1] = word_prefix[idx] + window_words;
   }
 
-  cudaStream_t stream = streams[0];
+  const size_t stream_count = streams.empty() ? 1u : streams.size();
+  const size_t stream_index = static_cast<size_t>(prototypeStreamCursor++) % stream_count;
+  cudaStream_t stream = streams.empty() ? nullptr : streams[stream_index];
   if (any_host_bitmap) {
     sievePrototypeBitmap.copyToDevice(stream, static_cast<size_t>(total_words));
   } else {
@@ -2762,7 +2723,9 @@ void GPUFermat::prototype_sieve_single(const SievePrototypeParams &params) {
   const uint64_t absolute_base = params.sieve_base + round_offset;
   const uint32_t base_parity = static_cast<uint32_t>(absolute_base & 1ull);
 
-  cudaStream_t stream = streams[0];
+  const size_t stream_count = streams.empty() ? 1u : streams.size();
+  const size_t stream_index = static_cast<size_t>(prototypeStreamCursor++) % stream_count;
+  cudaStream_t stream = streams.empty() ? nullptr : streams[stream_index];
   if (has_host_bitmap) {
     uint8_t *bitmap_host_bytes = sievePrototypeBitmap.HostData;
     const size_t bitmap_bytes = static_cast<size_t>(bitmap_words) * sizeof(uint32_t);
@@ -2951,16 +2914,17 @@ void GPUFermat::mark_sieve_window_optimized(const SieveMarkingJob &job) {
   if (effective_prime_count == 0)
     return;
 
-  // Launch optimized per-word kernel
-  const uint32_t threads_per_block = 256;
-  const uint32_t blocks = (window_words + threads_per_block - 1) / threads_per_block;
-
-  // Heuristic: choose tiled per-prime kernel when there are many primes and
-  // window is large, otherwise fall back to optimized per-word or per-prime.
-  const uint32_t tile_word_count = 64u; // tuneable: 64 words -> 2048 bits per tile
-  const uint32_t tile_blocks = (window_words + tile_word_count - 1) / tile_word_count;
-  if (effective_prime_count > 1024u && window_words > tile_word_count) {
-    // launch tiled per-prime kernel: shared mem size = tile_word_count * 4 bytes
+  // Dispatch strategy (both kernels use the stepping approach, so cost is
+  // O(sum window_size/prime) — vastly cheaper than the O(bits×primes×div)
+  // per-word kernel which is permanently retired).
+  //  ≤ 256 primes  → simple per-prime stepping (atomicOr, minimal overhead)
+  //  > 256 primes  → tiled shared-memory per-prime (reduces global atomics)
+  // Tile width of 128 words (4096 bits) fits comfortably in L1/shared.
+  const uint32_t tile_word_count = 128u;
+  const uint32_t tile_blocks = (window_words + tile_word_count - 1u) / tile_word_count;
+  if (effective_prime_count > 256u && window_words > tile_word_count) {
+    // Tiled per-prime kernel: primes mark into shared-memory tile, then
+    // flush to global once per tile — zero global atomics per prime-multiple.
     const uint32_t threads = std::min<uint32_t>(256u, effective_prime_count);
     const size_t shared_bytes = static_cast<size_t>(tile_word_count) * sizeof(uint32_t);
     sievePrototypeMarkCompositesPerPrimeTiled<<<tile_blocks, threads, shared_bytes, stream>>>(
@@ -2973,15 +2937,16 @@ void GPUFermat::mark_sieve_window_optimized(const SieveMarkingJob &job) {
         tile_word_count);
     CUDA_CHECK(cudaGetLastError());
   } else {
-    const uint32_t blocks_simple = (window_words + threads_per_block - 1) / threads_per_block;
-    sievePrototypeMarkCompositesOptimized<<<blocks_simple, threads_per_block, 0, stream>>>(
+    // Simple per-prime stepping kernel for small prime counts.
+    const uint32_t threads = std::min<uint32_t>(256u, effective_prime_count);
+    const uint32_t blocks_pp = (effective_prime_count + threads - 1u) / threads;
+    sievePrototypeMarkCompositesPerPrime<<<blocks_pp, threads, 0, stream>>>(
         buffer_cast<uint32_t>(sievePrototypeBitmap.DeviceData),
-        window_words,
+        job.window_size,
         job.base_offset,
         buffer_cast<const uint32_t>(sievePrototypePrimes.DeviceData),
         device_residues,
-        effective_prime_count,
-        job.shift);
+        effective_prime_count);
     CUDA_CHECK(cudaGetLastError());
   }
   

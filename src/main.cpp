@@ -50,6 +50,10 @@ static bool running = true;
 /* indicates that we are waiting for server */
 static bool waiting = false;
 
+/* async-signal-safe shutdown flags */
+static volatile sig_atomic_t shutdown_requested = 0;
+static volatile sig_atomic_t shutdown_count = 0;
+
 /* the miner */
 static Miner *miner;
 
@@ -61,26 +65,17 @@ void soft_shutdown(int signum) {
 
   log_str("soft_shutdown", LOG_D);
   (void) signum;
-  
-  static int shutdown = 0;
+
+  const sig_atomic_t count = ++shutdown_count;
+  shutdown_requested = 1;
   running = false;
   waiting = true;
 
-  if (shutdown == 0) {
-    pthread_mutex_lock(&io_mutex);
-    cout << get_time() << "shutdown.." << endl;
-    pthread_mutex_unlock(&io_mutex);
-  } else if (shutdown == 1) {
-    pthread_mutex_lock(&io_mutex);
-    cout << get_time() << "I'm on it, just wait! (press again to kill)" << endl;
-    pthread_mutex_unlock(&io_mutex);
+  if (count >= 3) {
+    const char msg[] = "\nforced shutdown\n";
+    write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    _exit(128 + signum);
   }
-  miner->stop();
-
-  if (shutdown >= 2)
-    kill(0, SIGKILL);
-
-  shutdown++;
 }
 
 /* init signal handler */
@@ -401,7 +396,8 @@ int main(int argc, char *argv[]) {
           << " bitmap_pool_buffers=" << (opts->has_bitmap_pool_buffers() ? opts->get_bitmap_pool_buffers() : "")
           << " snapshot_pool_buffers=" << (opts->has_snapshot_pool_buffers() ? opts->get_snapshot_pool_buffers() : "")
           << " gpu_launch_divisor=" << (opts->has_gpu_launch_divisor() ? opts->get_gpu_launch_divisor() : "")
-          << " gpu_launch_wait_ms=" << (opts->has_gpu_launch_wait_ms() ? opts->get_gpu_launch_wait_ms() : "");
+          << " gpu_launch_wait_ms=" << (opts->has_gpu_launch_wait_ms() ? opts->get_gpu_launch_wait_ms() : "")
+          << " gpu_low_latency_launch=" << (opts->use_gpu_low_latency_launch() ? "on" : "off");
 #ifdef USE_CUDA_BACKEND
       if (fermat) {
         cfg << " cuda_block=" << fermat->get_block_size()
@@ -485,6 +481,19 @@ int main(int argc, char *argv[]) {
 
   while (running) {
     sleep(sec);
+
+    static bool shutdown_handled = false;
+    if (shutdown_requested && !shutdown_handled) {
+      shutdown_handled = true;
+      pthread_mutex_lock(&io_mutex);
+      if (shutdown_count <= 1)
+        cout << get_time() << "shutdown.." << endl;
+      else
+        cout << get_time() << "I'm on it, just wait! (press again to kill)" << endl;
+      pthread_mutex_unlock(&io_mutex);
+      if (miner)
+        miner->stop();
+    }
 
     if (!opts->has_quiet() && !waiting) {
       pthread_mutex_lock(&io_mutex);

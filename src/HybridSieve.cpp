@@ -1718,6 +1718,9 @@ HybridSieve::GPUWorkList::GPUWorkList(uint32_t len,
   this->last_batch_avg_tests = 0;
   this->last_batch_min_tests = 0;
   this->last_batch_stats_valid = false;
+  this->low_latency_launch_enabled =
+      (opts_local && opts_local->use_gpu_low_latency_launch());
+  this->fresh_launch_deadline_us = 0;
 
   memset(prime_base, 0, sizeof(uint32_t) * 10);
   
@@ -1851,6 +1854,12 @@ void HybridSieve::GPUWorkList::reinit(uint32_t prime_base[10], uint64_t target, 
   this->nonce = nonce;
   this->last_cycle_tests = n_tests;
   this->last_candidate_count = len * n_tests;
+  if (low_latency_launch_enabled) {
+    const uint64_t now_us = PoWUtils::gettime_usec();
+    fresh_launch_deadline_us = now_us + 250000ull;
+  } else {
+    fresh_launch_deadline_us = 0;
+  }
   memcpy(this->prime_base, prime_base, sizeof(uint32_t) * 10);
   /* extra-verbose: print host prime_base words for comparison with device dump */
   if (Opts::get_instance() && Opts::get_instance()->has_extra_vb()) {
@@ -1961,13 +1970,26 @@ uint32_t HybridSieve::GPUWorkList::create_candidates() {
     return 0;
   }
 
-  const uint32_t desired_items = preferred_launch_items();
+  uint32_t desired_items = preferred_launch_items();
+  const uint64_t now_us = PoWUtils::gettime_usec();
+  const bool fresh_low_latency =
+      low_latency_launch_enabled && now_us < fresh_launch_deadline_us;
+  if (fresh_low_latency)
+    desired_items = 1u;
   bool logged_batch_wait = false;
   const uint64_t wait_timeout_us = 5000;
   const uint64_t max_wait_us =
       static_cast<uint64_t>(preferred_launch_max_wait_ms) * 1000ULL;
   const bool allow_batch_wait = (max_wait_us > 0);
   if (cur_len > 0 && cur_len < desired_items) {
+    if (fresh_low_latency) {
+      if (extra_verbose) {
+        std::ostringstream ss;
+        ss << get_time() << "GPU low-latency launch active; skipping batch wait"
+           << " (depth " << cur_len << "/" << len << ")";
+        extra_verbose_log(ss.str());
+      }
+    } else
     if (allow_batch_wait) {
       const uint64_t wait_start_us = PoWUtils::gettime_usec();
       const uint64_t wait_deadline_us = wait_start_us + max_wait_us;
